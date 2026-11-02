@@ -101,31 +101,39 @@ pub static USERNAME_LIMITER: Lazy<AttemptLimiter<String>> =
 pub static IP_LIMITER: Lazy<AttemptLimiter<IpAddr>> =
     Lazy::new(|| AttemptLimiter::new(20, Duration::from_secs(60), 100_000));
 
-/// The client's address for per-IP limiting, or `None` when it cannot be told.
+fn trust_proxy_headers() -> bool {
+    std::env::var("TRUST_PROXY_HEADERS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// The client's address for per-IP limiting, or `None` when `peer` is absent.
 ///
-/// Normally the TCP peer. When the peer is loopback or a private address, the
-/// panel sits behind Caddy (compose network) or a reverse proxy on the host —
-/// then the LAST X-Forwarded-For entry, the one the proxy itself appended, is
-/// the client. A public peer's X-Forwarded-For is ignored: that client could
-/// write anything there.
-///
-/// A private peer WITHOUT a usable X-Forwarded-For (a proxy configured without
-/// it) gives `None`, not the proxy's own address: every user would share that
-/// one counter, and anyone could lock them all out with 20 bad logins a
-/// minute. Such requests are covered by the per-username limit and the bcrypt
-/// permits only. (Caveat: if Docker's userland proxy publishes the port, a
-/// direct client also appears as a private address and could spoof the
-/// header; the permits still cap the damage.)
+/// Only trusts `X-Forwarded-For` when the TCP peer is local/private AND
+/// `TRUST_PROXY_HEADERS` (`1`/`true`) is enabled. When `X-Forwarded-For` is
+/// absent, invalid, or untrusted, falls back to `Some(peer)` so a local/Docker
+/// client can never bypass `IP_LIMITER` by omitting the header.
 pub fn client_ip(peer: Option<SocketAddr>, headers: &HeaderMap) -> Option<IpAddr> {
+    client_ip_with_trust(peer, headers, trust_proxy_headers())
+}
+
+pub fn client_ip_with_trust(
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trust_proxy: bool,
+) -> Option<IpAddr> {
     let peer = peer?.ip();
-    if !is_local(peer) {
-        return Some(peer);
+    if is_local(peer) && trust_proxy {
+        if let Some(forwarded) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit(',').next())
+            .and_then(|last| last.trim().parse::<IpAddr>().ok())
+        {
+            return Some(forwarded);
+        }
     }
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit(',').next())
-        .and_then(|last| last.trim().parse::<IpAddr>().ok())
+    Some(peer)
 }
 
 fn is_local(ip: IpAddr) -> bool {
@@ -139,7 +147,7 @@ fn is_local(ip: IpAddr) -> bool {
     }
 }
 
-/// Concurrent bcrypt runs allowed across login + register: half the cores,
+/// Concurrent bcrypt runs allowed across login: half the cores,
 /// so the rest of the panel always has CPU left.
 static BCRYPT_PERMITS: Lazy<Arc<Semaphore>> = Lazy::new(|| {
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
@@ -149,12 +157,6 @@ const BCRYPT_WAIT: Duration = Duration::from_secs(3);
 
 /// Run a bcrypt job on the blocking pool under the global permit. `None` when
 /// no permit freed up within BCRYPT_WAIT (the caller answers "busy").
-///
-/// The permit moves INTO the blocking job and is released when bcrypt
-/// finishes. Held by the request instead, it would be released as soon as a
-/// client disconnects (the request future is dropped) while its bcrypt keeps
-/// running — and connect-then-hang-up would run more bcrypt at once than the
-/// permits allow.
 pub async fn run_bcrypt<T: Send + 'static>(job: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     run_under(&BCRYPT_PERMITS, BCRYPT_WAIT, job).await
 }
@@ -191,34 +193,44 @@ mod tests {
     fn a_public_peer_is_the_client_whatever_it_claims() {
         let peer: SocketAddr = "203.0.113.7:5555".parse().unwrap();
         assert_eq!(
-            client_ip(Some(peer), &xff("198.51.100.1")),
+            client_ip_with_trust(Some(peer), &xff("198.51.100.1"), true),
+            Some("203.0.113.7".parse().unwrap())
+        );
+        assert_eq!(
+            client_ip_with_trust(Some(peer), &xff("198.51.100.1"), false),
             Some("203.0.113.7".parse().unwrap())
         );
     }
 
     #[test]
-    fn behind_a_local_proxy_the_last_forwarded_hop_is_the_client() {
+    fn local_peer_ignores_forwarded_for_unless_trust_proxy_enabled() {
         let caddy: SocketAddr = "172.18.0.3:40000".parse().unwrap();
-        // A client-supplied entry first, then the one the proxy appended.
         assert_eq!(
-            client_ip(Some(caddy), &xff("1.2.3.4, 203.0.113.9")),
+            client_ip_with_trust(Some(caddy), &xff("1.2.3.4, 203.0.113.9"), false),
+            Some("172.18.0.3".parse().unwrap())
+        );
+        assert_eq!(
+            client_ip_with_trust(Some(caddy), &xff("1.2.3.4, 203.0.113.9"), true),
             Some("203.0.113.9".parse().unwrap())
         );
         let host_proxy: SocketAddr = "127.0.0.1:40000".parse().unwrap();
         assert_eq!(
-            client_ip(Some(host_proxy), &xff("2001:db8::1")),
+            client_ip_with_trust(Some(host_proxy), &xff("2001:db8::1"), true),
             Some("2001:db8::1".parse().unwrap())
         );
     }
 
-    /// A proxy that does not send X-Forwarded-For must not put every user
-    /// under its own address: one shared counter would let anyone lock all
-    /// users out. Those requests get no per-IP limit instead.
     #[test]
-    fn a_local_proxy_without_forwarded_for_gives_no_client_ip() {
+    fn a_local_peer_without_valid_forwarded_for_falls_back_to_peer_ip() {
         let proxy: SocketAddr = "172.17.0.1:40000".parse().unwrap();
-        assert_eq!(client_ip(Some(proxy), &HeaderMap::new()), None);
-        assert_eq!(client_ip(Some(proxy), &xff("not-an-ip")), None);
+        assert_eq!(
+            client_ip_with_trust(Some(proxy), &HeaderMap::new(), true),
+            Some("172.17.0.1".parse().unwrap())
+        );
+        assert_eq!(
+            client_ip_with_trust(Some(proxy), &xff("not-an-ip"), true),
+            Some("172.17.0.1".parse().unwrap())
+        );
     }
 
     /// The permit stays taken until bcrypt itself finishes, even when the

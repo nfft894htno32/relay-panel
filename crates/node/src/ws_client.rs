@@ -71,11 +71,6 @@ pub async fn run_ws_loop(
 
         let exit = connect_and_run(&ws_url, &config.token, config, manager, node_id, metrics).await;
         match exit {
-            WsExit::ConfigChanged => {
-                tracing::info!("websocket: config_changed received, reconnecting immediately");
-                backoff = 1;
-                last_permanent_msg = None;
-            }
             WsExit::Disconnected => {
                 tracing::warn!(
                     "websocket disconnected, reconnecting in {} seconds",
@@ -115,7 +110,6 @@ pub async fn run_ws_loop(
 }
 
 enum WsExit {
-    ConfigChanged,
     Disconnected,
     /// A permanent error (426 protocol mismatch, 401/403 auth). The node backs
     /// off 5 minutes — the only fix is an upgrade or reconfiguration.
@@ -300,7 +294,6 @@ async fn connect_and_run(
                                     tracing::warn!("websocket: config fetch failed transiently; keeping cached config");
                                 }
                             }
-                            return WsExit::ConfigChanged;
                         } else if let Some(rm) =
                             serde_json::from_str::<relay_shared::protocol::RestartRuleMessage>(&text)
                                 .ok()
@@ -560,8 +553,6 @@ mod tests {
             panel_url: format!("http://{addr}"),
             token: "t".into(),
             poll_interval: 10,
-            tls_cert_path: None,
-            tls_key_path: None,
             network_interface: "auto".into(),
             listen_ipv4: "0.0.0.0".into(),
             listen_ipv6: "::".into(),
@@ -569,11 +560,12 @@ mod tests {
             outbound_bind_ipv4: None,
             shutdown_drain_secs: 5,
         };
+        let metrics = Arc::new(NodeMetrics::new(&config.network_interface));
         let manager = Arc::new(Mutex::new(ForwarderManager::new(
             Arc::new(TrafficCounter::new()),
             Arc::new(ConnectionTracker::new()),
+            metrics.clone(),
         )));
-        let metrics = Arc::new(NodeMetrics::new(&config.network_interface));
         let url = super::derive_ws_url(&config.panel_url);
 
         let exit = tokio::time::timeout(

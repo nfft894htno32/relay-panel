@@ -602,11 +602,12 @@ async fn send_batch(config: &NodeConfig, batch: &PendingBatch) -> BatchOutcome {
     };
 
     let url = format!("{}/api/v1/node/report_traffic", config.panel_url);
-    let client = reqwest::Client::new();
+    let client = crate::poller::http_client();
     match client
         .post(&url)
         .timeout(TRAFFIC_REPORT_TIMEOUT)
         .header("Authorization", format!("Bearer {}", config.token))
+        .header("X-Node-Token", &config.token)
         .json(&report)
         .send()
         .await
@@ -865,6 +866,22 @@ impl NodeMetrics {
 
     pub async fn public_ipv6(&self) -> Option<String> {
         self.public_ipv6.read().await.clone()
+    }
+
+    /// Return all known public IPs of this node (`public_ipv4` and `public_ipv6`)
+    /// parsed as `IpAddr`, used by the SNI anti-loop gate.
+    pub async fn own_public_ips(&self) -> Vec<std::net::IpAddr> {
+        let mut ips = Vec::new();
+        for lock in [&self.public_ipv4, &self.public_ipv6] {
+            if let Some(s) = lock.read().await.as_deref() {
+                if let Ok(ip) = s.trim().parse::<std::net::IpAddr>() {
+                    if !ips.contains(&ip) {
+                        ips.push(ip);
+                    }
+                }
+            }
+        }
+        ips
     }
 }
 
@@ -1281,7 +1298,7 @@ pub async fn report_status(
     );
 
     let url = format!("{}/api/v1/node/report_status", config.panel_url);
-    let client = reqwest::Client::new();
+    let client = crate::poller::http_client();
     // v0.3.9: check the response so a rejected status report (invalid/rotated
     // token, DB error) is surfaced instead of silently fire-and-forget. Unlike
     // report_traffic there's nothing to retry here (status is ephemeral), but
@@ -1294,6 +1311,7 @@ pub async fn report_status(
         // nothing.
         .timeout(Duration::from_secs(15))
         .header("Authorization", format!("Bearer {}", config.token))
+        .header("X-Node-Token", &config.token)
         .json(&report)
         .send()
         .await
@@ -1364,11 +1382,13 @@ fn parse_ip_for_family(body: &str, family: &IpFamily) -> Option<String> {
 }
 
 async fn detect_public_ip(check_url: &str, family: &IpFamily, quiet: bool) -> Option<String> {
-    let client = reqwest::Client::builder()
+    let client = crate::poller::http_client();
+    match client
+        .get(check_url)
         .timeout(Duration::from_secs(5))
-        .build()
-        .ok()?;
-    match client.get(check_url).send().await {
+        .send()
+        .await
+    {
         Ok(r) if r.status().is_success() => match r.text().await {
             Ok(body) => {
                 let result = parse_ip_for_family(&body, family);
@@ -1626,8 +1646,6 @@ mod tests {
             panel_url: "http://127.0.0.1:1".into(),
             token: "t".into(),
             poll_interval: 10,
-            tls_cert_path: None,
-            tls_key_path: None,
             network_interface: "auto".into(),
             listen_ipv4: "0.0.0.0".into(),
             listen_ipv6: "::".into(),
@@ -1646,37 +1664,27 @@ mod tests {
     #[tokio::test]
     async fn tcp_guard_increments_and_decrements_on_drop() {
         let tracker = ConnectionTracker::new();
-        // Baseline: zero active connections.
         assert_eq!(tracker.current().await, 0);
 
-        // Open one TCP connection -> count becomes 1.
         let guard = tracker.tcp_handle();
         assert_eq!(tracker.current().await, 1);
 
-        // Open a second -> count becomes 2.
         let guard2 = tracker.tcp_handle();
         assert_eq!(tracker.current().await, 2);
 
-        // Drop one guard (simulating a normal close) -> count falls to 1.
         drop(guard);
         assert_eq!(tracker.current().await, 1);
 
-        // Drop the other -> back to 0. This is the regression guard for
-        // "connection count stuck at non-zero after all clients disconnect".
         drop(guard2);
         assert_eq!(tracker.current().await, 0);
     }
 
     #[tokio::test]
     async fn tcp_guard_decrements_even_on_panic_via_drop() {
-        // The guard's Drop runs during stack unwinding, so a panicking task
-        // still releases its slot. We simulate that by forgetting the guard is
-        // inside a catch_unwind and just relying on Drop semantics.
         let tracker = ConnectionTracker::new();
         {
             let _g = tracker.tcp_handle();
             assert_eq!(tracker.current().await, 1);
-            // scope ends here -> _g drops
         }
         assert_eq!(tracker.current().await, 0);
     }
@@ -1684,25 +1692,20 @@ mod tests {
     #[tokio::test]
     async fn udp_session_registered_on_touch_and_counts_as_active() {
         let tracker = ConnectionTracker::new();
-        // No UDP traffic yet -> zero.
         assert_eq!(tracker.current().await, 0);
 
-        // First datagram from (127.0.0.1:5000, rule 1) opens a session.
         let opened = tracker.udp_touch(addr(5000), 1).await;
         assert!(opened, "first touch must register a new session");
         assert_eq!(tracker.current().await, 1);
 
-        // Same client again -> refresh, not a new session; count stays 1.
         let opened2 = tracker.udp_touch(addr(5000), 1).await;
         assert!(!opened2, "repeat touch must not register a new session");
         assert_eq!(tracker.current().await, 1);
 
-        // A different client (different port) opens a second session.
         let opened3 = tracker.udp_touch(addr(5001), 1).await;
         assert!(opened3);
         assert_eq!(tracker.current().await, 2);
 
-        // Same client but different rule is a distinct session.
         let opened4 = tracker.udp_touch(addr(5001), 2).await;
         assert!(opened4);
         assert_eq!(tracker.current().await, 3);
@@ -1711,8 +1714,6 @@ mod tests {
     #[tokio::test]
     async fn udp_session_expires_after_timeout() {
         let tracker = ConnectionTracker::new();
-        // Manually backdate a session to simulate "no traffic for longer than
-        // the timeout" — we can't sleep 60s in a unit test.
         tracker.udp.insert(
             UdpSessionKey {
                 client_addr: addr(6000),
@@ -1720,7 +1721,6 @@ mod tests {
             },
             Instant::now() - (UDP_SESSION_TIMEOUT + Duration::from_secs(1)),
         );
-        // The expired session must NOT be counted by current().
         assert_eq!(tracker.current().await, 0);
     }
 
@@ -1733,7 +1733,6 @@ mod tests {
 
         tracker.udp_close(addr(7000), 1).await;
         assert_eq!(tracker.current().await, 1);
-        // Closing an unknown session is a no-op.
         tracker.udp_close(addr(9999), 1).await;
         assert_eq!(tracker.current().await, 1);
     }
@@ -1741,7 +1740,6 @@ mod tests {
     #[tokio::test]
     async fn current_is_tcp_plus_udp() {
         let tracker = ConnectionTracker::new();
-        // 2 TCP + 2 UDP distinct sessions == 4.
         let _t1 = tracker.tcp_handle();
         let _t2 = tracker.tcp_handle();
         tracker.udp_touch(addr(8000), 1).await;
@@ -1749,31 +1747,26 @@ mod tests {
         assert_eq!(tracker.current().await, 4);
     }
 
-    /// Performance: applying a config with many rules must keep the listener
-    /// table size bounded (one entry per rule), confirming memory grows ~O(n)
-    /// and there is no per-rule polling task leaked.
     #[tokio::test]
     async fn apply_many_rules_keeps_listener_table_bounded() {
         use crate::forwarder::ForwarderManager;
-        use relay_shared::protocol::{ListenerConfig, NodeConfigResponse, NodeTransport};
+        use relay_shared::models::default_sni_fallback_addr;
+        use relay_shared::protocol::{ListenerConfig, NodeConfigResponse};
 
         let counter = Arc::new(TrafficCounter::new());
         let connections = Arc::new(ConnectionTracker::new());
-        let mut mgr = ForwarderManager::new(counter, connections);
+        let metrics = Arc::new(NodeMetrics::new("auto"));
+        let mut mgr = ForwarderManager::new(counter, connections, metrics);
 
-        // Build a config with 1000 rules. We deliberately pick listen ports
-        // that are unlikely to be bindable here (high) so apply_config tries
-        // to spawn listeners; failures are logged but the manager still
-        // records the key. What we assert is that the manager does not crash
-        // and completes in bounded time.
         let listeners: Vec<ListenerConfig> = (0..1000)
             .map(|i| ListenerConfig {
                 rule_id: i,
                 port: 40000 + (i as u16),
                 protocol: relay_shared::protocol::Protocol::Tcp,
-                node_transport: NodeTransport::Raw,
-                ws_path: None,
                 targets: vec!["127.0.0.1:1".to_string()],
+                sni: None,
+                sni_fallback_addr: default_sni_fallback_addr(),
+                sni_loop_bypass_ips: Vec::new(),
                 load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                 upload_limit_bps: None,
                 download_limit_bps: None,
@@ -1783,13 +1776,9 @@ mod tests {
             .collect();
         let cfg = NodeConfigResponse { listeners };
 
-        // apply_config should return promptly even for 1000 rules — the diff
-        // is O(n) and binding happens in spawned tasks, not inline.
         let start = Instant::now();
         mgr.apply_config(&cfg).await;
         let elapsed = start.elapsed();
-        // Generous bound: must finish well under 2s. If apply_config were
-        // doing serial work per rule this would blow past it.
         assert!(
             elapsed < Duration::from_secs(2),
             "apply_config(1000 rules) took {:?}, expected < 2s",
@@ -1797,9 +1786,6 @@ mod tests {
         );
     }
 
-    // v0.4.15: address-family validation for the public-IP refresher. These
-    // guard the dual-stack bug where the IPv4 endpoint, reached over IPv6,
-    // returns a v6 address that must NOT be stored as public_ipv4.
     #[test]
     fn parse_ip_for_family_accepts_matching_family() {
         assert_eq!(
@@ -1814,7 +1800,6 @@ mod tests {
 
     #[test]
     fn parse_ip_for_family_trims_whitespace() {
-        // ipify-style responses have no trailing newline, but be defensive.
         assert_eq!(
             parse_ip_for_family("  8.8.8.8\n", &IpFamily::V4),
             Some("8.8.8.8".to_string())
@@ -1823,9 +1808,7 @@ mod tests {
 
     #[test]
     fn parse_ip_for_family_rejects_wrong_family() {
-        // The core dual-stack guard: a v6 answer to a v4 query is dropped.
         assert_eq!(parse_ip_for_family("2001:db8::1", &IpFamily::V4), None);
-        // ...and a v4 answer to a v6 query.
         assert_eq!(parse_ip_for_family("1.2.3.4", &IpFamily::V6), None);
     }
 
@@ -1833,23 +1816,10 @@ mod tests {
     fn parse_ip_for_family_rejects_empty_and_non_ip() {
         assert_eq!(parse_ip_for_family("", &IpFamily::V4), None);
         assert_eq!(parse_ip_for_family("   ", &IpFamily::V4), None);
-        // An HTML error page or rate-limit text must not parse as an IP.
         assert_eq!(parse_ip_for_family("<html>429</html>", &IpFamily::V4), None);
         assert_eq!(parse_ip_for_family("not-an-ip", &IpFamily::V6), None);
     }
 
-    /// v1.2.1: the defaults must be FAMILY-PINNED hostnames, and the two must
-    /// differ.
-    ///
-    /// This is the invariant that pairs with `parse_ip_for_family`: a probe
-    /// discards an answer from the wrong family, so pointing both probes at a
-    /// dual-stack endpoint (`api.ip.sb/ip`, `api.ipify.org` reached over v6)
-    /// makes the v4 probe intermittently throw its answer away and the panel
-    /// show no address. It breaks only on dual-stack hosts and only sometimes,
-    /// so a unit test is the only place it gets caught cheaply.
-    ///
-    /// Asserting on the shape rather than the exact URL keeps the endpoint
-    /// swappable — what must not change is that each one names its family.
     #[test]
     fn default_check_urls_are_family_pinned() {
         assert_ne!(
@@ -1874,8 +1844,6 @@ mod tests {
             host6.contains("ipv6") || host6.contains("-v6") || host6.contains("6."),
             "IPv6 default must name its family, got {host6}"
         );
-        // Both must be HTTPS: the response decides what the panel displays as
-        // this node's identity, and plain HTTP lets any on-path party set it.
         assert!(DEFAULT_IPV4_CHECK_URL.starts_with("https://"));
         assert!(DEFAULT_IPV6_CHECK_URL.starts_with("https://"));
     }
@@ -1890,8 +1858,6 @@ mod tests {
         );
     }
 
-    /// A NIC reset or a switch to a different interface can make a cumulative
-    /// counter go backwards. That must read as zero, not as a wrapped u64.
     #[test]
     fn rate_between_treats_a_counter_that_went_down_as_zero() {
         let t0 = Instant::now();
@@ -1906,7 +1872,6 @@ mod tests {
     fn rate_between_needs_time_to_have_passed() {
         let t0 = Instant::now();
         assert_eq!(rate_between((0, 0, t0), (500, 500, t0)), None);
-        // Out-of-order readings are rejected rather than treated as negative time.
         assert_eq!(
             rate_between((0, 0, t0 + Duration::from_secs(1)), (500, 500, t0)),
             None
@@ -1918,8 +1883,6 @@ mod tests {
             panel_url: panel_url.into(),
             token: "t".into(),
             poll_interval: 10,
-            tls_cert_path: None,
-            tls_key_path: None,
             network_interface: "auto".into(),
             listen_ipv4: "0.0.0.0".into(),
             listen_ipv6: "::".into(),

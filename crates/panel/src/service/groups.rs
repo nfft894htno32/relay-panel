@@ -1,10 +1,4 @@
 //! Device group + rule deletion service.
-//!
-//! Extracted from `api/admin/{groups,rules}.rs`. Houses the group CRUD business
-//! rules (admin-owned token generation, no-fields guard, 404-on-zero-rows) and
-//! the rule deletion mutation. The handlers keep HTTP concerns + the
-//! connection-manager side effects (`close_group` / `broadcast_all`) and audit
-//! logging — those depend on `node_connections`, not the `Repository`.
 
 use crate::db::error::DbError;
 use crate::db::repo::ResourceScope;
@@ -12,6 +6,9 @@ use crate::db::Repository;
 use crate::service::rules::group_type_to_str;
 use relay_shared::models::DeviceGroup;
 use relay_shared::protocol::GroupType;
+use std::net::IpAddr;
+
+pub const DEFAULT_SNI_FALLBACK_ADDR: &str = "127.0.0.1:10443";
 
 #[derive(Debug)]
 pub enum CreateGroupError {
@@ -27,28 +24,66 @@ pub enum UpdateGroupError {
     Database(DbError),
 }
 
-/// v1.0.8: billing rate bounds. `rate` lives on device_groups; users are
-/// charged real bytes × rate in `apply_traffic_batch`. 1.0 = bill what you
-/// use. The same bounds are enforced inside `apply_traffic_batch` (a stray
-/// out-of-range value refuses the whole traffic batch) — this is the
-/// write-side guard so bad values never get persisted.
-pub const RATE_MIN: f64 = 0.1;
-pub const RATE_MAX: f64 = 100.0;
-pub const RATE_DEFAULT: f64 = 1.0;
-
-/// Validate a billing rate. Returns the clamped-or-passed value, or `None`
-/// when the input is out of `[RATE_MIN, RATE_MAX]` (callers map None → 400).
-pub fn validate_rate(rate: f64) -> Option<f64> {
-    (RATE_MIN..=RATE_MAX).contains(&rate).then_some(rate)
+/// Validate and normalize `sni_fallback_addr` (`host:port`). Empty input falls
+/// back to `DEFAULT_SNI_FALLBACK_ADDR`.
+pub fn validate_sni_fallback_addr(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_SNI_FALLBACK_ADDR.to_string());
+    }
+    let Some((host, port_str)) = trimmed.rsplit_once(':') else {
+        return Err("sni_fallback_addr 必须是 host:port 格式（例如 127.0.0.1:10443）");
+    };
+    if host.trim().is_empty() {
+        return Err("sni_fallback_addr 主机地址不能为空");
+    }
+    let Ok(port) = port_str.parse::<u16>() else {
+        return Err("sni_fallback_addr 端口必须是 1..=65535 的有效整数");
+    };
+    if port == 0 {
+        return Err("sni_fallback_addr 端口必须在 1..=65535 之间");
+    }
+    Ok(trimmed.to_string())
 }
 
-/// Create an admin-owned device group. Generates a fresh token, inserts, then
-/// returns the persisted row (INSERT-then-SELECT-by-token; the token is a
-/// freshly generated UUID so the SELECT is guaranteed to hit the new row).
-///
-/// v0.4.12 PR1: device groups are admin-managed shared infrastructure — the
-/// caller passes the creating admin's id as `owner_uid` (the handler ignores
-/// any client-supplied owner_uid).
+/// Validate and normalize comma/whitespace-separated IP addresses or CIDR ranges
+/// in `sni_loop_bypass_ips` (e.g. `203.0.113.10,198.51.100.0/24`).
+pub fn validate_sni_loop_bypass_ips(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    let mut normalized = Vec::new();
+    for part in trimmed.split(|c: char| c == ',' || c == '，' || c.is_whitespace()) {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        match p.split_once('/') {
+            None => {
+                let ip: IpAddr = p
+                    .parse()
+                    .map_err(|_| format!("sni_loop_bypass_ips 包含无效 IP 或 CIDR: {p}"))?;
+                normalized.push(ip.to_string());
+            }
+            Some((ip_part, prefix_part)) => {
+                let ip: IpAddr = ip_part
+                    .parse()
+                    .map_err(|_| format!("sni_loop_bypass_ips 包含无效 IP 或 CIDR: {p}"))?;
+                let bits: u8 = prefix_part
+                    .parse()
+                    .map_err(|_| format!("sni_loop_bypass_ips 包含无效 CIDR 掩码: {p}"))?;
+                let max_bits = if ip.is_ipv4() { 32 } else { 128 };
+                if bits > max_bits {
+                    return Err(format!("sni_loop_bypass_ips 包含无效 CIDR 掩码: {p}"));
+                }
+                normalized.push(format!("{ip}/{bits}"));
+            }
+        }
+    }
+    Ok(normalized.join(","))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn create_group(
     db: &dyn Repository,
@@ -57,8 +92,8 @@ pub async fn create_group(
     owner_uid: i64,
     connect_host: &str,
     port_range: &str,
-    rate: f64,
-    hidden: bool,
+    sni_fallback_addr: &str,
+    sni_loop_bypass_ips: &str,
 ) -> Result<DeviceGroup, CreateGroupError> {
     let token = uuid::Uuid::new_v4().to_string();
     let group_type = group_type_to_str(group_type);
@@ -69,8 +104,8 @@ pub async fn create_group(
         owner_uid,
         connect_host,
         port_range,
-        rate,
-        hidden,
+        sni_fallback_addr,
+        sni_loop_bypass_ips,
     )
     .await
     .map_err(CreateGroupError::Database)?;
@@ -82,12 +117,7 @@ pub async fn create_group(
     }
 }
 
-/// Rotate a device group's node token. Generates a fresh UUID and persists it.
-/// Returns `Ok(Some(new_token))` when a row changed, `Ok(None)` when the group
-/// didn't exist (the handler maps that to 404). The connection teardown
-/// (`close_group`) + broadcast stay in the handler.
 pub async fn rotate_group_token(db: &dyn Repository, id: i64) -> Result<Option<String>, DbError> {
-    // v0.4.12 PR1: admin-only. Scope All — an admin operates on any group.
     let new_token = uuid::Uuid::new_v4().to_string();
     match db
         .update_group_token(id, &ResourceScope::All, &new_token)
@@ -98,9 +128,6 @@ pub async fn rotate_group_token(db: &dyn Repository, id: i64) -> Result<Option<S
     }
 }
 
-/// Update an admin-owned device group. Enforces the no-fields guard and
-/// 404-on-zero-rows. The token is NOT updatable here (rotation is a separate
-/// endpoint).
 #[allow(clippy::too_many_arguments)]
 pub async fn update_group(
     db: &dyn Repository,
@@ -109,15 +136,15 @@ pub async fn update_group(
     group_type: Option<&GroupType>,
     connect_host: Option<&str>,
     port_range: Option<&str>,
-    rate: Option<f64>,
-    hidden: Option<bool>,
+    sni_fallback_addr: Option<&str>,
+    sni_loop_bypass_ips: Option<&str>,
 ) -> Result<(), UpdateGroupError> {
     if name.is_none()
         && group_type.is_none()
         && connect_host.is_none()
         && port_range.is_none()
-        && rate.is_none()
-        && hidden.is_none()
+        && sni_fallback_addr.is_none()
+        && sni_loop_bypass_ips.is_none()
     {
         return Err(UpdateGroupError::NoFields);
     }
@@ -130,8 +157,8 @@ pub async fn update_group(
             group_type.map(group_type_to_str),
             connect_host,
             port_range,
-            rate,
-            hidden,
+            sni_fallback_addr,
+            sni_loop_bypass_ips,
         )
         .await
         .map_err(UpdateGroupError::Database)?
@@ -143,14 +170,11 @@ pub async fn update_group(
 
 #[derive(Debug)]
 pub enum ReorderGroupsError {
-    /// Empty list, or the same id twice.
     Invalid,
-    /// An id that is not a device group.
     UnknownGroup,
     Database(DbError),
 }
 
-/// Set the panel-wide group display order. See `GroupRepository::reorder_groups`.
 pub async fn reorder_groups(db: &dyn Repository, ids: &[i64]) -> Result<(), ReorderGroupsError> {
     let distinct: std::collections::HashSet<i64> = ids.iter().copied().collect();
     if ids.is_empty() || distinct.len() != ids.len() {
@@ -162,8 +186,6 @@ pub async fn reorder_groups(db: &dyn Repository, ids: &[i64]) -> Result<(), Reor
     })
 }
 
-/// v1.0.4: error returned when a group cannot be deleted because rules
-/// still reference it.
 #[derive(Debug)]
 pub struct GroupInUseError {
     pub group_id: i64,
@@ -182,10 +204,6 @@ impl std::fmt::Display for GroupInUseError {
 
 impl std::error::Error for GroupInUseError {}
 
-/// Delete an admin-owned device group. Before deleting, checks that no
-/// forward_rules reference this group via device_group_in or
-/// device_group_out. Returns `GroupInUseError` with the rule count if any
-/// references exist, so the handler can return a clear 409.
 pub async fn delete_group(
     db: &dyn Repository,
     id: i64,
@@ -200,13 +218,40 @@ pub async fn delete_group(
     Ok(db.delete_group(id, &ResourceScope::All).await? > 0)
 }
 
-/// Delete a rule within `scope` (owner-scoped for regular users, All for
-/// admins). Returns `Ok(true)` when a row was deleted, `Ok(false)` when nothing
-/// matched (the handler maps that to 404 + no broadcast).
 pub async fn delete_rule(
     db: &dyn Repository,
     id: i64,
     scope: &ResourceScope,
 ) -> Result<bool, DbError> {
     Ok(db.delete_rule(id, scope).await? > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_sni_fallback_addr_defaults_and_checks_port() {
+        assert_eq!(validate_sni_fallback_addr("  ").unwrap(), "127.0.0.1:10443");
+        assert_eq!(
+            validate_sni_fallback_addr("127.0.0.1:18443").unwrap(),
+            "127.0.0.1:18443"
+        );
+        assert!(validate_sni_fallback_addr("127.0.0.1").is_err());
+        assert!(validate_sni_fallback_addr("127.0.0.1:0").is_err());
+        assert!(validate_sni_fallback_addr(":10443").is_err());
+    }
+
+    #[test]
+    fn validate_sni_loop_bypass_ips_accepts_ip_and_cidr() {
+        assert_eq!(validate_sni_loop_bypass_ips(" ").unwrap(), "");
+        assert_eq!(
+            validate_sni_loop_bypass_ips("11.22.33.44/32, 198.51.100.0/24，2001:db8::1/128\n203.0.113.10")
+                .unwrap(),
+            "11.22.33.44/32,198.51.100.0/24,2001:db8::1/128,203.0.113.10"
+        );
+        assert!(validate_sni_loop_bypass_ips("11.22.33.44/33").is_err());
+        assert!(validate_sni_loop_bypass_ips("2001:db8::1/129").is_err());
+        assert!(validate_sni_loop_bypass_ips("not-an-ip").is_err());
+    }
 }

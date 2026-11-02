@@ -3,7 +3,8 @@ use crate::api::middleware::{AdminOnly, AuthUser};
 use crate::api::AppState;
 use crate::db::repo::ResourceScope;
 use crate::service::groups::{
-    validate_rate, CreateGroupError, ReorderGroupsError, UpdateGroupError, RATE_DEFAULT,
+    validate_sni_fallback_addr, validate_sni_loop_bypass_ips, CreateGroupError, ReorderGroupsError,
+    UpdateGroupError, DEFAULT_SNI_FALLBACK_ADDR,
 };
 use axum::{
     extract::{Path, State},
@@ -11,6 +12,7 @@ use axum::{
 };
 use relay_shared::models::*;
 use relay_shared::protocol::*;
+
 // === Device Groups ===
 pub async fn list_groups(
     user: AuthUser,
@@ -31,19 +33,21 @@ pub async fn create_group(
     State(state): State<AppState>,
     Json(req): Json<CreateGroupRequest>,
 ) -> Json<ApiResponse<DeviceGroup>> {
-    // v0.4.12 PR1: device groups are admin-managed shared infrastructure, and
-    // only ADMIN-owned groups are ever shared to regular users. Creating a
-    // group owned by a regular user would produce a "dead" group the user
-    // can't manage (AdminOnly) and that is never shared. So `owner_uid` is
-    // IGNORED — the group always belongs to the creating admin.
-    // v1.0.8: clamp absent rate to the default (1.0) and reject out-of-range.
-    let rate = match req.rate {
-        Some(r) => match validate_rate(r) {
-            Some(v) => v,
-            None => return Json(err(400, "倍率必须在 0.1 到 100 之间")),
+    let sni_fallback_addr = match req.sni_fallback_addr.as_deref() {
+        Some(addr) if !addr.trim().is_empty() => match validate_sni_fallback_addr(addr) {
+            Ok(v) => v,
+            Err(_) => return Json(err(400, "SNI 回落地址格式无效（示例：127.0.0.1:10443）")),
         },
-        None => RATE_DEFAULT,
+        _ => DEFAULT_SNI_FALLBACK_ADDR.to_string(),
     };
+    let sni_loop_bypass_ips = match req.sni_loop_bypass_ips.as_deref() {
+        Some(ips) => match validate_sni_loop_bypass_ips(ips) {
+            Ok(v) => v,
+            Err(_) => return Json(err(400, "防回环白名单 IP 格式无效（多个 IP 用逗号分隔）")),
+        },
+        None => String::new(),
+    };
+
     match crate::service::groups::create_group(
         state.db.as_ref(),
         &req.name,
@@ -51,8 +55,8 @@ pub async fn create_group(
         admin.user_id,
         &req.connect_host,
         &req.port_range,
-        rate,
-        req.hidden.unwrap_or(false),
+        &sni_fallback_addr,
+        &sni_loop_bypass_ips,
     )
     .await
     {
@@ -65,8 +69,7 @@ pub async fn create_group(
     }
 }
 
-/// `PUT /groups/order`: set the panel-wide display order of the groups (what
-/// the admin arranged by dragging on the node-status page). Admin only.
+/// `PUT /groups/order`: set the panel-wide display order of the groups. Admin only.
 pub async fn reorder_groups(
     admin: AdminOnly,
     State(state): State<AppState>,
@@ -74,8 +77,6 @@ pub async fn reorder_groups(
 ) -> Json<ApiResponse<()>> {
     match crate::service::groups::reorder_groups(state.db.as_ref(), &req.ids).await {
         Ok(()) => {
-            // The audit detail is the resulting order, by name: ids alone say
-            // nothing to whoever reads the log later.
             let order = match state.db.list_groups(&ResourceScope::All).await {
                 Ok(groups) => groups
                     .iter()
@@ -104,11 +105,6 @@ pub async fn reorder_groups(
     }
 }
 
-/// Rotate a device group's node token. Generates a fresh UUID, persists it,
-/// and broadcasts `config_changed` so connected nodes drop the old token and
-/// re-authenticate with the new one. This is the only way to revoke a leaked
-/// node token without deleting the whole group (and its rules). Returns the
-/// new token so the admin can hand it to the node operator.
 #[derive(serde::Serialize)]
 pub struct RotatedToken {
     token: String,
@@ -122,30 +118,13 @@ pub async fn rotate_group_token(
     match crate::service::groups::rotate_group_token(state.db.as_ref(), id).await {
         Ok(None) => Json(err(404, "分组不存在")),
         Ok(Some(new_token)) => {
-            // v0.3.9: tear down every live WS connection for this group BEFORE
-            // broadcasting. The old token just became invalid, but sockets that
-            // authenticated at upgrade time stay open with the revoked credential
-            // — close_group drops them so the node reconnects and re-auths with
-            // the new token. (broadcast_all alone was insufficient: it pushed
-            // config_changed, the node re-fetched config with the OLD token, the
-            // panel returned an empty config, and the node tore down all its
-            // listeners — a complete outage on every token rotation.)
             let closed = state.node_connections.close_group(id).await;
-            // Notify any connections in OTHER groups too (harmless no-op for this
-            // group since close_group already drained it).
-            state
-                .node_connections
-                .broadcast_all(r#"{"type":"config_changed"}"#)
-                .await;
             tracing::warn!(
                 action = "rotate_group_token",
                 group_id = id,
                 closed_connections = closed,
                 "admin rotated node token"
             );
-            // `detail` carries the blast radius (how many nodes got kicked),
-            // NEVER `new_token`. The audit log is readable by every admin and
-            // is retained for a year; a node credential must not live there.
             crate::service::audit::record(
                 &state,
                 Some(_admin.user_id),
@@ -177,14 +156,21 @@ pub async fn update_group(
     Path(id): Path<i64>,
     Json(req): Json<UpdateGroupRequest>,
 ) -> Json<ApiResponse<()>> {
-    // v1.0.8: validate rate when present. Out-of-range → 400 (don't persist).
-    let rate = match req.rate {
-        Some(r) => match validate_rate(r) {
-            Some(v) => Some(v),
-            None => return Json(err(400, "倍率必须在 0.1 到 100 之间")),
+    let sni_fallback_addr = match req.sni_fallback_addr.as_deref() {
+        Some(addr) => match validate_sni_fallback_addr(addr) {
+            Ok(v) => Some(v),
+            Err(_) => return Json(err(400, "SNI 回落地址格式无效（示例：127.0.0.1:10443）")),
         },
         None => None,
     };
+    let sni_loop_bypass_ips = match req.sni_loop_bypass_ips.as_deref() {
+        Some(ips) => match validate_sni_loop_bypass_ips(ips) {
+            Ok(v) => Some(v),
+            Err(_) => return Json(err(400, "防回环白名单 IP 格式无效（多个 IP 用逗号分隔）")),
+        },
+        None => None,
+    };
+
     match crate::service::groups::update_group(
         state.db.as_ref(),
         id,
@@ -192,20 +178,19 @@ pub async fn update_group(
         req.group_type.as_ref(),
         req.connect_host.as_deref(),
         req.port_range.as_deref(),
-        rate,
-        req.hidden,
+        sni_fallback_addr.as_deref(),
+        sni_loop_bypass_ips.as_deref(),
     )
     .await
     {
         Ok(()) => {
             state
                 .node_connections
-                .broadcast_all(r#"{"type":"config_changed"}"#)
+                .send_group(id, r#"{"type":"config_changed"}"#)
                 .await;
             Json(ApiResponse::success(()))
         }
         Err(UpdateGroupError::NoFields) => Json(err(400, "无需要更新的字段")),
-        // v0.3.6: 0 rows = group id didn't exist. 404 + no broadcast.
         Err(UpdateGroupError::NotFound) => Json(err(404, "Group not found")),
         Err(UpdateGroupError::Database(e)) => {
             tracing::error!("update_group {}: update_group_fields failed: {}", id, e);
@@ -219,9 +204,6 @@ pub async fn delete_group(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Json<ApiResponse<()>> {
-    // Read the name BEFORE deleting: afterwards the row is gone and the audit
-    // entry could only ever say "#id", which is exactly the record nobody can
-    // interpret six months later.
     let label = crate::service::audit::group_label(&state, id).await;
     match crate::service::groups::delete_group(state.db.as_ref(), id).await {
         Ok(false) => Json(err(404, "分组不存在")),
@@ -242,14 +224,7 @@ pub async fn delete_group(
                 &label,
             )
             .await;
-            // v1.0.4: close WS connections for the deleted group so nodes
-            // stop reporting.
             state.node_connections.close_group(id).await;
-            // v1.2.13: and drop its node records. Offline rows are never aged
-            // out, so without this a deleted group's nodes would stay on the
-            // node-status page as "Group N" until removed by hand.
-            // Best-effort: the group is already gone, and a row that survives
-            // a failure here can still be removed by hand.
             if let Err(e) =
                 crate::service::traffic::remove_group_status(state.db.as_ref(), id).await
             {
@@ -259,10 +234,6 @@ pub async fn delete_group(
                     e
                 );
             }
-            state
-                .node_connections
-                .broadcast_all(r#"{"type":"config_changed"}"#)
-                .await;
             Json(ApiResponse::success(()))
         }
         Err(e) => {

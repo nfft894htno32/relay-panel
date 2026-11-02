@@ -46,6 +46,8 @@ pub struct RuleGate {
     /// Live TCP connections for this rule right now. Incremented by
     /// [`RuleGate::admit`], decremented when the returned guard drops.
     live: Arc<AtomicU64>,
+    /// Last epoch second a connection-cap warning was logged for this rule.
+    last_cap_warn_secs: Arc<AtomicU64>,
     /// Restart signal. The value is a generation counter; any change means
     /// "drop the connection you are driving".
     cancel: watch::Receiver<u64>,
@@ -81,6 +83,23 @@ impl RuleGate {
         }
     }
 
+    /// Returns `true` at most once every 60 seconds per rule when a connection
+    /// is rejected by the connection cap.
+    pub fn should_warn_cap(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(1);
+        let prev = self.last_cap_warn_secs.load(Ordering::Relaxed);
+        if prev == 0 || now.saturating_sub(prev) >= 60 {
+            self.last_cap_warn_secs
+                .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        } else {
+            false
+        }
+    }
+
     /// Live connection count for this rule on this node.
     pub fn live(&self) -> u64 {
         self.live.load(Ordering::Relaxed)
@@ -105,6 +124,7 @@ impl RuleGate {
 /// task's `cancelled()` resolves).
 pub struct RuleRuntime {
     live: Arc<AtomicU64>,
+    last_cap_warn_secs: Arc<AtomicU64>,
     cancel: watch::Sender<u64>,
 }
 
@@ -113,6 +133,7 @@ impl RuleRuntime {
         let (cancel, _) = watch::channel(0);
         Self {
             live: Arc::new(AtomicU64::new(0)),
+            last_cap_warn_secs: Arc::new(AtomicU64::new(0)),
             cancel,
         }
     }
@@ -124,6 +145,7 @@ impl RuleRuntime {
         RuleGate {
             max_connections,
             live: self.live.clone(),
+            last_cap_warn_secs: self.last_cap_warn_secs.clone(),
             cancel: self.cancel.subscribe(),
         }
     }

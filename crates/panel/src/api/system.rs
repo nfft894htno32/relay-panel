@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-const REPO: &str = "MoeShinX/relay-panel";
+const REPO: &str = "nfft894htno32/relay-panel";
 const CACHE_TTL: Duration = Duration::from_secs(1800); // 30 minutes
 
 /// Cached GitHub Release info. Shared across all requests via AppState.
@@ -709,7 +709,7 @@ mod tests {
         // Real-world v0.2.0 shape: body is null
         let json = r#"{
             "tag_name": "v0.2.0",
-            "html_url": "https://github.com/MoeShinX/relay-panel/releases/tag/v0.2.0",
+            "html_url": "https://github.com/nfft894htno32/relay-panel/releases/tag/v0.2.0",
             "body": null,
             "published_at": "2026-05-01T00:00:00Z",
             "draft": false,
@@ -1001,13 +1001,13 @@ mod tests {
     use std::sync::Mutex;
 
     const API_DIRECT: &str =
-        "https://api.github.com/repos/MoeShinX/relay-panel/releases?per_page=30";
-    const API_DOWN: &str = "https://down.relaypanel.dev/https://api.github.com/repos/MoeShinX/relay-panel/releases?per_page=30";
+        "https://api.github.com/repos/nfft894htno32/relay-panel/releases?per_page=30";
+    const API_DOWN: &str = "https://down.relaypanel.dev/https://api.github.com/repos/nfft894htno32/relay-panel/releases?per_page=30";
     const PANEL_TOML: &str = "crates/panel/Cargo.toml";
     const NODE_TOML: &str = "crates/node/Cargo.toml";
 
     fn raw(prefix: &str, path: &str) -> String {
-        format!("{prefix}https://raw.githubusercontent.com/MoeShinX/relay-panel/main/{path}")
+        format!("{prefix}https://raw.githubusercontent.com/nfft894htno32/relay-panel/main/{path}")
     }
 
     fn toml_with_version(name: &str, v: &str) -> String {
@@ -1049,7 +1049,7 @@ mod tests {
         );
         assert_eq!(
             with_prefix("https://down.relaypanel.dev/", &raw_cargo_toml_url("node")),
-            "https://down.relaypanel.dev/https://raw.githubusercontent.com/MoeShinX/relay-panel/main/crates/node/Cargo.toml"
+            "https://down.relaypanel.dev/https://raw.githubusercontent.com/nfft894htno32/relay-panel/main/crates/node/Cargo.toml"
         );
     }
 
@@ -1196,11 +1196,11 @@ mod tests {
         // No notes or date, but a usable link; nothing the frontend cannot show.
         assert_eq!(
             panel.html_url.as_deref(),
-            Some("https://github.com/MoeShinX/relay-panel/releases/tag/v1.2.16")
+            Some("https://github.com/nfft894htno32/relay-panel/releases/tag/v1.2.16")
         );
         assert_eq!(
             node.html_url.as_deref(),
-            Some("https://github.com/MoeShinX/relay-panel/releases/tag/node-v1.2.10")
+            Some("https://github.com/nfft894htno32/relay-panel/releases/tag/node-v1.2.10")
         );
         assert!(panel.body.is_none() && panel.published_at.is_none());
         assert!(!panel.draft && !panel.prerelease);

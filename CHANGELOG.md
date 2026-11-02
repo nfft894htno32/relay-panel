@@ -10,6 +10,27 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-03
+
+Ships alongside 
+ode-v1.3.0. Self-hosted single-admin edition with native multi-SNI routing on port 443 and automatic anti-loop fallback.
+
+### Added
+
+- **Native single-port multi-SNI routing (Route B)**: Multiple TCP forwarding rules can now share the same inbound port (e.g. 443) within a device group when each rule specifies a distinct sni hostname (exact or wildcard *.example.com).
+- **Device group SNI fallback & anti-loop configuration**: Added sni_fallback_addr (default 127.0.0.1:10443) and sni_loop_bypass_ips on inbound device groups.
+- **Connection controls on rule creation**: max_connections and uto_restart_minutes can now be configured directly when creating a rule.
+
+### Changed
+
+- **Single-admin self-hosted architecture**: Removed commercial and multi-tenant modules (Shop, Plans, Orders, Redeem Codes, Balance, User Quotas, Public Registration, and legacy WS/TLS Tunnel Profiles). Non-destructive database migrations preserve existing tables for seamless upgrades and instant rollback from official 1.2.20.
+
+### Fixed
+
+- **Auth failure no longer wipes node config cache**: GET /api/v1/node/get_config now returns 401 Unauthorized on invalid/missing token instead of 200 OK with empty listeners.
+- **Login rate limiter (uth_throttle) hardening**: Added TRUST_PROXY_HEADERS opt-in and peer IP fallback so private/Docker bridge connections are properly rate-limited.
+- **Eliminated N+1 rule target queries**: Batched orward_rule_targets queries across rule listing and node config generation.
+
 ## [1.2.20] - 2026-11-02
 
 Ships alongside `node-v1.2.11`. The config protocol is unchanged at version 4.

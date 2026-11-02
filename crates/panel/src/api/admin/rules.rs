@@ -9,10 +9,9 @@ use axum::{
 use relay_shared::models::*;
 use relay_shared::protocol::*;
 
-/// Query params for list_rules (v0.4.20).
+/// Query params for list_rules.
 #[derive(serde::Deserialize, Default)]
 pub struct ListRulesQuery {
-    /// Admin-only: filter rules by owner. Non-admin is ignored.
     pub owner_uid: Option<i64>,
 }
 
@@ -22,7 +21,6 @@ pub async fn list_rules(
     Query(query): Query<ListRulesQuery>,
     State(state): State<AppState>,
 ) -> Json<ApiResponse<Vec<ForwardRule>>> {
-    // v0.4.20: admin can filter rules by owner_uid for user rule management.
     let scope = match (user.admin, query.owner_uid) {
         (true, Some(owner_uid)) => crate::db::repo::ResourceScope::Owner(owner_uid),
         _ => user.resource_scope(),
@@ -41,39 +39,11 @@ pub async fn create_rule(
     State(state): State<AppState>,
     Json(req): Json<CreateRuleRequest>,
 ) -> Json<ApiResponse<()>> {
-    // v1.0.4: non-admin users with a RESTRICTED permission group (group set +
-    // allow_all_groups=false) can only create rules on authorized device
-    // groups. An empty authorized list means "no groups allowed" → deny. Legacy
-    // (group_id NULL) and allow-all users skip this and defer to the service
-    // layer's normal group validation. A DB error returns 500.
-    if !user.admin {
-        let restricted = match state.db.is_user_restricted(user.user_id).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("create_rule: restriction lookup failed: {}", e);
-                return Json(err(500, "数据库错误"));
-            }
-        };
-        if restricted {
-            let allowed = match state.db.authorized_device_group_ids(user.user_id).await {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::error!("create_rule: authz lookup failed: {}", e);
-                    return Json(err(500, "数据库错误"));
-                }
-            };
-            if !allowed.contains(&req.device_group_in) {
-                return Json(err(403, "device_group_in 不在您允许的分组列表中"));
-            }
-        }
-    }
-    match crate::service::rules::create_rule(state.db.as_ref(), user.user_id, user.admin, &req)
-        .await
-    {
+    match crate::service::rules::create_rule(state.db.as_ref(), user.user_id, &req).await {
         Ok(()) => {
             state
                 .node_connections
-                .broadcast_all(r#"{"type":"config_changed"}"#)
+                .send_group(req.device_group_in, r#"{"type":"config_changed"}"#)
                 .await;
             Json(ApiResponse::success(()))
         }
@@ -82,9 +52,6 @@ pub async fn create_rule(
             409,
             format!("监听端口 {} 在此入口分组上已被占用", port),
         )),
-        // v1.2.12: the authorization re-checked inside the write transaction
-        // failed — it was revoked after the check above.
-        Err(CreateRuleError::Forbidden) => Json(err(403, "device_group_in 不在您允许的分组列表中")),
         Err(CreateRuleError::Database(e)) => {
             tracing::error!("create_rule: service failed: {}", e);
             Json(err(500, "数据库错误"))
@@ -99,83 +66,35 @@ pub async fn update_rule(
     Json(req): Json<UpdateRuleRequest>,
 ) -> Json<ApiResponse<()>> {
     let scope = user.resource_scope();
-    // v1.0.4: restricted non-admin users can only switch to authorized device
-    // groups. Legacy/allow-all users skip this. DB error → 500.
-    if !user.admin {
-        if let Some(dgi) = req.device_group_in {
-            let restricted = match state.db.is_user_restricted(user.user_id).await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("update_rule: restriction lookup failed: {}", e);
-                    return Json(err(500, "数据库错误"));
-                }
-            };
-            if restricted {
-                let allowed = match state.db.authorized_device_group_ids(user.user_id).await {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tracing::error!("update_rule: authz lookup failed: {}", e);
-                        return Json(err(500, "数据库错误"));
-                    }
-                };
-                if !allowed.contains(&dgi) {
-                    return Json(err(
-                        403,
-                        "device_group_in is not in your allowed device groups",
-                    ));
-                }
-            }
-        }
-    }
-    // v1.0.7: resuming a rule (paused → false) is ALSO gated on authorization.
-    // A restricted user whose plan was removed has their rules auto-paused; they
-    // must not be able to re-enable a rule pointing at a now-unauthorized group
-    // by sending only {paused:false} — the device_group_in check above is
-    // skipped when that field is absent. Only needed when not switching groups
-    // in the same request (that path is already covered above).
-    if !user.admin && req.paused == Some(false) && req.device_group_in.is_none() {
-        let restricted = match state.db.is_user_restricted(user.user_id).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("update_rule: restriction lookup failed: {}", e);
-                return Json(err(500, "数据库错误"));
-            }
-        };
-        if restricted {
-            match state.db.find_rule_by_id(id, &scope).await {
-                Ok(Some(rule)) => {
-                    let allowed = match state.db.authorized_device_group_ids(user.user_id).await {
-                        Ok(a) => a,
-                        Err(e) => {
-                            tracing::error!("update_rule: authz lookup failed: {}", e);
-                            return Json(err(500, "数据库错误"));
-                        }
-                    };
-                    if !allowed.contains(&rule.device_group_in) {
-                        return Json(err(403, "无法启动未被授权设备分组下的规则"));
-                    }
-                }
-                Ok(None) => return Json(err(404, "规则不存在")),
-                Err(e) => {
-                    tracing::error!("update_rule: rule lookup failed: {}", e);
-                    return Json(err(500, "数据库错误"));
-                }
-            }
-        }
-    }
+    let old_group_id = state
+        .db
+        .find_rule_by_id(id, &scope)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.device_group_in);
+
     match crate::service::rules::update_rule(state.db.as_ref(), id, &scope, &req).await {
         Ok(()) => {
-            state
-                .node_connections
-                .broadcast_all(r#"{"type":"config_changed"}"#)
-                .await;
+            if let Some(old_gid) = old_group_id {
+                state
+                    .node_connections
+                    .send_group(old_gid, r#"{"type":"config_changed"}"#)
+                    .await;
+            }
+            if let Some(new_gid) = req.device_group_in {
+                if Some(new_gid) != old_group_id {
+                    state
+                        .node_connections
+                        .send_group(new_gid, r#"{"type":"config_changed"}"#)
+                        .await;
+                }
+            }
             Json(ApiResponse::success(()))
         }
         Err(UpdateRuleError::BadRequest(msg)) => Json(err(400, msg)),
         Err(UpdateRuleError::NotFound) => Json(err(404, "规则不存在")),
         Err(UpdateRuleError::PortConflict) => Json(err(409, "监听端口在此入口分组上已被占用")),
-        Err(UpdateRuleError::Forbidden(msg)) => Json(err(403, msg)),
-        Err(UpdateRuleError::Internal(msg)) => Json(err(500, msg)),
         Err(UpdateRuleError::Database(e)) => {
             tracing::error!("update_rule {}: service failed: {}", id, e);
             Json(err(500, "数据库错误"))
@@ -183,16 +102,6 @@ pub async fn update_rule(
     }
 }
 
-/// POST /api/v1/rules/{id}/reset-traffic — v1.2.15: zero one rule's own
-/// traffic counter. Owner-scoped like delete: an admin may reset any rule, a
-/// user only their own.
-///
-/// This is the per-rule statistic only. The owner's quota
-/// (`users.traffic_used`) is counted separately, not summed from rules, so
-/// billing is untouched; so is the traffic history behind the charts. Zeroing
-/// a user's quota stays the admin's "reset traffic" on the user, which also
-/// zeroes all of that user's rules. Batch reset is the frontend calling this
-/// per rule, like batch pause/resume and restart.
 pub async fn reset_rule_traffic(
     user: AuthUser,
     State(state): State<AppState>,
@@ -234,18 +143,11 @@ pub async fn delete_rule(
     Path(id): Path<i64>,
 ) -> Json<ApiResponse<()>> {
     let scope = user.resource_scope();
-    // Snapshot the name before the delete — afterwards there is no row to read
-    // it from, and "rule 12" alone doesn't answer "who deleted my rule".
-    let rule_name = match state.db.find_rule_by_id(id, &scope).await {
-        Ok(Some(r)) => r.name,
-        _ => String::new(),
+    let (rule_name, group_id) = match state.db.find_rule_by_id(id, &scope).await {
+        Ok(Some(r)) => (r.name, Some(r.device_group_in)),
+        _ => (String::new(), None),
     };
-    // v0.3.6: check rows_affected(). A non-existent rule previously returned
-    // success AND broadcast config_changed — a no-op mutation that needlessly
-    // triggered a node re-fetch. Now 404 + no broadcast when nothing was deleted.
     match crate::service::groups::delete_rule(state.db.as_ref(), id, &scope).await {
-        // v0.3.6: nothing existed at that id. Return 404 and do NOT broadcast
-        // config_changed — a no-op delete shouldn't trigger a node re-fetch.
         Ok(false) => Json(err(404, "规则不存在")),
         Ok(true) => {
             tracing::warn!(
@@ -255,8 +157,6 @@ pub async fn delete_rule(
                 actor_admin = user.admin,
                 "destructive op"
             );
-            // Recorded for non-admins too: a rule can be deleted by its owner,
-            // and "it wasn't an admin" is itself the answer sometimes.
             crate::service::audit::record(
                 &state,
                 Some(user.user_id),
@@ -266,10 +166,12 @@ pub async fn delete_rule(
                 &rule_name,
             )
             .await;
-            state
-                .node_connections
-                .broadcast_all(r#"{"type":"config_changed"}"#)
-                .await;
+            if let Some(gid) = group_id {
+                state
+                    .node_connections
+                    .send_group(gid, r#"{"type":"config_changed"}"#)
+                    .await;
+            }
             Json(ApiResponse::success(()))
         }
         Err(e) => {

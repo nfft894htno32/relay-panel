@@ -7,8 +7,6 @@ pub struct NodeConfig {
     pub panel_url: String,
     pub token: String,
     pub poll_interval: u64,
-    pub tls_cert_path: Option<String>,
-    pub tls_key_path: Option<String>,
     /// v0.4.6: NIC for traffic stats. "auto" = auto-detect default route.
     pub network_interface: String,
     /// v1.0.4: IPv4 listen address. Empty = disabled. Default "0.0.0.0".
@@ -56,10 +54,6 @@ impl NodeConfig {
             panel_url,
             token,
             poll_interval,
-            tls_cert_path: std::env::var("TLS_CERT_PATH")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            tls_key_path: std::env::var("TLS_KEY_PATH").ok().filter(|s| !s.is_empty()),
             network_interface: std::env::var("NETWORK_INTERFACE")
                 .ok()
                 .filter(|s| !s.trim().is_empty())

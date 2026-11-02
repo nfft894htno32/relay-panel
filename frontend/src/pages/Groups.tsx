@@ -1,14 +1,13 @@
-import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Typography, Tag, Tooltip, Alert, Switch } from 'antd';
+import { Table, Button, Modal, Form, Input, Select, Space, message, Popconfirm, Typography, Tag, Tooltip, Alert } from 'antd';
 import { PlusOutlined, ReloadOutlined, CopyOutlined, EditOutlined, CloudServerOutlined, CodeOutlined, ApiOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import api from '../api/client';
-import type { ApiEnvelope, DeviceGroup, User, NodeStatus } from '../api/types';
+import type { ApiEnvelope, DeviceGroup, NodeStatus } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { useTableScroll } from '../hooks/useIsMobile';
 import { copyText } from '../utils/clipboard';
 import { formatDateTime } from '../utils/format';
 import { buildInstallCommand } from '../utils/installCommand';
-import { useAuth } from '../auth/useAuth';
 import ConnectHostsEditor from '../components/ConnectHostsEditor';
 import { NodeLabelCell } from '../components/nodes/NodeLabelCell';
 import HostSummary from '../components/HostSummary';
@@ -16,9 +15,6 @@ import { joinHosts, splitHosts } from '../utils/connectHosts';
 
 const { Text } = Typography;
 
-/** v1.2.5: the forwarding/visibility columns and fields that a monitor-only
- *  group has no use for. It carries no rules and never reaches a regular user,
- *  so connect host, port range, rate and hidden are all inert on it. */
 function isMonitorOnly(g: { group_type: string }): boolean {
   return g.group_type === 'monitor';
 }
@@ -33,9 +29,7 @@ function isLocalhost(): boolean {
 export default function Groups() {
   const tableScroll = useTableScroll();
   const { t } = useI18n();
-  const { isAdmin } = useAuth();
   const [groups, setGroups] = useState<DeviceGroup[]>([]);
-  const [users, setUsers] = useState<User[]>([]);
   const [nodes, setNodes] = useState<NodeStatus[]>([]);
   const [loading, setLoading] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
@@ -43,25 +37,13 @@ export default function Groups() {
   const [cmdModalOpen, setCmdModalOpen] = useState(false);
   const [cmdModalContent, setCmdModalContent] = useState<{ title: ReactNode; body: ReactNode }>({ title: null, body: null });
   const [editing, setEditing] = useState<DeviceGroup | null>(null);
-  // v1.2.3: node-token rotation. `rotating` is the target group; `confirmName`
-  // is the typed group name that unlocks the button — rotation kicks every node
-  // in the group offline until each is re-enrolled, so it must not be one
-  // careless click away.
   const [rotating, setRotating] = useState<DeviceGroup | null>(null);
   const [confirmName, setConfirmName] = useState('');
   const [rotateBusy, setRotateBusy] = useState(false);
-  // See load(): a failed read must not be shown as an empty group list.
   const [loadFailed, setLoadFailed] = useState(false);
   const [createForm] = Form.useForm();
   const [editForm] = Form.useForm();
 
-  // v1.2.5: a monitor-only group reports node status to admins and nothing
-  // else — no forwarding rule is ever bound to it, and list_shared_groups
-  // filters to group_type='in', so it never reaches a regular user's lines or
-  // node-status page either. Connect host, port range, rate and hidden are all
-  // dead for it, so the forms stop asking. Hidden rather than disabled: a
-  // greyed-out field still takes up the space and sends you looking for what
-  // would enable it, when the honest answer is that it does not apply at all.
   const createType = Form.useWatch('group_type', createForm) ?? 'in';
   const editType = Form.useWatch('group_type', editForm) ?? editing?.group_type;
   const createIsMonitor = createType === 'monitor';
@@ -71,40 +53,23 @@ export default function Groups() {
     setLoading(true);
     try {
       const g = await api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups');
-      // `code: 500` arrives inside a 200 response with `data: null`, so without
-      // this check a database outage renders as "no groups" — and from here an
-      // operator would go create duplicates of groups that still exist.
       if (g.code !== 0) {
         setLoadFailed(true);
       } else {
         setLoadFailed(false);
         setGroups(g.data || []);
       }
-      if (isAdmin) {
-        try {
-          const u = await api.get<unknown, ApiEnvelope<User[]>>('/admin/users');
-          setUsers(u.data || []);
-        } catch { setUsers([]); }
-        // v1.0.4: fetch node status for expandable node lists.
-        try {
-          const n = await api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes');
-          setNodes(n.data || []);
-        } catch { setNodes([]); }
-      } else {
-        setUsers([]);
-        try {
-          const n = await api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes/shared');
-          setNodes(n.data || []);
-        } catch { setNodes([]); }
-      }
+      try {
+        const n = await api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes');
+        setNodes(n.data || []);
+      } catch { setNodes([]); }
     } catch {
       setLoadFailed(true);
     } finally { setLoading(false); }
-  }, [isAdmin]);
+  }, []);
 
   useEffect(() => { load(); }, [load]);
 
-  // ── Node helpers ──
   const nodesByGroup = useCallback((groupId: number): NodeStatus[] => {
     return nodes.filter(n => n.group_id === groupId);
   }, [nodes]);
@@ -112,28 +77,25 @@ export default function Groups() {
   const nodeCount = useCallback((groupId: number) => nodesByGroup(groupId).length, [nodesByGroup]);
   const onlineCount = useCallback((groupId: number) => nodesByGroup(groupId).filter(n => n.online).length, [nodesByGroup]);
 
-  const handleCreate = async (values: { name: string; group_type: string; connect_hosts?: string[]; port_range: string; rate?: number; hidden?: boolean; owner_uid?: number | null }) => {
+  const handleCreate = async (values: {
+    name: string;
+    group_type: string;
+    connect_hosts?: string[];
+    port_range: string;
+    sni_fallback_addr?: string;
+    sni_loop_bypass_ips?: string;
+  }) => {
     try {
-      // v1.0.8: rate defaults to 1.0 on the server when omitted; send it
-      // explicitly so the value the admin picked is what gets persisted.
-      // The addresses are several inputs but one column: join them. The API
-      // wants the key even when empty (an omitted field is a 422).
       const { connect_hosts, ...rest } = values;
-      const payload = { ...rest, connect_host: joinHosts(connect_hosts ?? []), rate: values.rate ?? 1.0, hidden: values.hidden ?? false, owner_uid: values.owner_uid || undefined };
-      // v1.2.5: a monitor-only group forwards nothing, so the forwarding fields
-      // are neutralised explicitly.
-      //
-      // Not merely cosmetic: hiding the Form.Items unregisters them, so `values`
-      // arrives with no connect_host/port_range at all — and CreateGroupRequest
-      // declares both as plain `String` with no serde default, which makes an
-      // omission a 422 rather than an empty string. Empty IS a first-class value
-      // for both columns (`NOT NULL DEFAULT ''`, and resolve_auto_port_range
-      // reads empty as the default pool), so send it.
+      const payload = {
+        ...rest,
+        connect_host: joinHosts(connect_hosts ?? []),
+        sni_fallback_addr: values.sni_fallback_addr?.trim() || '127.0.0.1:10443',
+        sni_loop_bypass_ips: values.sni_loop_bypass_ips?.trim() || '',
+      };
       if (values.group_type === 'monitor') {
         payload.connect_host = '';
         payload.port_range = '';
-        payload.rate = 1.0;
-        payload.hidden = false;
       }
       const res = await api.post<unknown, ApiEnvelope<DeviceGroup>>('/groups', payload);
       if (res.code !== 0) { message.error(res.message); return; }
@@ -146,32 +108,46 @@ export default function Groups() {
 
   const handleEdit = (g: DeviceGroup) => {
     setEditing(g);
-    editForm.setFieldsValue({ name: g.name, group_type: g.group_type, connect_hosts: splitHosts(g.connect_host).length ? splitHosts(g.connect_host) : [''], port_range: g.port_range, rate: g.rate, hidden: !!g.hidden });
+    editForm.setFieldsValue({
+      name: g.name,
+      group_type: g.group_type,
+      connect_hosts: splitHosts(g.connect_host).length ? splitHosts(g.connect_host) : [''],
+      port_range: g.port_range,
+      sni_fallback_addr: g.sni_fallback_addr || '127.0.0.1:10443',
+      sni_loop_bypass_ips: g.sni_loop_bypass_ips || '',
+    });
     setEditOpen(true);
   };
 
-  const handleUpdate = async (values: { name?: string; group_type?: string; connect_hosts?: string[]; port_range?: string; rate?: number; hidden?: boolean }) => {
+  const handleUpdate = async (values: {
+    name?: string;
+    group_type?: string;
+    connect_hosts?: string[];
+    port_range?: string;
+    sni_fallback_addr?: string;
+    sni_loop_bypass_ips?: string;
+  }) => {
     if (!editing) return;
     const payload: Record<string, unknown> = {};
     if (values.name !== undefined && values.name !== editing.name) payload.name = values.name;
     if (values.group_type !== undefined && values.group_type !== editing.group_type) payload.group_type = values.group_type;
-    // v1.2.5: converting a group to monitor-only must leave its stored
-    // forwarding fields ALONE. They do nothing while the group is a monitor,
-    // but wiping them would destroy what you need to convert it back, and
-    // "switch the type to look at something, switch it back" has to be a safe
-    // round trip. No special case is needed here: hiding those Form.Items
-    // unregisters them, so they arrive undefined and the `!== undefined` guards
-    // below already skip them. Groups.test.tsx pins that round trip.
     if (values.connect_hosts !== undefined) {
       const joined = joinHosts(values.connect_hosts);
       if (joined !== joinHosts(splitHosts(editing.connect_host))) payload.connect_host = joined;
     }
     if (values.port_range !== undefined && values.port_range !== editing.port_range) payload.port_range = values.port_range;
-    // v1.0.8: only send rate when it actually changed (avoid no-op 400s and
-    // keep the diff-based payload pattern used for the other fields).
-    if (values.rate !== undefined && values.rate !== editing.rate) payload.rate = values.rate;
-    // v1.0.7: only send hidden when it actually changed.
-    if (values.hidden !== undefined && values.hidden !== !!editing.hidden) payload.hidden = values.hidden;
+    if (
+      values.sni_fallback_addr !== undefined &&
+      values.sni_fallback_addr.trim() !== (editing.sni_fallback_addr || '127.0.0.1:10443')
+    ) {
+      payload.sni_fallback_addr = values.sni_fallback_addr.trim();
+    }
+    if (
+      values.sni_loop_bypass_ips !== undefined &&
+      values.sni_loop_bypass_ips.trim() !== (editing.sni_loop_bypass_ips || '')
+    ) {
+      payload.sni_loop_bypass_ips = values.sni_loop_bypass_ips.trim();
+    }
     if (Object.keys(payload).length === 0) { setEditOpen(false); return; }
     try {
       const res = await api.put<unknown, ApiEnvelope<null>>(`/groups/${editing.id}`, payload);
@@ -183,8 +159,6 @@ export default function Groups() {
   };
 
   const handleDelete = async (id: number) => {
-    // v1.2.12: "still in use" comes back as HTTP 200 + code 409, not as an
-    // HTTP error, so the old catch-only check reported it as deleted.
     try {
       const res = await api.delete<unknown, ApiEnvelope<null>>(`/groups/${id}`);
       if (res.code !== 0) {
@@ -236,16 +210,6 @@ export default function Groups() {
     setCmdModalOpen(true);
   };
 
-  /**
-   * Rotate the group's node token. The backend invalidates the old token and
-   * force-closes this group's live WS connections (a node that reconnected with
-   * the revoked token used to fetch an empty config and tear down all its
-   * listeners), so every node here is offline until re-enrolled.
-   *
-   * The new token is shown once, together with the ready-to-paste enrollment
-   * command — this is the moment the operator needs it, and hunting for it
-   * afterwards while nodes are down is the wrong time to go looking.
-   */
   const handleRotateToken = async () => {
     if (!rotating) return;
     setRotateBusy(true);
@@ -294,17 +258,6 @@ export default function Groups() {
     }
   };
 
-  /**
-   * v1.2.5: the type column's label.
-   *
-   * `in` / `out` / `monitor` are wire values, not something to show an operator
-   * — the column rendered `gt.toUpperCase()`, so it read "IN" / "MONITOR" on an
-   * otherwise Chinese page. Reuses the same strings as the form's picker, so
-   * the label an admin picked is the label the row shows back.
-   *
-   * An unrecognised value falls back to the raw string rather than an empty
-   * tag, so a type added on the backend before its label lands still reads.
-   */
   const typeLabel = (gt: string) => {
     switch (gt) {
       case 'in': return t('inboundListener');
@@ -314,9 +267,6 @@ export default function Groups() {
     }
   };
 
-  // v1.0.4: create form only shows in/monitor (no out/egress).
-  // v1.0.9: the edit form uses the same set — outbound/egress groups are no
-  // longer offered anywhere in the UI.
   const groupTypeOptions = [
     { value: 'in', label: t('inboundListener') },
     { value: 'monitor', label: t('typeMonitor') },
@@ -324,8 +274,6 @@ export default function Groups() {
 
   const columns = [
     { title: t('id'), dataIndex: 'id', key: 'id', width: 60 },
-    // A floor on the width: with the table's other columns the name was squeezed
-    // to a few characters and wrapped one character per line.
     { title: t('name'), dataIndex: 'name', key: 'name', width: 160, ellipsis: { showTitle: true } },
     {
       title: t('type'), dataIndex: 'group_type', key: 'group_type',
@@ -343,8 +291,6 @@ export default function Groups() {
       title: t('nodeToken'), dataIndex: 'token', key: 'token',
       render: (tk: string, g: DeviceGroup) => (
         <Space>
-          {/* 150, not 180: with the wrapping actions this lets the table fit a
-              1280px window (the ellipsis still shows ~17 characters). */}
           <Text code style={{ maxWidth: 150 }} ellipsis>{tk}</Text>
           <Tooltip title={t('copyInstallCommand')}>
             <Button size="small" type="text" icon={<CodeOutlined />} aria-label={t('copyInstallCommand')} onClick={() => showInstallCommand(g)} />
@@ -352,37 +298,16 @@ export default function Groups() {
         </Space>
       ),
     },
-    // v1.2.5: these four say nothing about a monitor-only group — it forwards
-    // nothing and is never shown to a user — so it reads "-" rather than a
-    // stored value that looks like configuration but is inert. The value itself
-    // is kept in the DB; see handleUpdate.
     { title: t('connectHost'), dataIndex: 'connect_host', key: 'connect_host', render: (v: string, g: DeviceGroup) => isMonitorOnly(g) ? dash : <HostSummary value={v} empty={dash} /> },
     { title: t('portRange'), dataIndex: 'port_range', key: 'port_range', render: (v: string, g: DeviceGroup) => isMonitorOnly(g) ? dash : <span className="rp-mono">{v}</span> },
     {
-      // v1.0.8: billing rate. Only show a tag when it differs from 1.0 — a 1x
-      // column on every row is noise. The tag color reflects the multiplier
-      // direction (gold = premium line, no tag = bill-as-used).
-      title: t('rate'), dataIndex: 'rate', key: 'rate', width: 80,
-      render: (rate: number, g: DeviceGroup) => {
-        if (isMonitorOnly(g)) return dash;
-        const r = typeof rate === 'number' ? rate : 1.0;
-        if (Math.abs(r - 1.0) < 1e-9) return <span style={{ color: 'var(--rp-text-tertiary)' }}>1x</span>;
-        // Trim trailing zeros: 2.0 → "2x", 1.5 → "1.5x".
-        const label = Number.isInteger(r) ? `${r}x` : `${r}x`;
-        return <Tag color="gold">{label}</Tag>;
-      },
+      title: 'SNI 回落地址',
+      dataIndex: 'sni_fallback_addr',
+      key: 'sni_fallback_addr',
+      render: (v: string | undefined, g: DeviceGroup) =>
+        isMonitorOnly(g) ? dash : <span className="rp-mono">{v || '127.0.0.1:10443'}</span>,
     },
     {
-      // v1.0.7: hidden flag — only tag when hidden, to keep the column quiet.
-      title: t('groupHidden'), dataIndex: 'hidden', key: 'hidden', width: 80,
-      render: (hidden: boolean, g: DeviceGroup) =>
-        hidden && !isMonitorOnly(g) ? <Tag>{t('yes')}</Tag> : dash,
-    },
-    {
-      // v1.2.13: no fixed width, and the buttons wrap — one line where there is
-      // room, folded on a narrow window instead of pushing the page wider than
-      // a 1280px laptop. (A fixed width would fold them even on a wide screen;
-      // the minimum keeps a fold to two lines rather than one button each.)
       title: t('action'), key: 'action',
       render: (_: unknown, g: DeviceGroup) => (
         <Space size={0} wrap style={{ minWidth: 150 }}>
@@ -405,9 +330,6 @@ export default function Groups() {
     },
   ];
 
-  // Name one machine of a group ('' clears the name). Resolves whether it was
-  // saved, so the cell can leave its edit state either way; the reason it was
-  // not (too long, a control character) is the server's message.
   const handleSetNodeLabel = async (row: { group_id: number; node_id?: string | null }, label: string): Promise<boolean> => {
     if (!row.node_id) return false;
     try {
@@ -450,13 +372,9 @@ export default function Groups() {
           scroll={tableScroll}
           size="small"
           columns={[
-            // The admin's name for the machine (edited right here, in this column) leads;
-            // the id stays for matching it to a node's own node-id file.
             { title: t('nodeLabel'), dataIndex: 'label', key: 'label', width: 200, render: (_: unknown, n: NodeStatus) => (
               <div>
                 <NodeLabelCell row={n} t={t} onSave={handleSetNodeLabel} />
-                {/* The address under the name: with a dozen machines in a group the
-                    name alone is not always enough to tell which box is which. */}
                 <NodeAddresses node={n} />
               </div>
             ) },
@@ -504,12 +422,6 @@ export default function Groups() {
       <Modal title={t('addGroup')} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText={t('create')} cancelText={t('cancel')}>
         <Form form={createForm} onFinish={handleCreate} layout="vertical">
           <Form.Item name="name" label={t('name')} rules={[{ required: true }]}><Input placeholder="tokyo-node-1" /></Form.Item>
-          {isAdmin && (
-            <Form.Item name="owner_uid" label={t('owner')} extra={t('ownerHint')}>
-              <Select allowClear placeholder={t('ownerSelf')} options={users.map(u => ({ value: u.id, label: u.username }))} />
-            </Form.Item>
-          )}
-          {/* v1.0.4: new groups cannot be type 'out' (egress). */}
           <Form.Item name="group_type" label={t('type')} rules={[{ required: true }]} initialValue="in">
             <Select options={groupTypeOptions} />
           </Form.Item>
@@ -524,15 +436,21 @@ export default function Groups() {
             <>
               <ConnectHostsEditor t={t} />
               <Form.Item name="port_range" label={t('portRange')} rules={[{ required: true }]} initialValue="10000-65535"><Input placeholder="10000-65535" /></Form.Item>
-              {/* v1.0.8: billing rate. Users are charged real bytes × rate; the
-                  rule/user byte counters keep real bytes. 1.0 = bill as used. */}
-              <Form.Item name="rate" label={t('rate')} initialValue={1.0} extra={t('rateHint')} rules={[{ required: true }]}>
-                <InputNumber min={0.1} max={100} step={0.1} style={{ width: '100%' }} />
+              <Form.Item
+                name="sni_fallback_addr"
+                label="SNI 回落地址 (Fallback)"
+                initialValue="127.0.0.1:10443"
+                extra="单端口多 SNI 分流未匹配或触发防回环时的回落目标（默认 127.0.0.1:10443）"
+              >
+                <Input placeholder="127.0.0.1:10443" />
               </Form.Item>
-              {/* v1.0.7: hide this group from regular users' node-status / available
-                  lines. Admins always see it. */}
-              <Form.Item name="hidden" label={t('groupHidden')} valuePropName="checked" initialValue={false} extra={t('groupHiddenHint')}>
-                <Switch />
+              <Form.Item
+                name="sni_loop_bypass_ips"
+                label="防回环额外白名单 IP/CIDR"
+                initialValue=""
+                extra="可选，逗号分隔（支持 IP 或 CIDR）。除本机公网 IP 和当前端口转发目标 IP 外，额外直接回落到 Fallback 的来源 IP"
+              >
+                <Input placeholder="203.0.113.10,198.51.100.0/24" />
               </Form.Item>
             </>
           )}
@@ -552,15 +470,21 @@ export default function Groups() {
             />
           ) : (
             <>
-              {/* A legacy outbound group's address is a real forwarding target, so it stays
-                  a single value; and what it already holds (maybe a hostname) stays valid. */}
               <ConnectHostsEditor t={t} legacy={splitHosts(editing?.connect_host)} canAdd={editType !== 'out'} />
               <Form.Item name="port_range" label={t('portRange')}><Input /></Form.Item>
-              <Form.Item name="rate" label={t('rate')} extra={t('rateHint')}>
-                <InputNumber min={0.1} max={100} step={0.1} style={{ width: '100%' }} />
+              <Form.Item
+                name="sni_fallback_addr"
+                label="SNI 回落地址 (Fallback)"
+                extra="单端口多 SNI 分流未匹配或触发防回环时的回落目标（默认 127.0.0.1:10443）"
+              >
+                <Input placeholder="127.0.0.1:10443" />
               </Form.Item>
-              <Form.Item name="hidden" label={t('groupHidden')} valuePropName="checked" extra={t('groupHiddenHint')}>
-                <Switch />
+              <Form.Item
+                name="sni_loop_bypass_ips"
+                label="防回环额外白名单 IP/CIDR"
+                extra="可选，逗号分隔（支持 IP 或 CIDR）。除本机公网 IP 和当前端口转发目标 IP 外，额外直接回落到 Fallback 的来源 IP"
+              >
+                <Input placeholder="203.0.113.10,198.51.100.0/24" />
               </Form.Item>
             </>
           )}
@@ -571,10 +495,6 @@ export default function Groups() {
         {cmdModalContent.body}
       </Modal>
 
-      {/* v1.2.3: rotate confirmation. Deliberately heavier than a Popconfirm —
-          this disconnects every node in the group until each one is manually
-          re-enrolled, so it states the node count and requires the group name
-          to be typed. */}
       <Modal
         title={t('rotateTokenConfirmTitle')}
         open={!!rotating}
@@ -610,8 +530,6 @@ export default function Groups() {
   );
 }
 
-/** A node's public address(es), small and grey under its name: IPv4 first, then
- *  IPv6 when it has one. Nothing when the node has not reported an address yet. */
 function NodeAddresses({ node }: { node: { public_ipv4?: string | null; public_ip?: string | null; public_ipv6?: string | null } }) {
   const addrs = [node.public_ipv4 ?? node.public_ip, node.public_ipv6].filter((a): a is string => !!a);
   if (addrs.length === 0) return null;

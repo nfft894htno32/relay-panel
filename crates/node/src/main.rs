@@ -168,11 +168,9 @@ async fn run() {
 
     let counter = Arc::new(TrafficCounter::new());
     let connections = Arc::new(ConnectionTracker::new());
-    let mut manager_inner = ForwarderManager::new(counter.clone(), connections.clone());
-    // v1.0.4: configure dual-stack listen and outbound source IP. A
-    // misconfigured outbound (invalid IP, missing interface, non-local IP) is
-    // a fatal startup error — we refuse to boot rather than silently routing
-    // traffic out the wrong NIC.
+    let metrics = Arc::new(NodeMetrics::new(&config.network_interface));
+    let mut manager_inner =
+        ForwarderManager::new(counter.clone(), connections.clone(), metrics.clone());
     if let Err(e) = manager_inner.set_network_config(&config) {
         eprintln!(
             "FATAL: invalid outbound configuration: {}\n  \
@@ -182,28 +180,8 @@ async fn run() {
         std::process::exit(1);
     }
 
-    // v0.4.1: load TLS certificate + start hot-reloader for tls_simple listeners.
-    // CertReloader ALWAYS starts the poll task, even if the initial load fails
-    // (missing file, bad PEM, etc). The poll task retries every 5s and picks up
-    // the cert once the file is fixed — no restart needed. Raw/WS always run.
-    let tls_listener_errors = manager_inner.listener_errors_arc();
-    match (&config.tls_cert_path, &config.tls_key_path) {
-        (Some(cert), Some(key)) => {
-            let (reloader, shared) = forwarder::cert_reloader::CertReloader::new(cert, key);
-            manager_inner.set_tls_acceptor(Some(shared));
-            reloader.spawn_poll_task(tls_listener_errors.clone());
-        }
-        _ => {
-            tracing::info!(
-                "No TLS_CERT_PATH/TLS_KEY_PATH set — tls_simple disabled (Raw/WS unaffected)"
-            );
-        }
-    }
-
     let manager = Arc::new(Mutex::new(manager_inner));
 
-    // Unified sampler: CPU/mem + disk + network rate + cumulative traffic.
-    let metrics = Arc::new(NodeMetrics::new(&config.network_interface));
     // Seed CPU + network baselines (fast, no sleep) and fire-and-forget the
     // CPU second-sample warm-up so the first real report is sane.
     metrics.seed_baselines().await;

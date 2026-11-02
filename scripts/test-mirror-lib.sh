@@ -115,10 +115,10 @@ run_lib() {
       eval "$1" )
 }
 
-PANEL=ghcr.io/moeshinx/relay-panel-panel:1.2.15
-NODE=ghcr.io/moeshinx/relay-panel-node:1.2.9
-NODE_NAMED=moeshinx/relay-panel-node
-PANEL_NAMED=moeshinx/relay-panel-panel
+PANEL=ghcr.io/nfft894htno32/relay-panel-panel:1.2.15
+NODE=ghcr.io/nfft894htno32/relay-panel-node:1.2.9
+NODE_NAMED=nfft894htno32/relay-panel-node
+PANEL_NAMED=nfft894htno32/relay-panel-panel
 
 echo "image names"
 new_case
@@ -183,8 +183,8 @@ check "never by tag" no_call "docker pull ghcr.nju.edu.cn/$NODE_NAMED:1.2.9"
 check "the probe asked for the digest reference too" has_call "docker manifest inspect ghcr.nju.edu.cn/$NODE_NAMED@$DIGEST"
 check "tagged back" has_call "docker tag ghcr.nju.edu.cn/$NODE_NAMED@$DIGEST $NODE"
 check "the mirror's name is dropped" has_call "docker rmi ghcr.nju.edu.cn/$NODE_NAMED@$DIGEST"
-check "the digest came from ghcr.io" grep -q 'https://ghcr.io/v2/moeshinx/relay-panel-node/manifests/1.2.9' "$S/curl-calls"
-check "the registry token scope is URL-encoded" grep -q 'scope=repository%3Amoeshinx%2Frelay-panel-node%3Apull' "$S/curl-calls"
+check "the digest came from ghcr.io" grep -q 'https://ghcr.io/v2/nfft894htno32/relay-panel-node/manifests/1.2.9' "$S/curl-calls"
+check "the registry token scope is URL-encoded" grep -q 'scope=repository%3Anfft894htno32%2Frelay-panel-node%3Apull' "$S/curl-calls"
 check "the public mirror was never asked for a digest" bash -c "! grep -q 'nju' '$S/curl-calls'"
 
 echo "the digest comes from down.relaypanel.dev when ghcr.io does not answer"

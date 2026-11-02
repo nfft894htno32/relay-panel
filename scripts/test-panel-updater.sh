@@ -35,7 +35,7 @@ setup() {
     echo "$1" > "$STATE/version"
     echo "$MAIN_SHA" > "$STATE/main-sha"
     : > "$STATE/git-calls"; : > "$STATE/probe-calls"
-    compose() { printf 'services:\n  panel:\n    image: ghcr.io/moeshinx/relay-panel-panel:${RELAYPANEL_PANEL_TAG:-%s}\n' "$1"; }
+    compose() { printf 'services:\n  panel:\n    image: ghcr.io/nfft894htno32/relay-panel-panel:${RELAYPANEL_PANEL_TAG:-%s}\n' "$1"; }
     compose "$1" > "$REPO/docker-compose.release.yaml"
     compose "$2" > "$STATE/compose-after-pull"
     : > "$REPO/.env"
@@ -189,7 +189,7 @@ check "status is valid JSON" valid_json
 check "nothing was stopped" bash -c "! grep -q stop '$STATE/docker-calls' 2>/dev/null"
 
 DOWN='https://down.relaypanel.dev/'
-REPO_URL='https://github.com/MoeShinX/relay-panel.git'
+REPO_URL='https://github.com/nfft894htno32/relay-panel.git'
 
 echo "fast-forward refused (diverged history or local changes)"
 setup 1.2.10 1.2.11

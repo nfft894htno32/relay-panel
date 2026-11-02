@@ -13,9 +13,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/MoeShinX/relay-panel/releases/latest"><img src="https://img.shields.io/github/v/release/MoeShinX/relay-panel?style=flat-square&label=Release&color=blue" alt="Release" /></a>
-  <a href="https://github.com/MoeShinX/relay-panel/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/MoeShinX/relay-panel/ci.yml?style=flat-square&label=CI" alt="CI" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/MoeShinX/relay-panel?style=flat-square&label=License&color=blue" alt="License" /></a>
+  <a href="https://github.com/nfft894htno32/relay-panel/releases/latest"><img src="https://img.shields.io/github/v/release/nfft894htno32/relay-panel?style=flat-square&label=Release&color=blue" alt="Release" /></a>
+  <a href="https://github.com/nfft894htno32/relay-panel/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/nfft894htno32/relay-panel/ci.yml?style=flat-square&label=CI" alt="CI" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/nfft894htno32/relay-panel?style=flat-square&label=License&color=blue" alt="License" /></a>
 </p>
 
 <p align="center">
@@ -78,7 +78,7 @@
 **一条命令部署：**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeShinX/relay-panel/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/nfft894htno32/relay-panel/main/install.sh | bash
 ```
 
 大陆服务器上，GitHub 无法直连时，安装和更新会自动改走下载镜像，无需额外操作。

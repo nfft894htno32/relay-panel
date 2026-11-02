@@ -59,13 +59,8 @@ const nonAdminMe: UserSelf = {
   id: 5,
   username: 'bob',
   admin: false,
-  balance: '0',
-  plan_id: 1,
-  plan_name: 'free',
-  max_rules: 5,
   current_rules: 0,
   traffic_used: 0,
-  traffic_limit: 0,
   registered_at: '2024-01-01',
   must_change_password: false,
 };

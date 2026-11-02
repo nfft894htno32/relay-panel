@@ -1,12 +1,12 @@
 import { Card, Col, Row, Statistic, Table, Tag, Typography, Alert, Modal, Button, Space, Tooltip } from 'antd';
 import {
-  CloudServerOutlined, ApiOutlined, UserOutlined, DashboardOutlined, ReloadOutlined,
+  CloudServerOutlined, ApiOutlined, DashboardOutlined, ReloadOutlined,
   ArrowUpOutlined, ArrowDownOutlined,
 } from '@ant-design/icons';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, User, ForwardRule, DeviceGroup, NodeStatus } from '../api/types';
+import type { ApiEnvelope, ForwardRule, DeviceGroup, NodeStatus } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { aggregateNodesByGroup } from '../components/nodes/aggregate';
 import TrafficChart from '../components/TrafficChart';
@@ -25,53 +25,37 @@ interface VersionInfo {
   release_url: string;
   release_notes: string;
   published_at: string;
-  /** True if the GitHub release check itself failed (network / parse / non-2xx).
-   *  In this case latest_version is unreliable; surface a "check failed" hint
-   *  instead of letting the user think they are up to date. */
   check_failed: boolean;
-  /** Short human-readable error from the last failed check. Empty on success. */
   error_message: string;
 }
 
 const IGNORED_KEY = 'relaypanel_ignored_version';
-// The "Update Now" button points here. README.md is the user-facing entry
-// doc with the one-line install + a dedicated upgrade section, so it's a better
-// landing page than the (more ops-focused) docs/DEPLOYMENT.md.
-const DEPLOY_DOC_URL = 'https://github.com/MoeShinX/relay-panel/blob/main/README.md#-更新';
+const DEPLOY_DOC_URL = 'https://github.com/nfft894htno32/relay-panel/blob/main/README.md#-更新';
 
 export default function Dashboard() {
   const { t } = useI18n();
   const navigate = useNavigate();
   const isMobile = useIsMobile();
   const tableScroll = useTableScroll();
-  const [stats, setStats] = useState({ users: 0, rules: 0, groups: 0 });
-  // v1.2.0: kept whole (not just the count) for the traffic chart's drill-down.
+  const [stats, setStats] = useState({ rules: 0, groups: 0 });
   const [ruleList, setRuleList] = useState<ForwardRule[]>([]);
   const [nodes, setNodes] = useState<NodeStatus[]>([]);
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [showChangelog, setShowChangelog] = useState(false);
   const [versionRefreshing, setVersionRefreshing] = useState(false);
-  // See load(): a failed read must not be counted as zero.
   const [loadFailed, setLoadFailed] = useState(false);
 
   const load = async () => {
     try {
-      const [users, rules, groups] = await Promise.all([
-        api.get<unknown, ApiEnvelope<User[]>>('/admin/users'),
+      const [rules, groups] = await Promise.all([
         api.get<unknown, ApiEnvelope<ForwardRule[]>>('/rules'),
         api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups'),
       ]);
-      // These reads report a database failure as `code: 500` with `data: null`
-      // inside a 200 response. Counting a null payload would put "0 users,
-      // 0 rules, 0 groups" on the dashboard — the most alarming possible way
-      // to render an outage, and wrong. Keep the last known numbers and say
-      // that the refresh failed instead.
-      if (users.code !== 0 || rules.code !== 0 || groups.code !== 0) {
+      if (rules.code !== 0 || groups.code !== 0) {
         setLoadFailed(true);
       } else {
         setLoadFailed(false);
         setStats({
-          users: users.data?.length || 0,
           rules: rules.data?.length || 0,
           groups: groups.data?.length || 0,
         });
@@ -319,13 +303,10 @@ export default function Dashboard() {
         </Tooltip>
       </div>
       <Row gutter={isMobile ? 8 : 16} style={{ marginBottom: 20 }}>
-        <Col span={8}>
-          <Card className="rp-stat-card"><Statistic title={t('users')} value={stats.users} prefix={<UserOutlined style={{ color: 'var(--rp-primary)' }} />} /></Card>
-        </Col>
-        <Col span={8}>
+        <Col span={12}>
           <Card className="rp-stat-card"><Statistic title={t('forwardRules')} value={stats.rules} prefix={<ApiOutlined style={{ color: 'var(--rp-primary)' }} />} /></Card>
         </Col>
-        <Col span={8}>
+        <Col span={12}>
           <Card className="rp-stat-card"><Statistic title={t('deviceGroups')} value={stats.groups} prefix={<CloudServerOutlined style={{ color: 'var(--rp-primary)' }} />} /></Card>
         </Col>
       </Row>

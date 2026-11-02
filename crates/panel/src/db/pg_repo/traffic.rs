@@ -65,27 +65,6 @@ impl TrafficRepository for PgRepository {
             }
         }
 
-        // ── v1.0.8: read this group's billing rate once for the whole batch
-        // (every entry in a batch is for the SAME group_id). rate lives on
-        // device_groups; users are CHARGED real * rate (rounded) while
-        // forward_rules keeps real bytes. Missing group → rate=1.0 (defensive;
-        // its rules will be rejected as Unavailable below anyway). ──
-        let rate: f64 = sqlx::query_scalar("SELECT rate FROM device_groups WHERE id = $1")
-            .bind(group_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .flatten()
-            .unwrap_or(1.0);
-        if !(0.1..=100.0).contains(&rate) {
-            let _ = tx.rollback().await;
-            tracing::error!(
-                "traffic_batch: group {} has out-of-range rate {} (expected 0.1..=100)",
-                group_id,
-                rate
-            );
-            return Ok(vec![TrafficEntryResult::Overflow]);
-        }
-
         // ── Pass 1: validate u64→i64 per entry + aggregate duplicate rule_ids
         // into one per-rule delta (so the cumulative overflow check sees the
         // true batch total, not a per-row slice). ──
@@ -114,16 +93,11 @@ impl TrafficRepository for PgRepository {
         }
 
         // ── Pass 2: ownership + existing-value resolution.
-        // SINGLE query per distinct rule_id, gated by device_group_in. A miss =
-        // "not available" (missing OR foreign); NO second existence query (that
-        // was the rule-id oracle). Reason logged server-side only.
         struct Resolved {
             rule_id: i64,
             uid: i64,
             delta_up: u64,
             delta_down: u64,
-            /// v1.0.8: billed bytes charged to the USER = round((up+down) * rate).
-            /// Separate from delta_up/delta_down (real bytes for the rule).
             billed_delta: i64,
         }
         let mut resolved: Vec<Resolved> = Vec::with_capacity(rule_delta.len());
@@ -136,8 +110,6 @@ impl TrafficRepository for PgRepository {
                     return Ok(vec![TrafficEntryResult::Overflow]);
                 }
             };
-            // JOIN users to fetch both the rule's and the user's current totals
-            // in one round trip (same as the SQLite path).
             let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
                 "SELECT fr.id, fr.uid, fr.traffic_used, u.traffic_used \
                  FROM forward_rules fr \
@@ -158,19 +130,11 @@ impl TrafficRepository for PgRepository {
                 let _ = tx.rollback().await;
                 return Ok(vec![TrafficEntryResult::Unavailable]);
             };
-            // Per-rule cumulative overflow (REAL bytes — rate does not apply).
             if rule_used.checked_add(rule_delta_sum).is_none() {
                 let _ = tx.rollback().await;
                 return Ok(vec![TrafficEntryResult::Overflow]);
             }
-            // v1.0.8: billed delta charged to the user = round(real * rate).
-            let billed_raw = (rule_delta_sum as f64) * rate;
-            let billed_delta = if billed_raw.is_finite() && billed_raw <= i64::MAX as f64 {
-                billed_raw.round() as i64
-            } else {
-                let _ = tx.rollback().await;
-                return Ok(vec![TrafficEntryResult::Overflow]);
-            };
+            let billed_delta = rule_delta_sum;
             // Per-user cumulative overflow: existing total + running batch delta
             // (BILLED bytes).
             let cur_user_delta = *user_delta.get(&uid).unwrap_or(&0);

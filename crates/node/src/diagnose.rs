@@ -151,7 +151,7 @@ async fn probe_tcp(addr: &str) -> TargetProbeOutcome {
 /// POST the result to the panel (same channel/auth as report_status).
 async fn report(config: &NodeConfig, result: DiagnoseResult) -> Result<(), String> {
     let url = format!("{}/api/v1/node/diagnose_result", config.panel_url);
-    let client = reqwest::Client::new();
+    let client = crate::poller::http_client();
     let resp = client
         .post(&url)
         // v1.2.6: the panel stops waiting for a diagnosis after a few seconds,

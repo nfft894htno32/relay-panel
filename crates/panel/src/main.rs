@@ -2,7 +2,6 @@ mod api;
 mod cli;
 mod config;
 mod db;
-mod dto;
 mod service;
 
 use axum::Router;
@@ -47,15 +46,6 @@ async fn main() {
     }
 
     let db = open_database(&config).await;
-
-    // v0.4.10 PR3: seed the app_settings row from REGISTRATION_ENABLED on the
-    // very first boot. insert_settings_if_absent is a no-op once the row
-    // exists, so the env var can NEVER re-enable registration after an admin
-    // turns it off — only the admin PUT endpoint mutates the row afterwards.
-    // This runs through the Repository trait so SQLite + PG share one path.
-    db.insert_settings_if_absent(config.registration_enabled, 1, &[1])
-        .await
-        .expect("Failed to seed app settings");
 
     // Build the SPA fallback: ServeDir handles static assets, and any unknown
     // path falls back to index.html so client-side routing works.

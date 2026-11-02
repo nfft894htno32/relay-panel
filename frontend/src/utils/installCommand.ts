@@ -1,6 +1,6 @@
 /** The node installer, straight from the repository. */
 export const INSTALL_SCRIPT_URL =
-  'https://raw.githubusercontent.com/MoeShinX/relay-panel/main/scripts/relay-node-install.sh';
+  'https://raw.githubusercontent.com/nfft894htno32/relay-panel/main/scripts/relay-node-install.sh';
 
 /**
  * Where the installer script may be fetched from, tried in this order (5 s to

@@ -2,7 +2,122 @@ use super::PgRepository;
 use crate::db::error::DbError;
 use crate::db::repo::*;
 use async_trait::async_trait;
-use relay_shared::models::ForwardRule;
+use relay_shared::models::{ForwardRule, ForwardRuleTarget};
+use relay_shared::protocol::RuleTargetRequest;
+use std::collections::HashMap;
+
+const RULE_COLS: &str =
+    "id, name, uid, paused, listen_port, protocol, device_group_in, device_group_out, \
+     forward_mode, NULLIF(sni, '') AS sni, target_addr, target_port, load_balance_strategy, upload_limit_mbps, \
+     download_limit_mbps, max_connections, auto_restart_minutes, proxy_protocol_send, \
+     proxy_protocol_accept, proxy_protocol_trusted, config, traffic_used, status, created_at";
+
+async fn check_port_conflict_pg(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    exclude_rule_id: Option<i64>,
+    device_group_in: i64,
+    listen_port: i32,
+    protocol: &str,
+    sni: Option<&str>,
+) -> Result<(), DbError> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(device_group_in)
+        .execute(&mut **tx)
+        .await?;
+
+    let uses_tcp = protocol == "tcp" || protocol == "tcp_udp" || protocol == "both";
+    let uses_udp = protocol == "udp" || protocol == "tcp_udp" || protocol == "both";
+    let exclude_id = exclude_rule_id.unwrap_or(-1);
+
+    if uses_udp {
+        let udp_conflict: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM forward_rules \
+             WHERE device_group_in = $1 AND listen_port = $2 AND id != $3 \
+               AND protocol IN ('udp', 'tcp_udp', 'both') \
+             LIMIT 1",
+        )
+        .bind(device_group_in)
+        .bind(listen_port)
+        .bind(exclude_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if udp_conflict.is_some() {
+            return Err(DbError::PortConflict);
+        }
+    }
+
+    if uses_tcp {
+        let tcp_conflict: Option<(i64,)> = match sni {
+            None => {
+                sqlx::query_as(
+                    "SELECT id FROM forward_rules \
+                     WHERE device_group_in = $1 AND listen_port = $2 AND id != $3 \
+                       AND protocol IN ('tcp', 'tcp_udp', 'both') \
+                     LIMIT 1",
+                )
+                .bind(device_group_in)
+                .bind(listen_port)
+                .bind(exclude_id)
+                .fetch_optional(&mut **tx)
+                .await?
+            }
+            Some(sni_val) => {
+                sqlx::query_as(
+                    "SELECT id FROM forward_rules \
+                     WHERE device_group_in = $1 AND listen_port = $2 AND id != $3 \
+                       AND protocol IN ('tcp', 'tcp_udp', 'both') \
+                       AND (sni IS NULL OR sni = '' OR LOWER(sni) = LOWER($4)) \
+                     LIMIT 1",
+                )
+                .bind(device_group_in)
+                .bind(listen_port)
+                .bind(exclude_id)
+                .bind(sni_val)
+                .fetch_optional(&mut **tx)
+                .await?
+            }
+        };
+        if tcp_conflict.is_some() {
+            return Err(DbError::PortConflict);
+        }
+    }
+
+    Ok(())
+}
+
+async fn batch_load_targets_pg(
+    pool: &sqlx::PgPool,
+    rule_ids: &[i64],
+    enabled_only: bool,
+) -> Result<Vec<ForwardRuleTarget>, DbError> {
+    if rule_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut all_targets = Vec::new();
+    for chunk in rule_ids.chunks(500) {
+        let placeholders = (1..=chunk.len())
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let enabled_clause = if enabled_only {
+            " AND enabled = TRUE"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT * FROM forward_rule_targets \
+             WHERE rule_id IN ({placeholders}){enabled_clause} \
+             ORDER BY rule_id, position, id"
+        );
+        let mut q = sqlx::query_as::<_, ForwardRuleTarget>(&sql);
+        for &id in chunk {
+            q = q.bind(id);
+        }
+        let mut rows = q.fetch_all(pool).await?;
+        all_targets.append(&mut rows);
+    }
+    Ok(all_targets)
+}
 
 // ── RuleRepository ──
 
@@ -10,15 +125,26 @@ use relay_shared::models::ForwardRule;
 impl RuleRepository for PgRepository {
     async fn list_rules(&self, scope: &ResourceScope) -> Result<Vec<ForwardRule>, DbError> {
         let mut rules: Vec<ForwardRule> = match scope.owner_id() {
-            None => sqlx::query_as("SELECT * FROM forward_rules ORDER BY id"),
-            Some(uid) => {
-                sqlx::query_as("SELECT * FROM forward_rules WHERE uid = $1 ORDER BY id").bind(uid)
-            }
+            None => sqlx::query_as(&format!("SELECT {RULE_COLS} FROM forward_rules ORDER BY id"))
+                .fetch_all(&self.pool)
+                .await?,
+            Some(uid) => sqlx::query_as(&format!(
+                "SELECT {RULE_COLS} FROM forward_rules WHERE uid = $1 ORDER BY id"
+            ))
+            .bind(uid)
+            .fetch_all(&self.pool)
+            .await?,
+        };
+        let rule_ids: Vec<i64> = rules.iter().map(|r| r.id).collect();
+        let targets = batch_load_targets_pg(&self.pool, &rule_ids, false).await?;
+        let mut by_rule: HashMap<i64, Vec<ForwardRuleTarget>> = HashMap::new();
+        for t in targets {
+            by_rule.entry(t.rule_id).or_default().push(t);
         }
-        .fetch_all(&self.pool)
-        .await?;
         for rule in &mut rules {
-            rule.targets = self.list_rule_targets(rule.id, scope).await?;
+            if let Some(ts) = by_rule.remove(&rule.id) {
+                rule.targets = ts;
+            }
         }
         Ok(rules)
     }
@@ -28,40 +154,59 @@ impl RuleRepository for PgRepository {
         rule_id: i64,
         scope: &ResourceScope,
     ) -> Result<Option<ForwardRule>, DbError> {
-        let mut rule: Option<ForwardRule> = match scope.owner_id() {
-            None => sqlx::query_as("SELECT * FROM forward_rules WHERE id = $1").bind(rule_id),
-            Some(uid) => sqlx::query_as("SELECT * FROM forward_rules WHERE id = $1 AND uid = $2")
-                .bind(rule_id)
-                .bind(uid),
-        }
-        .fetch_optional(&self.pool)
+        let rule: Option<ForwardRule> = match scope.owner_id() {
+            None => sqlx::query_as(&format!(
+                "SELECT {RULE_COLS} FROM forward_rules WHERE id = $1"
+            ))
+            .bind(rule_id)
+            .fetch_optional(&self.pool)
+            .await?,
+            Some(uid) => sqlx::query_as(&format!(
+                "SELECT {RULE_COLS} FROM forward_rules WHERE id = $1 AND uid = $2"
+            ))
+            .bind(rule_id)
+            .bind(uid)
+            .fetch_optional(&self.pool)
+            .await?,
+        };
+        let Some(mut rule) = rule else {
+            return Ok(None);
+        };
+        rule.targets = sqlx::query_as(
+            "SELECT * FROM forward_rule_targets WHERE rule_id = $1 ORDER BY position, id",
+        )
+        .bind(rule.id)
+        .fetch_all(&self.pool)
         .await?;
-        if let Some(r) = &mut rule {
-            r.targets = self.list_rule_targets(r.id, scope).await?;
-        }
-        Ok(rule)
+        Ok(Some(rule))
     }
 
     async fn list_rule_targets(
         &self,
         rule_id: i64,
         scope: &ResourceScope,
-    ) -> Result<Vec<relay_shared::models::ForwardRuleTarget>, DbError> {
-        let targets = match scope.owner_id() {
+    ) -> Result<Vec<ForwardRuleTarget>, DbError> {
+        let targets: Vec<ForwardRuleTarget> = match scope.owner_id() {
             None => sqlx::query_as(
-                "SELECT * FROM forward_rule_targets WHERE rule_id = $1 ORDER BY position, id",
-            )
-            .bind(rule_id),
-            Some(uid) => sqlx::query_as(
-                "SELECT * FROM forward_rule_targets WHERE rule_id = $1 AND EXISTS \
-                 (SELECT 1 FROM forward_rules WHERE id = forward_rule_targets.rule_id AND uid = $2) \
-                 ORDER BY position, id",
+                "SELECT t.* FROM forward_rule_targets t \
+                 JOIN forward_rules r ON r.id = t.rule_id \
+                 WHERE t.rule_id = $1 \
+                 ORDER BY t.position, t.id",
             )
             .bind(rule_id)
-            .bind(uid),
-        }
-        .fetch_all(&self.pool)
-        .await?;
+            .fetch_all(&self.pool)
+            .await?,
+            Some(uid) => sqlx::query_as(
+                "SELECT t.* FROM forward_rule_targets t \
+                 JOIN forward_rules r ON r.id = t.rule_id \
+                 WHERE t.rule_id = $1 AND r.uid = $2 \
+                 ORDER BY t.position, t.id",
+            )
+            .bind(rule_id)
+            .bind(uid)
+            .fetch_all(&self.pool)
+            .await?,
+        };
         Ok(targets)
     }
 
@@ -69,61 +214,89 @@ impl RuleRepository for PgRepository {
         &self,
         rule_id: i64,
         scope: &ResourceScope,
-    ) -> Result<Vec<relay_shared::models::ForwardRuleTarget>, DbError> {
-        let targets = match scope.owner_id() {
+    ) -> Result<Vec<ForwardRuleTarget>, DbError> {
+        let targets: Vec<ForwardRuleTarget> = match scope.owner_id() {
             None => sqlx::query_as(
-                "SELECT * FROM forward_rule_targets WHERE rule_id = $1 AND enabled = TRUE ORDER BY position, id",
-            )
-            .bind(rule_id),
-            Some(uid) => sqlx::query_as(
-                "SELECT * FROM forward_rule_targets WHERE rule_id = $1 AND enabled = TRUE AND EXISTS \
-                 (SELECT 1 FROM forward_rules WHERE id = forward_rule_targets.rule_id AND uid = $2) \
-                 ORDER BY position, id",
+                "SELECT t.* FROM forward_rule_targets t \
+                 JOIN forward_rules r ON r.id = t.rule_id \
+                 WHERE t.rule_id = $1 AND t.enabled = TRUE \
+                 ORDER BY t.position, t.id",
             )
             .bind(rule_id)
-            .bind(uid),
-        }
-        .fetch_all(&self.pool)
-        .await?;
+            .fetch_all(&self.pool)
+            .await?,
+            Some(uid) => sqlx::query_as(
+                "SELECT t.* FROM forward_rule_targets t \
+                 JOIN forward_rules r ON r.id = t.rule_id \
+                 WHERE t.rule_id = $1 AND r.uid = $2 AND t.enabled = TRUE \
+                 ORDER BY t.position, t.id",
+            )
+            .bind(rule_id)
+            .bind(uid)
+            .fetch_all(&self.pool)
+            .await?,
+        };
         Ok(targets)
+    }
+
+    async fn list_enabled_targets_for_rules(
+        &self,
+        rule_ids: &[i64],
+    ) -> Result<Vec<ForwardRuleTarget>, DbError> {
+        batch_load_targets_pg(&self.pool, rule_ids, true).await
     }
 
     async fn replace_rule_targets(
         &self,
         rule_id: i64,
         scope: &ResourceScope,
-        targets: &[relay_shared::protocol::RuleTargetRequest],
+        targets: &[RuleTargetRequest],
     ) -> Result<(), DbError> {
-        // Scope guard: under Owner scope, no-op unless the rule is owned by uid.
-        if let Some(uid) = scope.owner_id() {
-            let owned: Option<(i32,)> =
-                sqlx::query_as("SELECT 1 FROM forward_rules WHERE id = $1 AND uid = $2")
-                    .bind(rule_id)
-                    .bind(uid)
-                    .fetch_optional(&self.pool)
-                    .await?;
-            if owned.is_none() {
-                return Ok(());
-            }
-        }
         let mut tx = self.pool.begin().await?;
+        let exists: Option<(i64,)> = match scope.owner_id() {
+            None => sqlx::query_as("SELECT id FROM forward_rules WHERE id = $1")
+                .bind(rule_id)
+                .fetch_optional(&mut *tx)
+                .await?,
+            Some(uid) => sqlx::query_as("SELECT id FROM forward_rules WHERE id = $1 AND uid = $2")
+                .bind(rule_id)
+                .bind(uid)
+                .fetch_optional(&mut *tx)
+                .await?,
+        };
+        if exists.is_none() {
+            return Err(DbError::NotFound);
+        }
+
         sqlx::query("DELETE FROM forward_rule_targets WHERE rule_id = $1")
             .bind(rule_id)
             .execute(&mut *tx)
             .await?;
-        for (idx, target) in targets.iter().enumerate() {
+
+        for (pos, t) in targets.iter().enumerate() {
             sqlx::query(
-                "INSERT INTO forward_rule_targets (rule_id, host, port, position, enabled) \
+                "INSERT INTO forward_rule_targets \
+                 (rule_id, host, port, position, enabled) \
                  VALUES ($1, $2, $3, $4, $5)",
             )
             .bind(rule_id)
-            .bind(target.host.trim())
-            .bind(target.port as i32)
-            .bind(idx as i32 + 1)
-            .bind(target.enabled)
+            .bind(&t.host)
+            .bind(t.port as i32)
+            .bind((pos + 1) as i32)
+            .bind(t.enabled)
             .execute(&mut *tx)
             .await?;
         }
+
+        if let Some(primary) = targets.iter().find(|t| t.enabled).or(targets.first()) {
+            sqlx::query("UPDATE forward_rules SET target_addr = $1, target_port = $2 WHERE id = $3")
+                .bind(&primary.host)
+                .bind(primary.port as i32)
+                .bind(rule_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
         tx.commit().await?;
         Ok(())
     }
@@ -135,20 +308,22 @@ impl RuleRepository for PgRepository {
         strategy: &str,
     ) -> Result<u64, DbError> {
         let result = match scope.owner_id() {
-            None => {
-                sqlx::query("UPDATE forward_rules SET load_balance_strategy = $1 WHERE id = $2")
-                    .bind(strategy)
-                    .bind(rule_id)
-            }
+            None => sqlx::query(
+                "UPDATE forward_rules SET load_balance_strategy = $1 WHERE id = $2",
+            )
+            .bind(strategy)
+            .bind(rule_id)
+            .execute(&self.pool)
+            .await?,
             Some(uid) => sqlx::query(
                 "UPDATE forward_rules SET load_balance_strategy = $1 WHERE id = $2 AND uid = $3",
             )
             .bind(strategy)
             .bind(rule_id)
-            .bind(uid),
-        }
-        .execute(&self.pool)
-        .await?;
+            .bind(uid)
+            .execute(&self.pool)
+            .await?,
+        };
         Ok(result.rows_affected())
     }
 
@@ -161,22 +336,27 @@ impl RuleRepository for PgRepository {
     ) -> Result<u64, DbError> {
         let result = match scope.owner_id() {
             None => sqlx::query(
-                "UPDATE forward_rules SET upload_limit_mbps = $1, download_limit_mbps = $2 WHERE id = $3",
+                "UPDATE forward_rules \
+                 SET upload_limit_mbps = $1, download_limit_mbps = $2 \
+                 WHERE id = $3",
             )
             .bind(upload_limit_mbps)
             .bind(download_limit_mbps)
-            .bind(rule_id),
+            .bind(rule_id)
+            .execute(&self.pool)
+            .await?,
             Some(uid) => sqlx::query(
-                "UPDATE forward_rules SET upload_limit_mbps = $1, download_limit_mbps = $2 \
+                "UPDATE forward_rules \
+                 SET upload_limit_mbps = $1, download_limit_mbps = $2 \
                  WHERE id = $3 AND uid = $4",
             )
             .bind(upload_limit_mbps)
             .bind(download_limit_mbps)
             .bind(rule_id)
-            .bind(uid),
-        }
-        .execute(&self.pool)
-        .await?;
+            .bind(uid)
+            .execute(&self.pool)
+            .await?,
+        };
         Ok(result.rows_affected())
     }
 
@@ -189,222 +369,71 @@ impl RuleRepository for PgRepository {
     ) -> Result<u64, DbError> {
         let result = match scope.owner_id() {
             None => sqlx::query(
-                "UPDATE forward_rules SET max_connections = $1, auto_restart_minutes = $2 WHERE id = $3",
+                "UPDATE forward_rules \
+                 SET max_connections = $1, auto_restart_minutes = $2 \
+                 WHERE id = $3",
             )
             .bind(max_connections)
             .bind(auto_restart_minutes)
-            .bind(rule_id),
+            .bind(rule_id)
+            .execute(&self.pool)
+            .await?,
             Some(uid) => sqlx::query(
-                "UPDATE forward_rules SET max_connections = $1, auto_restart_minutes = $2 \
+                "UPDATE forward_rules \
+                 SET max_connections = $1, auto_restart_minutes = $2 \
                  WHERE id = $3 AND uid = $4",
             )
             .bind(max_connections)
             .bind(auto_restart_minutes)
             .bind(rule_id)
-            .bind(uid),
-        }
-        .execute(&self.pool)
-        .await?;
+            .bind(uid)
+            .execute(&self.pool)
+            .await?,
+        };
         Ok(result.rows_affected())
     }
 
     async fn list_auto_restart_rules(&self) -> Result<Vec<(i64, i64, i32)>, DbError> {
-        // `paused = FALSE` — PG stores paused as a real BOOLEAN, unlike SQLite's
-        // INTEGER 0/1. See the exclusion rationale in the SQLite implementation.
-        Ok(sqlx::query_as(
+        let rows: Vec<(i64, i64, i32)> = sqlx::query_as(
             "SELECT id, device_group_in, auto_restart_minutes FROM forward_rules \
-             WHERE auto_restart_minutes > 0 AND paused = FALSE",
+             WHERE auto_restart_minutes > 0 AND paused = FALSE \
+             ORDER BY id",
         )
         .fetch_all(&self.pool)
-        .await?)
-    }
-
-    async fn set_rule_tunnel_profile(
-        &self,
-        rule_id: i64,
-        scope: &ResourceScope,
-        profile_id: Option<i64>,
-    ) -> Result<u64, DbError> {
-        let result = match scope.owner_id() {
-            None => sqlx::query("UPDATE forward_rules SET tunnel_profile_id = $1 WHERE id = $2")
-                .bind(profile_id)
-                .bind(rule_id),
-            Some(uid) => sqlx::query(
-                "UPDATE forward_rules SET tunnel_profile_id = $1 WHERE id = $2 AND uid = $3",
-            )
-            .bind(profile_id)
-            .bind(rule_id)
-            .bind(uid),
-        }
-        .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected())
+        Ok(rows)
     }
 
     async fn list_group_port_protocols(
         &self,
         device_group_in: i64,
     ) -> Result<Vec<(i32, String)>, DbError> {
-        let rows: Vec<(i32, String)> = sqlx::query_as(
+        let used: Vec<(i32, String)> = sqlx::query_as(
             "SELECT listen_port, protocol FROM forward_rules WHERE device_group_in = $1",
         )
         .bind(device_group_in)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows)
+        Ok(used)
     }
 
     async fn group_port_range(&self, group_id: i64) -> Result<Option<String>, DbError> {
-        // port_range is TEXT NOT NULL, so the Option here reflects row existence
-        // (missing group -> None), not a null column.
-        let range: Option<String> =
-            sqlx::query_scalar("SELECT port_range FROM device_groups WHERE id = $1")
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT port_range FROM device_groups WHERE id = $1")
                 .bind(group_id)
                 .fetch_optional(&self.pool)
                 .await?;
-        Ok(range)
+        Ok(row.map(|(r,)| r))
     }
 
     async fn count_by_uid(&self, uid: i64) -> Result<i64, DbError> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules WHERE uid = $1")
-            .bind(uid)
-            .fetch_one(&self.pool)
-            .await?;
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM forward_rules WHERE uid = $1 AND paused = FALSE",
+        )
+        .bind(uid)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(count)
-    }
-
-    async fn max_rules_for_uid(&self, uid: i64) -> Result<i32, DbError> {
-        let max_rules: i32 =
-            sqlx::query_scalar("SELECT COALESCE(max_rules, 0) FROM users WHERE id = $1")
-                .bind(uid)
-                .fetch_one(&self.pool)
-                .await?;
-        Ok(max_rules)
-    }
-
-    async fn insert_quota_guarded(
-        &self,
-        name: &str,
-        uid: i64,
-        listen_port: i32,
-        protocol: &str,
-        public_transport: &str,
-        node_transport: &str,
-        route_mode: &str,
-        entry_transport: &str,
-        ws_path: Option<&str>,
-        device_group_in: i64,
-        device_group_out: Option<i64>,
-        forward_mode: &str,
-        target_addr: &str,
-        target_port: i32,
-    ) -> Result<u64, DbError> {
-        // v0.4.4: serialize concurrent inserts for the SAME user with a row lock.
-        // PostgreSQL's MVCC means two concurrent transactions can both read the
-        // same COUNT(*) and both pass the quota check, overshooting max_rules.
-        // SQLite avoids this via single-writer serialization; PG needs an
-        // explicit lock. We take `SELECT ... FOR UPDATE` on the user row inside a
-        // transaction, so a second creator for the same uid blocks until the
-        // first commits and then re-evaluates the (now-updated) count.
-        //
-        // v0.4.11 PR4: ALSO serialize concurrent inserts for the SAME inbound
-        // group with a per-group advisory xact lock, so the port-conflict
-        // pre-check below is race-safe (two users sharing one group can't both
-        // pass the check for the same port). Lock order is ALWAYS advisory(group)
-        // then row(user) across every caller, so no deadlock cycle can form.
-        //
-        // The INSERT keeps its own WHERE guard as the authoritative quota check
-        // and the partial unique indexes are the authoritative port backstop;
-        // the locks only make the reads stable for the duration.
-        let needs_tcp = matches!(protocol, "tcp" | "tcp_udp");
-        let needs_udp = matches!(protocol, "udp" | "tcp_udp");
-
-        let mut tx = self.pool.begin().await?;
-
-        // Per-group advisory lock (released automatically at tx end).
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(device_group_in)
-            .execute(&mut *tx)
-            .await?;
-
-        // Lock the user row. If the user doesn't exist, there's nothing to lock
-        // and the INSERT's FK on uid would fail anyway — let it surface naturally.
-        sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE")
-            .bind(uid)
-            .fetch_optional(&mut *tx)
-            .await?;
-
-        // Port-conflict pre-check: same inbound group + same port + an
-        // overlapping socket type. A pure-TCP and a pure-UDP rule do NOT conflict.
-        let conflict: Result<Option<(i32,)>, sqlx::Error> = sqlx::query_as(
-            "SELECT 1 FROM forward_rules \
-             WHERE device_group_in = $1 AND listen_port = $2 \
-               AND ( ($3 AND protocol IN ('tcp', 'tcp_udp')) \
-                  OR ($4 AND protocol IN ('udp', 'tcp_udp')) ) \
-             LIMIT 1",
-        )
-        .bind(device_group_in)
-        .bind(listen_port)
-        .bind(needs_tcp)
-        .bind(needs_udp)
-        .fetch_optional(&mut *tx)
-        .await;
-        match conflict {
-            Ok(Some(_)) => {
-                let _ = tx.rollback().await;
-                return Err(DbError::PortConflict);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                let _ = tx.rollback().await;
-                return Err(e.into());
-            }
-        }
-
-        // 14 row-value binds ($1..$14) + 3 uid binds for the WHERE subqueries
-        // ($15..$17). Same atomic quota-guarded INSERT shape as SQLite.
-        let result = sqlx::query(
-            "INSERT INTO forward_rules \
-               (name, uid, listen_port, protocol, public_transport, node_transport, \
-                route_mode, entry_transport, ws_path, \
-                device_group_in, device_group_out, forward_mode, target_addr, target_port) \
-             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14 \
-             WHERE (SELECT max_rules FROM users WHERE id = $15) = 0 \
-                OR (SELECT COUNT(*) FROM forward_rules WHERE uid = $16) \
-                   < (SELECT max_rules FROM users WHERE id = $17)",
-        )
-        .bind(name)
-        .bind(uid)
-        .bind(listen_port)
-        .bind(protocol)
-        .bind(public_transport)
-        .bind(node_transport)
-        .bind(route_mode)
-        .bind(entry_transport)
-        .bind(ws_path)
-        .bind(device_group_in)
-        .bind(device_group_out)
-        .bind(forward_mode)
-        .bind(target_addr)
-        .bind(target_port)
-        .bind(uid)
-        .bind(uid)
-        .bind(uid)
-        .execute(&mut *tx)
-        .await;
-
-        match result {
-            Ok(r) => {
-                tx.commit().await?;
-                Ok(r.rows_affected())
-            }
-            Err(e) => {
-                // Roll back so the user-row lock is released; map the error
-                // (e.g. UNIQUE on listen_port) the same way as elsewhere.
-                let _ = tx.rollback().await;
-                Err(e.into())
-            }
-        }
     }
 
     async fn create_rule_full(
@@ -413,250 +442,88 @@ impl RuleRepository for PgRepository {
         uid: i64,
         listen_port: i32,
         protocol: &str,
-        public_transport: &str,
-        node_transport: &str,
-        route_mode: &str,
-        entry_transport: &str,
-        ws_path: Option<&str>,
+        sni: Option<&str>,
         device_group_in: i64,
         device_group_out: Option<i64>,
         forward_mode: &str,
         target_addr: &str,
         target_port: i32,
-        targets: &[relay_shared::protocol::RuleTargetRequest],
+        targets: &[RuleTargetRequest],
         load_balance_strategy: &str,
         upload_limit_mbps: i32,
         download_limit_mbps: i32,
-        tunnel_profile_id: Option<i64>,
-        check_owner_authorization: bool,
-        proxy_protocol: &crate::db::repo::RuleProxyProtocol,
-    ) -> Result<Option<i64>, DbError> {
-        // v1.2: atomic create. Same advisory-xact-lock + user-row FOR UPDATE +
-        // conflict pre-check + quota-guarded INSERT shape as
-        // insert_quota_guarded, but the INSERT is a RETURNING-id, followed by
-        // the targets / LB / rate-limit / tunnel writes INSIDE the same tx.
-        // The new id comes from RETURNING (not a post-commit listen_port
-        // re-lookup), so two inbound groups reusing a port can't cross-write.
-
-        let needs_tcp = matches!(protocol, "tcp" | "tcp_udp");
-        let needs_udp = matches!(protocol, "udp" | "tcp_udp");
-
+        max_connections: i32,
+        auto_restart_minutes: i32,
+        proxy_protocol: &RuleProxyProtocol,
+    ) -> Result<i64, DbError> {
         let mut tx = self.pool.begin().await?;
 
-        // Convert any sqlx error into a rollback + DbError early return so the
-        // body stays linear. Evaluates to `!`, so `try_!(expr)` is well-typed
-        // for any sqlx::Error-producing statement.
-        macro_rules! try_ {
-            ($tx:expr, $expr:expr) => {
-                match $expr {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = $tx.rollback().await;
-                        return Err(DbError::from(e));
-                    }
-                }
-            };
-        }
+        check_port_conflict_pg(
+            &mut tx,
+            None,
+            device_group_in,
+            listen_port,
+            protocol,
+            sni,
+        )
+        .await?;
 
-        // Lock order: advisory(group) then row(user) — identical to
-        // insert_quota_guarded so no deadlock cycle can form.
-        try_!(
-            tx,
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(device_group_in)
-                .execute(&mut *tx)
-                .await
-        );
+        let (rule_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO forward_rules \
+             (name, uid, listen_port, protocol, sni, device_group_in, device_group_out, \
+              forward_mode, target_addr, target_port, load_balance_strategy, \
+              upload_limit_mbps, download_limit_mbps, max_connections, auto_restart_minutes, \
+              proxy_protocol_send, proxy_protocol_accept, proxy_protocol_trusted) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+             RETURNING id",
+        )
+        .bind(name)
+        .bind(uid)
+        .bind(listen_port)
+        .bind(protocol)
+        .bind(sni.unwrap_or(""))
+        .bind(device_group_in)
+        .bind(device_group_out)
+        .bind(forward_mode)
+        .bind(target_addr)
+        .bind(target_port)
+        .bind(load_balance_strategy)
+        .bind(upload_limit_mbps)
+        .bind(download_limit_mbps)
+        .bind(max_connections)
+        .bind(auto_restart_minutes)
+        .bind(&proxy_protocol.send)
+        .bind(proxy_protocol.accept)
+        .bind(&proxy_protocol.trusted)
+        .fetch_one(&mut *tx)
+        .await?;
 
-        try_!(
-            tx,
-            sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE")
-                .bind(uid)
-                .fetch_optional(&mut *tx)
-                .await
-        );
-
-        // v1.2.12: the owner's authorization for this group, re-checked with
-        // the owner row locked — the row every authorization change locks
-        // first — so a revocation is either fully visible here or waits for
-        // this rule and then pauses it (see the trait docs).
-        if check_owner_authorization {
-            let allowed = try_!(
-                tx,
-                super::user_groups::owner_may_use_group(&mut tx, uid, device_group_in).await
-            );
-            if !allowed {
-                let _ = tx.rollback().await;
-                return Err(DbError::GroupNotAuthorized);
-            }
-        }
-
-        let conflict: Option<(i32,)> = try_!(
-            tx,
-            sqlx::query_as(
-                "SELECT 1 FROM forward_rules \
-                 WHERE device_group_in = $1 AND listen_port = $2 \
-                   AND ( ($3 AND protocol IN ('tcp', 'tcp_udp')) \
-                      OR ($4 AND protocol IN ('udp', 'tcp_udp')) ) \
-                 LIMIT 1",
+        for (pos, t) in targets.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO forward_rule_targets \
+                 (rule_id, host, port, position, enabled) \
+                 VALUES ($1, $2, $3, $4, $5)",
             )
-            .bind(device_group_in)
-            .bind(listen_port)
-            .bind(needs_tcp)
-            .bind(needs_udp)
-            .fetch_optional(&mut *tx)
-            .await
-        );
-        if conflict.is_some() {
-            let _ = tx.rollback().await;
-            return Err(DbError::PortConflict);
+            .bind(rule_id)
+            .bind(&t.host)
+            .bind(t.port as i32)
+            .bind((pos + 1) as i32)
+            .bind(t.enabled)
+            .execute(&mut *tx)
+            .await?;
         }
 
-        // RETURNING id so we get the new row's id directly. The WHERE quota
-        // guard is the same as SQLite's; when it matches 0 rows the SELECT
-        // yields no id → Option<i64> None → quota exhausted.
-        let rule_id: Option<i64> = try_!(
-            tx,
-            sqlx::query_scalar(
-                "INSERT INTO forward_rules \
-                   (name, uid, listen_port, protocol, public_transport, node_transport, \
-                    route_mode, entry_transport, ws_path, \
-                    device_group_in, device_group_out, forward_mode, target_addr, target_port) \
-                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14 \
-                 WHERE (SELECT max_rules FROM users WHERE id = $15) = 0 \
-                    OR (SELECT COUNT(*) FROM forward_rules WHERE uid = $16) \
-                       < (SELECT max_rules FROM users WHERE id = $17) \
-                 RETURNING id",
-            )
-            .bind(name)
-            .bind(uid)
-            .bind(listen_port)
-            .bind(protocol)
-            .bind(public_transport)
-            .bind(node_transport)
-            .bind(route_mode)
-            .bind(entry_transport)
-            .bind(ws_path)
-            .bind(device_group_in)
-            .bind(device_group_out)
-            .bind(forward_mode)
-            .bind(target_addr)
-            .bind(target_port)
-            .bind(uid)
-            .bind(uid)
-            .bind(uid)
-            .fetch_optional(&mut *tx)
-            .await
-        );
-
-        let Some(rule_id) = rule_id else {
-            // Quota exhausted — nothing inserted. Commit the empty tx.
-            tx.commit().await?;
-            return Ok(None);
-        };
-
-        try_!(
-            tx,
-            sqlx::query("DELETE FROM forward_rule_targets WHERE rule_id = $1")
+        if let Some(primary) = targets.iter().find(|t| t.enabled).or(targets.first()) {
+            sqlx::query("UPDATE forward_rules SET target_addr = $1, target_port = $2 WHERE id = $3")
+                .bind(&primary.host)
+                .bind(primary.port as i32)
                 .bind(rule_id)
                 .execute(&mut *tx)
-                .await
-        );
-        for (idx, target) in targets.iter().enumerate() {
-            try_!(
-                tx,
-                sqlx::query(
-                    "INSERT INTO forward_rule_targets (rule_id, host, port, position, enabled) \
-                     VALUES ($1, $2, $3, $4, $5)",
-                )
-                .bind(rule_id)
-                .bind(target.host.trim())
-                .bind(target.port as i32)
-                .bind(idx as i32 + 1)
-                .bind(target.enabled)
-                .execute(&mut *tx)
-                .await
-            );
-        }
-
-        if load_balance_strategy != "first" {
-            try_!(
-                tx,
-                sqlx::query("UPDATE forward_rules SET load_balance_strategy = $1 WHERE id = $2")
-                    .bind(load_balance_strategy)
-                    .bind(rule_id)
-                    .execute(&mut *tx)
-                    .await
-            );
-        }
-
-        // v1.2.15: PROXY protocol, written only when on (the column defaults
-        // are off), in the same transaction as the rule.
-        if *proxy_protocol != crate::db::repo::RuleProxyProtocol::default() {
-            try_!(
-                tx,
-                sqlx::query(
-                    "UPDATE forward_rules SET proxy_protocol_send = $1, proxy_protocol_accept = $2, \
-                     proxy_protocol_trusted = $3 WHERE id = $4",
-                )
-                .bind(&proxy_protocol.send)
-                .bind(proxy_protocol.accept)
-                .bind(&proxy_protocol.trusted)
-                .bind(rule_id)
-                .execute(&mut *tx)
-                .await
-            );
-        }
-
-        if upload_limit_mbps != 0 || download_limit_mbps != 0 {
-            try_!(
-                tx,
-                sqlx::query(
-                    "UPDATE forward_rules SET upload_limit_mbps = $1, download_limit_mbps = $2 \
-                     WHERE id = $3",
-                )
-                .bind(upload_limit_mbps)
-                .bind(download_limit_mbps)
-                .bind(rule_id)
-                .execute(&mut *tx)
-                .await
-            );
-        }
-
-        if let Some(pid) = tunnel_profile_id {
-            try_!(
-                tx,
-                sqlx::query("UPDATE forward_rules SET tunnel_profile_id = $1 WHERE id = $2")
-                    .bind(pid)
-                    .bind(rule_id)
-                    .execute(&mut *tx)
-                    .await
-            );
+                .await?;
         }
 
         tx.commit().await?;
-        Ok(Some(rule_id))
-    }
-
-    async fn find_transport_by_id(
-        &self,
-        id: i64,
-        scope: &ResourceScope,
-    ) -> Result<Option<(String, String)>, DbError> {
-        let row: Option<(String, String)> = match scope.owner_id() {
-            None => {
-                sqlx::query_as("SELECT protocol, public_transport FROM forward_rules WHERE id = $1")
-                    .bind(id)
-            }
-            Some(uid) => sqlx::query_as(
-                "SELECT protocol, public_transport FROM forward_rules WHERE id = $1 AND uid = $2",
-            )
-            .bind(id)
-            .bind(uid),
-        }
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row)
+        Ok(rule_id)
     }
 
     async fn find_device_group_out_by_id(
@@ -665,201 +532,133 @@ impl RuleRepository for PgRepository {
         scope: &ResourceScope,
     ) -> Result<Option<Option<i64>>, DbError> {
         let row: Option<(Option<i64>,)> = match scope.owner_id() {
-            None => {
-                sqlx::query_as("SELECT device_group_out FROM forward_rules WHERE id = $1").bind(id)
-            }
+            None => sqlx::query_as("SELECT device_group_out FROM forward_rules WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
             Some(uid) => sqlx::query_as(
                 "SELECT device_group_out FROM forward_rules WHERE id = $1 AND uid = $2",
             )
             .bind(id)
-            .bind(uid),
-        }
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(v,)| v))
+            .bind(uid)
+            .fetch_optional(&self.pool)
+            .await?,
+        };
+        Ok(row.map(|(g,)| g))
     }
 
     async fn update_rule_full(
         &self,
         id: i64,
         scope: &ResourceScope,
-        u: &RuleUpdate<'_>,
+        update: &RuleUpdate<'_>,
     ) -> Result<u64, DbError> {
-        // Same field order as SQLite. PG needs numbered placeholders; we walk
-        // the SET list twice — once to know which fields are present, once to
-        // bind them in order.
-        let mut sets: Vec<&str> = Vec::new();
-        if u.name.is_some() {
-            sets.push("name = ");
-        }
-        if u.listen_port.is_some() {
-            sets.push("listen_port = ");
-        }
-        if u.protocol.is_some() {
-            sets.push("protocol = ");
-        }
-        if u.public_transport.is_some() {
-            sets.push("public_transport = ");
-            sets.push("node_transport = ");
-            sets.push("entry_transport = ");
-        }
-        if u.route_mode.is_some() {
-            sets.push("route_mode = ");
-        }
-        if u.ws_path.is_some() {
-            sets.push("ws_path = ");
-        }
-        if u.device_group_in.is_some() {
-            sets.push("device_group_in = ");
-        }
-        if u.device_group_out.is_some() {
-            sets.push("device_group_out = ");
-        }
-        if u.forward_mode.is_some() {
-            sets.push("forward_mode = ");
-        }
-        if u.target_addr.is_some() {
-            sets.push("target_addr = ");
-        }
-        if u.target_port.is_some() {
-            sets.push("target_port = ");
-        }
-        if u.paused.is_some() {
-            sets.push("paused = ");
-            // v1.0.8: an explicit paused write is always a human action (the
-            // on/off switch, batch pause/resume) — clear auto_paused so a later
-            // buy_plan re-authorization doesn't treat this rule as something IT
-            // needs to reconcile.
-            sets.push("auto_paused = ");
-        }
-        // v1.2.12: columns that used to be written one call each after the
-        // main UPDATE — so an edit that failed half-way had already changed
-        // some of them. Each is its own column: an omitted one stays as it is.
-        if u.load_balance_strategy.is_some() {
-            sets.push("load_balance_strategy = ");
-        }
-        if u.upload_limit_mbps.is_some() {
-            sets.push("upload_limit_mbps = ");
-        }
-        if u.download_limit_mbps.is_some() {
-            sets.push("download_limit_mbps = ");
-        }
-        if u.max_connections.is_some() {
-            sets.push("max_connections = ");
-        }
-        if u.auto_restart_minutes.is_some() {
-            sets.push("auto_restart_minutes = ");
-        }
-        if u.tunnel_profile_id.is_some() {
-            sets.push("tunnel_profile_id = ");
-        }
-        if u.proxy_protocol_send.is_some() {
-            sets.push("proxy_protocol_send = ");
-        }
-        if u.proxy_protocol_accept.is_some() {
-            sets.push("proxy_protocol_accept = ");
-        }
-        if u.proxy_protocol_trusted.is_some() {
-            sets.push("proxy_protocol_trusted = ");
-        }
-        if sets.is_empty() && u.targets.is_none() {
-            return Ok(0);
-        }
-
         let mut tx = self.pool.begin().await?;
-        let owner: Option<(i64,)> = match scope.owner_id() {
-            None => {
-                sqlx::query_as("SELECT uid FROM forward_rules WHERE id = $1")
-                    .bind(id)
-                    .fetch_optional(&mut *tx)
-                    .await?
-            }
-            Some(uid) => {
-                sqlx::query_as("SELECT uid FROM forward_rules WHERE id = $1 AND uid = $2")
-                    .bind(id)
-                    .bind(uid)
-                    .fetch_optional(&mut *tx)
-                    .await?
-            }
+
+        let current: Option<(i32, String, Option<String>, i64)> = match scope.owner_id() {
+            None => sqlx::query_as(
+                "SELECT listen_port, protocol, NULLIF(sni, '') AS sni, device_group_in \
+                 FROM forward_rules WHERE id = $1 \
+                 FOR UPDATE",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?,
+            Some(uid) => sqlx::query_as(
+                "SELECT listen_port, protocol, NULLIF(sni, '') AS sni, device_group_in \
+                 FROM forward_rules WHERE id = $1 AND uid = $2 \
+                 FOR UPDATE",
+            )
+            .bind(id)
+            .bind(uid)
+            .fetch_optional(&mut *tx)
+            .await?,
         };
-        let Some((uid,)) = owner else {
+        let Some((cur_port, cur_proto, cur_sni, cur_group_in)) = current else {
             return Ok(0);
         };
 
-        let resuming = u.paused == Some(false);
-        let checks_group = u.check_owner_authorization && (resuming || u.device_group_in.is_some());
-        // PostgreSQL has concurrent writers, so a resume — and, v1.2.12, any
-        // write that re-checks the owner's authorization — locks the owner row
-        // before the rule. Same order as buy_plan and the authorization
-        // changes (user → rules), which lock that row first too: this edit
-        // runs entirely before or after them, so neither a stale active count
-        // nor a stale authorization can be acted on.
-        let mut max_rules = 0i32;
-        if resuming || checks_group {
-            max_rules = sqlx::query_scalar(
-                "SELECT COALESCE(max_rules, 0) FROM users WHERE id = $1 FOR UPDATE",
-            )
-            .bind(uid)
-            .fetch_one(&mut *tx)
-            .await?;
-        }
-        let rule: Option<(bool, i64)> = sqlx::query_as(
-            "SELECT paused, device_group_in FROM forward_rules \
-             WHERE id = $1 AND uid = $2 FOR UPDATE",
-        )
-        .bind(id)
-        .bind(uid)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((is_paused, group_in)) = rule else {
-            return Ok(0);
+        let eff_port = update.listen_port.unwrap_or(cur_port);
+        let eff_proto = update.protocol.unwrap_or(cur_proto.as_str());
+        let eff_sni: Option<&str> = match update.sni {
+            Some(s) => s,
+            None => cur_sni.as_deref(),
         };
+        let eff_group_in = update.device_group_in.unwrap_or(cur_group_in);
 
-        // v1.2.12: resuming the rule, or moving it to another inbound group,
-        // needs the owner's authorization for that group as it is NOW (see the
-        // SQLite impl).
-        if checks_group {
-            let group = u.device_group_in.unwrap_or(group_in);
-            if !super::user_groups::owner_may_use_group(&mut tx, uid, group).await? {
-                return Err(DbError::GroupNotAuthorized);
-            }
-        }
-
-        if resuming && is_paused {
-            let active_rules: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM forward_rules WHERE uid = $1 AND paused = FALSE",
+        if update.listen_port.is_some()
+            || update.protocol.is_some()
+            || update.sni.is_some()
+            || update.device_group_in.is_some()
+        {
+            check_port_conflict_pg(
+                &mut tx,
+                Some(id),
+                eff_group_in,
+                eff_port,
+                eff_proto,
+                eff_sni,
             )
-            .bind(uid)
-            .fetch_one(&mut *tx)
             .await?;
-            if max_rules > 0 && active_rules >= i64::from(max_rules) {
-                return Err(DbError::QuotaExceeded);
-            }
         }
 
-        if let Some(targets) = u.targets {
-            sqlx::query("DELETE FROM forward_rule_targets WHERE rule_id = $1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            for (idx, target) in targets.iter().enumerate() {
-                sqlx::query(
-                    "INSERT INTO forward_rule_targets (rule_id, host, port, position, enabled) \
-                     VALUES ($1, $2, $3, $4, $5)",
-                )
-                .bind(id)
-                .bind(target.host.trim())
-                .bind(target.port as i32)
-                .bind(idx as i32 + 1)
-                .bind(target.enabled)
-                .execute(&mut *tx)
-                .await?;
+        if update.has_columns() {
+            let mut sets: Vec<&str> = Vec::new();
+            if update.name.is_some() {
+                sets.push("name = ");
             }
-        }
+            if update.listen_port.is_some() {
+                sets.push("listen_port = ");
+            }
+            if update.protocol.is_some() {
+                sets.push("protocol = ");
+            }
+            if update.sni.is_some() {
+                sets.push("sni = ");
+            }
+            if update.device_group_in.is_some() {
+                sets.push("device_group_in = ");
+            }
+            if update.device_group_out.is_some() {
+                sets.push("device_group_out = ");
+            }
+            if update.forward_mode.is_some() {
+                sets.push("forward_mode = ");
+            }
+            if update.target_addr.is_some() {
+                sets.push("target_addr = ");
+            }
+            if update.target_port.is_some() {
+                sets.push("target_port = ");
+            }
+            if update.paused.is_some() {
+                sets.push("paused = ");
+            }
+            if update.load_balance_strategy.is_some() {
+                sets.push("load_balance_strategy = ");
+            }
+            if update.upload_limit_mbps.is_some() {
+                sets.push("upload_limit_mbps = ");
+            }
+            if update.download_limit_mbps.is_some() {
+                sets.push("download_limit_mbps = ");
+            }
+            if update.max_connections.is_some() {
+                sets.push("max_connections = ");
+            }
+            if update.auto_restart_minutes.is_some() {
+                sets.push("auto_restart_minutes = ");
+            }
+            if update.proxy_protocol_send.is_some() {
+                sets.push("proxy_protocol_send = ");
+            }
+            if update.proxy_protocol_accept.is_some() {
+                sets.push("proxy_protocol_accept = ");
+            }
+            if update.proxy_protocol_trusted.is_some() {
+                sets.push("proxy_protocol_trusted = ");
+            }
 
-        if !sets.is_empty() {
-            // Number the placeholders; id is the last bind. The scope was
-            // checked above, in this transaction.
             let mut ph = 1;
             let sets_with_ph: Vec<String> = sets
                 .iter()
@@ -870,78 +669,97 @@ impl RuleRepository for PgRepository {
                 })
                 .collect();
             let sql = format!(
-                "UPDATE forward_rules SET {} WHERE id = ${}",
-                sets_with_ph.join(", "),
-                ph
+                "UPDATE forward_rules SET {} WHERE id = ${ph}",
+                sets_with_ph.join(", ")
             );
             let mut q = sqlx::query(&sql);
-            if let Some(v) = u.name {
+            if let Some(v) = update.name {
                 q = q.bind(v);
             }
-            if let Some(v) = u.listen_port {
+            if let Some(v) = update.listen_port {
                 q = q.bind(v);
             }
-            if let Some(v) = u.protocol {
+            if let Some(v) = update.protocol {
                 q = q.bind(v);
             }
-            if let Some(v) = u.public_transport {
-                q = q.bind(v);
-                q = q.bind(u.node_transport.unwrap_or(v));
-                q = q.bind(u.entry_transport.unwrap_or(v));
+            if let Some(v) = update.sni {
+                q = q.bind(v.unwrap_or(""));
             }
-            if let Some(v) = u.route_mode {
+            if let Some(v) = update.device_group_in {
                 q = q.bind(v);
             }
-            if let Some(v) = u.ws_path {
+            if let Some(v) = update.device_group_out {
                 q = q.bind(v);
             }
-            if let Some(v) = u.device_group_in {
+            if let Some(v) = update.forward_mode {
                 q = q.bind(v);
             }
-            if let Some(v) = u.device_group_out {
+            if let Some(v) = update.target_addr {
                 q = q.bind(v);
             }
-            if let Some(v) = u.forward_mode {
+            if let Some(v) = update.target_port {
                 q = q.bind(v);
             }
-            if let Some(v) = u.target_addr {
+            if let Some(v) = update.paused {
                 q = q.bind(v);
             }
-            if let Some(v) = u.target_port {
+            if let Some(v) = update.load_balance_strategy {
                 q = q.bind(v);
             }
-            if let Some(v) = u.paused {
-                q = q.bind(v);
-                q = q.bind(false); // auto_paused reset
-            }
-            if let Some(v) = u.load_balance_strategy {
+            if let Some(v) = update.upload_limit_mbps {
                 q = q.bind(v);
             }
-            if let Some(v) = u.upload_limit_mbps {
+            if let Some(v) = update.download_limit_mbps {
                 q = q.bind(v);
             }
-            if let Some(v) = u.download_limit_mbps {
+            if let Some(v) = update.max_connections {
                 q = q.bind(v);
             }
-            if let Some(v) = u.max_connections {
+            if let Some(v) = update.auto_restart_minutes {
                 q = q.bind(v);
             }
-            if let Some(v) = u.auto_restart_minutes {
+            if let Some(v) = update.proxy_protocol_send {
                 q = q.bind(v);
             }
-            if let Some(v) = u.tunnel_profile_id {
+            if let Some(v) = update.proxy_protocol_accept {
                 q = q.bind(v);
             }
-            if let Some(v) = u.proxy_protocol_send {
+            if let Some(v) = update.proxy_protocol_trusted {
                 q = q.bind(v);
             }
-            if let Some(v) = u.proxy_protocol_accept {
-                q = q.bind(v);
+            q = q.bind(id);
+            q.execute(&mut *tx).await?;
+        }
+
+        if let Some(targets) = update.targets {
+            sqlx::query("DELETE FROM forward_rule_targets WHERE rule_id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            for (pos, t) in targets.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO forward_rule_targets \
+                     (rule_id, host, port, position, enabled) \
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(id)
+                .bind(&t.host)
+                .bind(t.port as i32)
+                .bind((pos + 1) as i32)
+                .bind(t.enabled)
+                .execute(&mut *tx)
+                .await?;
             }
-            if let Some(v) = u.proxy_protocol_trusted {
-                q = q.bind(v);
+            if let Some(primary) = targets.iter().find(|t| t.enabled).or(targets.first()) {
+                sqlx::query(
+                    "UPDATE forward_rules SET target_addr = $1, target_port = $2 WHERE id = $3",
+                )
+                .bind(&primary.host)
+                .bind(primary.port as i32)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
             }
-            q.bind(id).execute(&mut *tx).await?;
         }
 
         tx.commit().await?;
@@ -954,9 +772,16 @@ impl RuleRepository for PgRepository {
         upload: u64,
         download: u64,
     ) -> Result<(), DbError> {
-        sqlx::query("UPDATE forward_rules SET traffic_used = traffic_used + $1 + $2 WHERE id = $3")
-            .bind(upload as i64)
-            .bind(download as i64)
+        let delta = i64::try_from(upload)
+            .ok()
+            .and_then(|u| i64::try_from(download).ok().and_then(|d| u.checked_add(d)))
+            .ok_or_else(|| {
+                DbError::Other(sqlx::Error::Protocol(
+                    "traffic delta overflows i64".to_string(),
+                ))
+            })?;
+        sqlx::query("UPDATE forward_rules SET traffic_used = traffic_used + $1 WHERE id = $2")
+            .bind(delta)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -992,12 +817,14 @@ impl RuleRepository for PgRepository {
 
     async fn reset_rule_traffic(&self, id: i64, scope: &ResourceScope) -> Result<u64, DbError> {
         let result = match scope.owner_id() {
-            None => sqlx::query("UPDATE forward_rules SET traffic_used = 0 WHERE id = $1").bind(id),
-            Some(uid) => {
-                sqlx::query("UPDATE forward_rules SET traffic_used = 0 WHERE id = $1 AND uid = $2")
-                    .bind(id)
-                    .bind(uid)
+            None => {
+                sqlx::query("UPDATE forward_rules SET traffic_used = 0 WHERE id = $1").bind(id)
             }
+            Some(uid) => sqlx::query(
+                "UPDATE forward_rules SET traffic_used = 0 WHERE id = $1 AND uid = $2",
+            )
+            .bind(id)
+            .bind(uid),
         }
         .execute(&self.pool)
         .await?;
@@ -1013,22 +840,15 @@ impl RuleRepository for PgRepository {
     }
 
     async fn list_active_for_config(&self, group_id: i64) -> Result<Vec<ForwardRule>, DbError> {
-        // v0.4.11 PR3: REMOVED cross-owner defense filter. See SQLite impl comment.
-        // v1.0.8: FOUR gating conditions (banned, suspended, over-quota,
-        // expired). Mirrors the SQLite WHERE clause. PG uses now() for the
-        // expiry comparison; plan_expire_at is TEXT UTC 'YYYY-MM-DD HH:MM:SS'.
-        let rules: Vec<ForwardRule> = sqlx::query_as(
-            "SELECT fr.* FROM forward_rules fr \
-             JOIN users u ON fr.uid = u.id \
-             WHERE fr.device_group_in = $1 AND fr.paused = FALSE \
-             AND u.banned = FALSE \
-             AND u.suspended = FALSE \
-             AND (u.traffic_limit = 0 OR u.traffic_used < u.traffic_limit) \
-             AND (u.plan_expire_at IS NULL OR u.plan_expire_at > to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))",
-        )
-        .bind(group_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let sql = format!(
+            "SELECT {RULE_COLS} FROM forward_rules \
+             WHERE device_group_in = $1 AND paused = FALSE \
+             ORDER BY id"
+        );
+        let rules: Vec<ForwardRule> = sqlx::query_as(&sql)
+            .bind(group_id)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rules)
     }
 }

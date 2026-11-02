@@ -1,4 +1,4 @@
-import { Layout, Menu, Button, Space, Typography, Segmented, Modal, Form, Input, message, Spin, Badge, Tooltip, Drawer, Dropdown } from 'antd';
+import { Layout, Menu, Button, Space, Typography, Segmented, Modal, Form, Input, message, Spin, Tooltip, Drawer, Dropdown } from 'antd';
 import type { MenuProps } from 'antd';
 import { Outlet, useNavigate, useLocation } from 'react-router-dom';
 import { useState, Suspense } from 'react';
@@ -12,18 +12,12 @@ import {
   UserOutlined,
   LogoutOutlined,
   LockOutlined,
-  SettingOutlined,
-  ShoppingOutlined,
-  TeamOutlined,
-  NotificationOutlined,
   GithubOutlined,
 } from '@ant-design/icons';
 import { useI18n } from '../i18n/context';
 import api from '../api/client';
 import type { ApiEnvelope } from '../api/types';
 import { useAuth } from '../auth/useAuth';
-import { useSite } from '../hooks/useSite';
-import { useAnnouncementBadge } from '../hooks/useAnnouncementBadge';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { makePasswordValidator } from '../utils/password';
 
@@ -35,77 +29,20 @@ export default function MainLayout() {
   const location = useLocation();
   const { t, lang, setLang } = useI18n();
   const { isAdmin, user, logout: authLogout } = useAuth();
-  const site = useSite();
-  // Marked seen by the archive page itself, so the dot clears only once the
-  // notices have actually been shown.
-  const { unread } = useAnnouncementBadge(user?.id ?? null);
   const [changePwOpen, setChangePwOpen] = useState(false);
   const [pwForm] = Form.useForm();
   const [pwSubmitting, setPwSubmitting] = useState(false);
-  // Phones get no sider: the menu slides in from the left on demand, and the
-  // header's controls fold into one menu (see the mobile branch below).
   const isMobile = useIsMobile();
   const [menuOpen, setMenuOpen] = useState(false);
   const [siderCollapsed, setSiderCollapsed] = useState(false);
 
-  // v0.4.11 PR2: role-based navigation.
-  // Admin: Dashboard → 个人中心, 转发规则, 设备分组, 节点状态, 隧道配置, 用户管理, 系统设置
-  // Regular: 个人中心, 我的规则, 可用节点
-  // v1.0.7: 仪表盘 (/) is admin-only — the regular-user dashboard was removed
-  // (redirects to /account), so regular users no longer get this menu entry.
-  const dashboardItem = { key: '/', icon: <DashboardOutlined />, label: t('dashboard') };
-  const sharedItems = [
-    { key: '/account', icon: <UserOutlined />, label: t('personalCenter') },
-    { key: '/shop', icon: <ShoppingOutlined />, label: t('shop') },
-    { key: '/rules', icon: <ApiOutlined />, label: t('myRules') },
-    { key: '/nodes', icon: <CloudServerOutlined />, label: t('availableNodes') },
-  ];
-  // v1.2.4: the admin list had grown to seven top-level entries. Grouped into
-  // two submenus by what they ARE, not just to shorten the list:
-  //
-  //   billing  — records you create, edit and delete day to day
-  //   system   — configuration you set once, plus the audit trail
-  //
-  // Plans and redeem codes deliberately did NOT go under 系统设置: generating
-  // codes is a routine task, and burying a daily CRUD page inside "system
-  // settings" costs a click every time and misfiles it besides.
-  const billingChildren = [
-    { key: '/users', label: t('users') },
-    { key: '/plans', label: t('planManagement') },
-    { key: '/redeem-codes', label: t('redeemCodes') },
-  ];
-  const systemChildren = [
-    { key: '/site-settings', label: t('siteSettings') },
-    { key: '/settings', label: t('basicSettings') },
-    { key: '/notify-settings', label: t('notifySettings') },
-    { key: '/announcement-admin', label: t('announcementAdmin') },
-    { key: '/audit-log', label: t('auditLog') },
-  ];
-  const adminOnlyItems = [
+  const menuItems = [
+    { key: '/', icon: <DashboardOutlined />, label: t('dashboard') },
     { key: '/groups', icon: <CloudServerOutlined />, label: t('deviceGroups') },
-    {
-      key: 'grp-billing',
-      icon: <TeamOutlined />,
-      label: t('userAndBilling'),
-      children: billingChildren,
-    },
-    {
-      key: 'grp-system',
-      icon: <SettingOutlined />,
-      label: t('systemSettings'),
-      children: systemChildren,
-    },
+    { key: '/rules', icon: <ApiOutlined />, label: t('forwardRules') },
+    { key: '/nodes', icon: <CloudServerOutlined />, label: t('nodeStatus') },
+    { key: '/account', icon: <UserOutlined />, label: t('personalCenter') },
   ];
-  const menuItems = isAdmin
-    ? [dashboardItem, ...sharedItems, ...adminOnlyItems]
-    : sharedItems;
-
-  // Expand whichever group holds the current page. Computed from the path, not
-  // stored, so landing on /site-settings from a bookmark opens 系统设置 too.
-  const openKeys = [
-    billingChildren.some((c) => c.key === location.pathname) ? 'grp-billing' : '',
-    systemChildren.some((c) => c.key === location.pathname) ? 'grp-system' : '',
-  ].filter(Boolean);
 
   const logout = () => {
     authLogout();
@@ -130,11 +67,7 @@ export default function MainLayout() {
     }
   };
 
-  const brand = site.site_name || t('brand');
-  // The drawer and the sider keep an operator's long site name inside their
-  // 56px: a margin each side, at most two lines, then an ellipsis (full name
-  // on hover). The collapsed sider is 80px, narrower than RelayPanel itself
-  // at 17px, so there the name drops to 13px.
+  const brand = t('brand');
   const brandBlock = (collapsed = false) => (
     <div title={brand} style={{
       height: 'var(--rp-header-height)',
@@ -150,18 +83,14 @@ export default function MainLayout() {
       </span>
     </div>
   );
-  // One menu for both homes: the desktop sider and the phone drawer.
+
   const menu = (
     <Menu
       theme="dark"
       mode="inline"
       selectedKeys={[location.pathname]}
-      defaultOpenKeys={openKeys}
       items={menuItems}
-      // Parent entries carry a `grp-` key and no route — clicking one only
-      // expands it, so navigating on them would 404.
       onClick={({ key }) => {
-        if (key.startsWith('grp-')) return;
         navigate(key);
         setMenuOpen(false);
       }}
@@ -169,9 +98,6 @@ export default function MainLayout() {
     />
   );
 
-  // The phone header has room for a bell and one menu; everything the desktop
-  // header spreads across a row lives here. The first row says who is signed
-  // in, which the desktop header shows as the role text.
   const moreItems: MenuProps['items'] = [
     { key: 'who', label: `${user?.username ?? ''} · ${isAdmin ? t('admin') : t('user')}`, disabled: true },
     { type: 'divider' },
@@ -184,7 +110,7 @@ export default function MainLayout() {
   const onMore: MenuProps['onClick'] = ({ key }) => {
     if (key === 'lang') setLang(lang === 'zh-CN' ? 'en-US' : 'zh-CN');
     else if (key === 'password') setChangePwOpen(true);
-    else if (key === 'github') window.open('https://github.com/MoeShinX/relay-panel', '_blank', 'noopener,noreferrer');
+    else if (key === 'github') window.open('https://github.com/nfft894htno32/relay-panel', '_blank', 'noopener,noreferrer');
     else if (key === 'logout') logout();
   };
 
@@ -208,9 +134,6 @@ export default function MainLayout() {
           breakpoint="lg"
           width={220}
           onCollapse={(collapsed) => setSiderCollapsed(collapsed)}
-          // v1.2.14: the sider stays put while the page scrolls (a long node
-          // list used to carry the menu off screen). A menu taller than the
-          // window scrolls inside it.
           style={{
             background: 'var(--rp-sidebar-bg)',
             position: 'sticky', top: 0, height: '100vh', overflow: 'auto',
@@ -222,9 +145,6 @@ export default function MainLayout() {
       )}
       <Layout>
         <Header style={{
-          // v1.2.14: the header bar stays at the top while the page scrolls.
-          // Above antd's fixed table columns (z-index 15), which would
-          // otherwise scroll over it; below its popups and drawers (1000+).
           position: 'sticky', top: 0, zIndex: 100,
           background: '#fff', height: 'var(--rp-header-height)',
           padding: isMobile ? '0 8px 0 4px' : '0 24px', lineHeight: 'var(--rp-header-height)',
@@ -233,19 +153,11 @@ export default function MainLayout() {
         }}>
           {isMobile ? (
             <>
-              {/* The site name is the operator's: a long one stays on one line
-                  and ends in an ellipsis (full name on tap) — wrapping, each
-                  line took the header's 56px line height and burst the bar. */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 4, flex: '1 1 auto', minWidth: 0 }}>
                 <Button type="text" icon={<MenuOutlined />} aria-label={t('openMenu')} onClick={() => setMenuOpen(true)} style={{ flexShrink: 0 }} />
                 <Text strong ellipsis={{ tooltip: brand }} style={{ fontSize: 16, minWidth: 0 }}>{brand}</Text>
               </div>
               <Space size={4} style={{ flexShrink: 0 }}>
-                {/* Icon-only here: a phone header cannot fit the labelled
-                    button. The dot still says there is something new. */}
-                <Badge dot={unread} offset={[-6, 6]}>
-                  <Button type="text" icon={<NotificationOutlined />} aria-label={t('announcements')} onClick={() => navigate('/announcements')} />
-                </Badge>
                 <Dropdown menu={{ items: moreItems, onClick: onMore }} trigger={['click']} placement="bottomRight">
                   <Button type="text" icon={<EllipsisOutlined />} aria-label={t('moreActions')} />
                 </Dropdown>
@@ -253,26 +165,6 @@ export default function MainLayout() {
             </>
           ) : (
           <Space size="middle">
-            {/* v1.2.4: announcements live here rather than in the sidebar.
-                The banner already carries the current notice, so a menu row
-                would only be a route to the archive — a low-frequency
-                destination sitting beside pages people use daily. A bell also
-                does what a menu row cannot: say that something is new.
-
-                Labelled, not bare: every other control in this header is icon
-                + text, so an icon alone read as decoration and people did not
-                find it. The Tooltip is gone with it — a tooltip that repeats
-                the visible label is noise. */}
-            <Badge dot={unread} offset={[-4, 2]}>
-              <Button
-                type="text"
-                size="small"
-                icon={<NotificationOutlined />}
-                onClick={() => navigate('/announcements')}
-              >
-                {t('announcements')}
-              </Button>
-            </Badge>
             <Segmented
               size="small"
               value={lang}
@@ -288,15 +180,12 @@ export default function MainLayout() {
             <Button type="text" size="small" icon={<LockOutlined />} onClick={() => setChangePwOpen(true)}>
               {t('changePassword')}
             </Button>
-            {/* Icon-only by request, unlike the labelled controls beside it, so
-                the tooltip and aria-label carry the name. The login page already
-                links the same repository to everyone. */}
             <Tooltip title="GitHub">
               <Button
                 type="text"
                 size="small"
                 icon={<GithubOutlined />}
-                href="https://github.com/MoeShinX/relay-panel"
+                href="https://github.com/nfft894htno32/relay-panel"
                 target="_blank"
                 rel="noopener noreferrer"
                 aria-label="GitHub"
@@ -309,9 +198,6 @@ export default function MainLayout() {
           )}
         </Header>
         <Content style={{ margin: 'var(--rp-content-padding)', background: 'var(--rp-bg)' }}>
-          {/* v1.2 (PR4): lazy-loaded pages (router.tsx) suspend here on first
-              navigation to their chunk, showing a centered spinner instead of a
-              blank pane. */}
           <Suspense fallback={<div style={{ textAlign: 'center', padding: 48 }}><Spin /></div>}>
             <Outlet />
           </Suspense>

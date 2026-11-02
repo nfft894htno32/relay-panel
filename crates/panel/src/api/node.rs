@@ -59,11 +59,8 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
             .into_response();
     }
 
-    // Token comes ONLY from the Authorization header. No token → treat as
-    // "no matching group" and return an empty config (NOT an error: a node
-    // that hasn't been assigned a group yet should keep its cached config).
     let Some(token) = extract_node_token(&headers) else {
-        return Json(NodeConfigResponse { listeners: vec![] }).into_response();
+        return StatusCode::UNAUTHORIZED.into_response();
     };
 
     // Find device group by token.
@@ -80,7 +77,7 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
     };
 
     let Some(group) = group else {
-        return Json(NodeConfigResponse { listeners: vec![] }).into_response();
+        return StatusCode::UNAUTHORIZED.into_response();
     };
 
     // v0.3.6: delegate to the shared `build_node_config`. This path and the WS
@@ -489,7 +486,6 @@ mod tests {
                 jwt_secret: "test-secret".into(),
                 public_dir: "public".into(),
                 public_panel_url: String::new(),
-                registration_enabled: false,
                 cors_origins: vec![],
                 geoip_enabled: false,
                 geoip_cache_ttl: 604_800,
@@ -805,15 +801,13 @@ mod tests {
         assert_eq!(resp.code, 401, "missing token → business 401, not HTTP 401");
     }
 
-    /// get_config with NO Authorization header (but a valid config-protocol
-    /// header) → HTTP 200 with an EMPTY config, NOT an error. A node that
-    /// hasn't been assigned a group should keep its cached config.
+    /// get_config with NO Authorization header or invalid token → HTTP 401
+    /// so relay-node treats it as a transient auth error and preserves its
+    /// local cached config instead of wiping all running listeners.
     #[tokio::test]
-    async fn node_http_status_compat_get_config_missing_token_returns_empty_config() {
+    async fn node_http_status_compat_get_config_missing_or_invalid_token_returns_http401() {
         let (state, _pool) = seeded_state().await;
         let mut h = HeaderMap::new();
-        // get_config gates on config-protocol FIRST; supply a matching one so
-        // we reach the token check (else it'd return 426, masking this path).
         h.insert(
             "X-Config-Protocol-Version",
             relay_shared::protocol::CONFIG_PROTOCOL_VERSION
@@ -822,16 +816,13 @@ mod tests {
                 .unwrap(),
         );
         // No Authorization header.
-        let resp = get_config(State(state.clone()), h).await;
-        // Pin: HTTP 200 (not 401/403) + an empty listeners array.
-        assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            v["listeners"].as_array().map(|a| a.len()),
-            Some(0),
-            "missing token → empty config, not an error"
-        );
+        let resp = get_config(State(state.clone()), h.clone()).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        // Invalid token.
+        h.insert("Authorization", "Bearer invalid-token".parse().unwrap());
+        let resp_bad = get_config(State(state.clone()), h).await;
+        assert_eq!(resp_bad.status(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
     /// WebSocket upgrade with NO Authorization header → real HTTP 401 (the one

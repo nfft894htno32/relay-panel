@@ -15,7 +15,7 @@ const INSECURE_JWT_SECRET: &str = "change-me-jwt-secret";
 /// Overridable at runtime via the `APP_VERSION` env var — used by CI to inject
 /// the version into the Docker image without rebuilding. If the env var is
 /// unset, the compiled-in default below is used.
-const COMPILED_APP_VERSION: &str = "1.2.20";
+const COMPILED_APP_VERSION: &str = "1.3.0";
 
 /// Resolve the effective app version: the `APP_VERSION` env var if set,
 /// otherwise the compiled-in default. Cached for the process lifetime.
@@ -40,10 +40,6 @@ pub struct Config {
     /// e.g. "http://203.0.113.10:18888" or "https://panel.example.com".
     /// If empty, the frontend falls back to window.location.origin.
     pub public_panel_url: String,
-    /// Whether public self-registration (/auth/register) is allowed.
-    /// Default: false (admin must create users). Set REGISTRATION_ENABLED=1
-    /// to allow open registration.
-    pub registration_enabled: bool,
     /// Allowed CORS origins for the API. Comma-separated, e.g.
     /// "http://localhost:5173,https://panel.example.com". Empty (default) → no
     /// CORS layer is applied at all, which is correct for the standard
@@ -64,14 +60,6 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> Self {
-        // v0.4.3: DATABASE_URL is the canonical env var; DATABASE_PATH is a
-        // legacy fallback for deployments created before v0.4.3.  The internal
-        // field name stays `database_path` to avoid a wider refactor.
-        //
-        // Order:
-        //   1. DATABASE_URL   (e.g. postgres://user:pass@host/db or sqlite:...)
-        //   2. DATABASE_PATH  (legacy, e.g. sqlite:/app/data/data.db?mode=rwc)
-        //   3. Default: sqlite:data.db?mode=rwc
         let database_path = std::env::var("DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_PATH"))
             .unwrap_or_else(|_| "sqlite:data.db?mode=rwc".into());
@@ -81,9 +69,6 @@ impl Config {
             std::env::var("JWT_SECRET").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
         let public_dir = std::env::var("PUBLIC_DIR").unwrap_or_else(|_| "public".into());
         let public_panel_url = std::env::var("PUBLIC_PANEL_URL").unwrap_or_else(|_| String::new());
-        let registration_enabled = std::env::var("REGISTRATION_ENABLED")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
         let cors_origins = std::env::var("CORS_ORIGINS")
             .unwrap_or_default()
             .split(',')
@@ -91,14 +76,6 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>();
 
-        // v0.4.19: GeoIP is ON by default and uses built-in primary + fallback
-        // providers (ipinfo.io Lite → ipwho.is). The lookup URL is no longer
-        // user-configurable — only GEOIP_ENABLED and GEOIP_CACHE_TTL remain.
-        // Operators who don't want any third-party IP lookup set
-        // `GEOIP_ENABLED=false` (or `0`). The lookup is still server-side
-        // only, queries just the public IP, caches for GEOIP_CACHE_TTL
-        // (default 7 days), and degrades to "unknown" on any failure —
-        // forwarding/node status are never affected.
         let geoip_enabled = parse_geoip_enabled(std::env::var("GEOIP_ENABLED").ok());
         let geoip_cache_ttl = std::env::var("GEOIP_CACHE_TTL")
             .ok()
@@ -112,7 +89,6 @@ impl Config {
             jwt_secret,
             public_dir,
             public_panel_url,
-            registration_enabled,
             cors_origins,
             geoip_enabled,
             geoip_cache_ttl,

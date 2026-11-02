@@ -37,7 +37,7 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE: ghcr.io/moeshinx/relay-panel-panel
+  IMAGE: ghcr.io/nfft894htno32/relay-panel-panel
 
 jobs:
   build-frontend:

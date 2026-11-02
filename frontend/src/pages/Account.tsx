@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Card, Descriptions, Spin, Button, Space, Modal, Form, Input, message, Typography, Result, Progress, Alert, Tag } from 'antd';
-import { LockOutlined, LogoutOutlined, WalletOutlined } from '@ant-design/icons';
+import { Card, Descriptions, Spin, Button, Space, Modal, Form, Input, message, Typography, Result } from 'antd';
+import { LockOutlined, LogoutOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
 import type { ApiEnvelope, UserSelf } from '../api/types';
@@ -8,69 +8,20 @@ import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
 import { makePasswordValidator } from '../utils/password';
 import { useAuth } from '../auth/useAuth';
-import TrafficChart from '../components/TrafficChart';
-import SiteAnnouncement from '../components/SiteAnnouncement';
-import { useSiteNotice } from '../hooks/useSiteNotice';
-import RedeemHistory from '../components/RedeemHistory';
 
 const { Text } = Typography;
 
-/**
- * v0.4.9: a regular user's own account page (GET /user/me). This is the
- * non-admin landing page after login — the Dashboard is admin-only (it hits
- * /admin/* endpoints), so a non-admin needs a page that only reads their own
- * row. Admins can also view it (it's linked in the menu for everyone).
- *
- * v0.4.10: expanded to show plan + current/limit rule count. Logout delegates
- * to AuthContext.logout (single source of truth). The page still loads /user/me
- * itself (rather than only reading AuthContext.user) so it has its own
- * loading/error/retry UI independent of the app-wide boot state.
- *
- * Shows: username, plan, balance, rules (current/limit), traffic used / quota,
- * member-since. Change-password reuses the existing self-service PUT
- * /user/password (an AuthUser endpoint, not admin).
- */
 export default function Account() {
   const { t } = useI18n();
   const navigate = useNavigate();
   const { logout: authLogout } = useAuth();
-  const notice = useSiteNotice();
   const [me, setMe] = useState<UserSelf | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadFailed, setLoadFailed] = useState(false);
 
-  // Change-password modal state (mirrors MainLayout's modal).
   const [changePwOpen, setChangePwOpen] = useState(false);
   const [pwForm] = Form.useForm();
   const [pwSubmitting, setPwSubmitting] = useState(false);
-
-  // v1.2.0: redeem-code top-up.
-  const [redeemOpen, setRedeemOpen] = useState(false);
-  const [redeemForm] = Form.useForm();
-  const [redeeming, setRedeeming] = useState(false);
-
-  const handleRedeem = async (values: { code: string }) => {
-    setRedeeming(true);
-    try {
-      const res = await api.post<unknown, ApiEnvelope<{ amount: string; balance: string }>>(
-        '/user/redeem',
-        { code: values.code },
-      );
-      if (res.code !== 0) { message.error(res.message); return; }
-      message.success(
-        t('redeemSuccess')
-          .replace('{amount}', res.data?.amount ?? '')
-          .replace('{balance}', res.data?.balance ?? ''),
-      );
-      setRedeemOpen(false);
-      redeemForm.resetFields();
-      load(); // refresh the balance shown above
-    } catch {
-      message.error(t('redeemFailed'));
-    } finally {
-      setRedeeming(false);
-    }
-  };
 
   const load = async () => {
     setLoading(true);
@@ -83,9 +34,6 @@ export default function Account() {
       }
       setMe(res.data);
     } catch {
-      // 403/404/network — show a retry result rather than flashing to login.
-      // (401 is handled by the global interceptor; reaching here means the
-      // request failed for another reason.)
       setLoadFailed(true);
     } finally {
       setLoading(false);
@@ -133,20 +81,6 @@ export default function Account() {
 
   return (
     <>
-      {/* v1.2.4: operator announcement. Regular users land here rather than on
-          the dashboard, so without this they would never see one. */}
-      <SiteAnnouncement />
-      {/* v1.0.8: suspended banner — the user can still log in and buy a plan
-          (buying does NOT auto-unsuspend), but forwarding is gated off. */}
-      {me.suspended && (
-        <Alert
-          type="warning"
-          showIcon
-          style={{ marginBottom: 16 }}
-          title={t('accountSuspended')}
-          description={t('accountSuspendedHint')}
-        />
-      )}
       <Card
         title={t('myAccount')}
         extra={
@@ -161,92 +95,17 @@ export default function Account() {
             <Text strong>{me.username}</Text>
             {me.admin && <Text type="secondary"> ({t('admin')})</Text>}
           </Descriptions.Item>
-          <Descriptions.Item label={t('accountPlan')}>
-            {me.plan_name || '-'}
+          <Descriptions.Item label={t('forwardRules')}>
+            {me.current_rules}
           </Descriptions.Item>
-          {/* v1.0.8: plan expiry (null = no expiry). */}
-          <Descriptions.Item label={t('accountPlanExpiry')}>
-            {me.plan_expire_at ? <span className="rp-mono">{me.plan_expire_at}</span> : t('unlimited')}
-          </Descriptions.Item>
-          {/* v1.0.8: available lines — "全部" when unrestricted (admin or
-              all_device_groups), otherwise the specific authorized group names. */}
-          <Descriptions.Item label={t('accountAvailableGroups')}>
-            {me.all_groups ? (
-              <Tag color="green">{t('allGroups')}</Tag>
-            ) : me.available_groups && me.available_groups.length > 0 ? (
-              <Space wrap>
-                {me.available_groups.map((name) => <Tag key={name}>{name}</Tag>)}
-              </Space>
-            ) : (
-              <Text type="secondary">{t('noneAssigned')}</Text>
-            )}
-          </Descriptions.Item>
-          <Descriptions.Item label={t('accountBalance')}>
-            <Space wrap>
-              <span className="rp-mono">{me.balance}</span>
-              {/* v1.2.0: self-service top-up. It lives on the balance row
-                  because that is exactly where a user looks when they find
-                  they can't afford a plan.
-
-                  Ghost-primary with an icon, not a bare text link: as a `link`
-                  button beside a number it read as a label rather than a
-                  control, and users reported finding no way to top up at all. */}
-              <Button
-                size="small"
-                type="primary"
-                ghost
-                icon={<WalletOutlined />}
-                onClick={() => { redeemForm.resetFields(); setRedeemOpen(true); }}
-              >
-                {t('redeem')}
-              </Button>
-            </Space>
-          </Descriptions.Item>
-          <Descriptions.Item label={t('accountRulesLimit')}>
-            {me.current_rules} / {me.max_rules}
-          </Descriptions.Item>
-          {/* v1.0.8: traffic usage with a progress bar (used / limit). */}
           <Descriptions.Item label={t('accountTrafficUsed')}>
-            {me.traffic_limit > 0 ? (
-              <Space orientation="vertical" style={{ width: '100%', maxWidth: 360 }}>
-                <span>{formatBytes(me.traffic_used)} / {formatBytes(me.traffic_limit)}</span>
-                <Progress
-                  percent={Math.min(100, Math.round((me.traffic_used / me.traffic_limit) * 100))}
-                  size="small"
-                  status={me.traffic_used >= me.traffic_limit ? 'exception' : 'active'}
-                />
-              </Space>
-            ) : (
-              <span>{formatBytes(me.traffic_used)} / {t('unlimited')}</span>
-            )}
+            <span>{formatBytes(me.traffic_used)}</span>
           </Descriptions.Item>
           <Descriptions.Item label={t('accountMemberSince')}>
             <span className="rp-mono">{me.registered_at || '-'}</span>
           </Descriptions.Item>
-          {/* v1.2.4: only rendered when the operator filled it in — an empty
-              "Support" row would just look like something is broken. */}
-          {notice.contact && (
-            <Descriptions.Item label={t('siteContact')}>
-              <span style={{ whiteSpace: 'pre-wrap' }}>{notice.contact}</span>
-            </Descriptions.Item>
-          )}
         </Descriptions>
       </Card>
-
-      {/* v1.2.0: the user's own traffic trend. No rule filter here — the API
-          pins non-admins to their own uid, so the total IS their usage.
-
-          Hidden for admins: they already get the fleet-wide chart (with a
-          per-rule drill-down) on the dashboard, and an admin's "personal"
-          traffic is a near-meaningless number. The same card on two pages is
-          just noise. */}
-      {/* v1.2.4: the user's own top-up history. Above the traffic chart —
-          "where did my balance come from" is the question that brings people to
-          this page, and it should not sit below a chart. Purchase history is
-          not duplicated here; it stays on the shop page. */}
-      <RedeemHistory />
-
-      {!me.admin && <TrafficChart />}
 
       <Modal
         title={t('changePassword')}
@@ -292,31 +151,6 @@ export default function Account() {
             ]}
           >
             <Input.Password autoComplete="new-password" />
-          </Form.Item>
-        </Form>
-      </Modal>
-
-      {/* v1.2.0: redeem a top-up code. The backend normalizes input (case,
-          dashes, whitespace, O/0 and I/L/1 confusions), so the field is
-          deliberately permissive — no client-side format policing that would
-          reject a code the server would have accepted. */}
-      <Modal
-        title={t('redeem')}
-        open={redeemOpen}
-        onCancel={() => setRedeemOpen(false)}
-        onOk={() => redeemForm.submit()}
-        okText={t('redeemConfirm')}
-        cancelText={t('cancel')}
-        confirmLoading={redeeming}
-      >
-        <Form form={redeemForm} onFinish={handleRedeem} layout="vertical">
-          <Form.Item
-            name="code"
-            label={t('redeemCode')}
-            extra={t('redeemCodeHint')}
-            rules={[{ required: true, message: t('redeemCodeRequired') }]}
-          >
-            <Input placeholder="XXXX-XXXX-XXXX-XXXX" autoComplete="off" />
           </Form.Item>
         </Form>
       </Modal>

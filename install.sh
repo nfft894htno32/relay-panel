@@ -3,7 +3,7 @@
 # RelayPanel one-line installer for Linux (Debian / Ubuntu).
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/MoeShinX/relay-panel/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/nfft894htno32/relay-panel/main/install.sh | bash
 #
 # Where GitHub is slow or blocked (mainland China), the repository and the
 # container images are fetched through download mirrors by themselves when
@@ -29,7 +29,7 @@
 set -euo pipefail
 
 INSTALL_DIR="/opt/relay-panel"
-REPO_URL="https://github.com/MoeShinX/relay-panel.git"
+REPO_URL="https://github.com/nfft894htno32/relay-panel.git"
 
 # DEBUG=1 shows full git output during clone/pull (default: quiet, clean status
 # lines only). Most users want a clean install log without a wall of git diff

@@ -353,6 +353,21 @@ describe('export → import round-trip', () => {
     // The second rule's two targets round-trip into two dests.
     expect(entries[1].dest).toEqual(['a.com:1', 'b.com:2']);
   });
+
+  it('preserves sni when present on TCP SNI rules sharing port 443', () => {
+    const rules = [
+      mkRule({ id: 1, name: 'de01', listen_port: 443, protocol: 'tcp', sni: 'region-de01.example.com', target_addr: '10.0.0.1', target_port: 443 }),
+      mkRule({ id: 2, name: 'de02', listen_port: 443, protocol: 'tcp', sni: '*.de02.example.com', target_addr: '10.0.0.2', target_port: 443 }),
+    ];
+    const json = buildExportJSON(rules);
+    const parsed: unknown[] = JSON.parse(json);
+    expect(parsed).toHaveLength(2);
+    for (const p of parsed) {
+      expect(validateImportEntry(p)).toBeNull();
+    }
+    expect(asValidatedEntry(parsed[0]).sni).toBe('region-de01.example.com');
+    expect(asValidatedEntry(parsed[1]).sni).toBe('*.de02.example.com');
+  });
 });
 
 describe('exportFileLabel', () => {

@@ -896,7 +896,6 @@ mod upgrade_result_tests {
                 jwt_secret: "test-secret".into(),
                 public_dir: "public".into(),
                 public_panel_url: String::new(),
-                registration_enabled: false,
                 cors_origins: vec![],
                 geoip_enabled: false,
                 geoip_cache_ttl: 604_800,

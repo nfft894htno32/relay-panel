@@ -18,7 +18,8 @@ const ok = <T,>(data: T) => ({ code: 0, message: 'ok', data });
 function group(over: Record<string, unknown> = {}) {
   return {
     id: 1, name: 'g1', group_type: 'in', token: 'tok-'.padEnd(36, 'x'), uid: 1,
-    connect_host: '1.2.3.4', port_range: '10000-65535', rate: 1.0, hidden: false,
+    connect_host: '1.2.3.4', port_range: '10000-65535',
+    sni_fallback_addr: '127.0.0.1:10443', sni_loop_bypass_ips: '',
     ...over,
   };
 }
@@ -35,10 +36,6 @@ beforeEach(() => {
   });
 });
 
-// ── A failed read reports `code: 500` with `data: null` inside a 200 response,
-// so the axios success path runs. Rendering that as an empty table would tell
-// an operator their groups are gone, and invite them to recreate groups that
-// still exist.
 describe('a database error is not an empty group list', () => {
   it('shows a load failure instead of an empty table', async () => {
     mockGet.mockImplementation((url: string) => {
@@ -68,35 +65,24 @@ describe('a database error is not an empty group list', () => {
   });
 });
 
-// ── v1.2.5: a monitor-only group forwards nothing and never reaches a regular
-// user, so connect host / port range / rate / hidden are inert on it. The forms
-// stop asking for them, and nothing inert gets written to the DB.
 describe('monitor-only groups hide the forwarding fields', () => {
   it('drops the forwarding fields from the create form when the type is monitor', async () => {
     const user = userEvent.setup();
     render(<Groups />);
     await user.click(screen.getByRole('button', { name: /addGroup/i }));
 
-    // Inbound is the default: the fields are there to begin with.
     await waitFor(() => expect(screen.getByLabelText('connectHost')).toBeInTheDocument());
     expect(screen.getByLabelText('portRange')).toBeInTheDocument();
 
-    // Switch to monitor-only.
     await user.click(screen.getByLabelText('type'));
     await user.click(await screen.findByTitle('typeMonitor'));
 
     await waitFor(() => expect(screen.queryByLabelText('connectHost')).toBeNull());
     expect(screen.queryByLabelText('portRange')).toBeNull();
-    expect(screen.queryByLabelText('rate')).toBeNull();
     expect(screen.getByText('monitorOnlyNoForwardTitle')).toBeInTheDocument();
   });
 
   it('sends empty forwarding fields rather than omitting them', async () => {
-    // Hiding the Form.Items unregisters them, so they vanish from the submitted
-    // values — and CreateGroupRequest declares connect_host/port_range as plain
-    // String with no serde default, which turns an omission into a 422. The
-    // explicit empty string is what makes creating a monitor group work at all;
-    // it also guarantees a host typed before the switch is not carried over.
     const user = userEvent.setup();
     mockPost.mockResolvedValue(ok(group({ group_type: 'monitor' })));
     render(<Groups />);
@@ -113,7 +99,7 @@ describe('monitor-only groups hide the forwarding fields', () => {
     const [url, body] = mockPost.mock.calls[0];
     expect(url).toBe('/groups');
     expect(body).toMatchObject({
-      group_type: 'monitor', connect_host: '', port_range: '', rate: 1.0, hidden: false,
+      group_type: 'monitor', connect_host: '', port_range: '',
     });
   });
 

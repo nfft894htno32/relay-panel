@@ -74,33 +74,6 @@ impl TrafficRepository for SqliteRepository {
             }
         }
 
-        // ── v1.0.8: read this group's billing rate once for the whole batch
-        // (every entry in a batch is for the SAME group_id — the node reports
-        // per-group). rate is stored on device_groups; users are CHARGED
-        // real * rate (rounded), while forward_rules keeps real bytes. A group
-        // missing here is treated as rate=1.0 (defensive: a deleted group mid-
-        // batch shouldn't crash accounting — the per-rule ownership check below
-        // will reject its rules as Unavailable anyway). ──
-        let rate: f64 = sqlx::query_scalar("SELECT rate FROM device_groups WHERE id = ?")
-            .bind(group_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            // Group deleted mid-batch → treat as rate=1.0 (its rules will be
-            // rejected as Unavailable in Pass 2 anyway; don't crash accounting).
-            .flatten()
-            .unwrap_or(1.0);
-        if !(0.1..=100.0).contains(&rate) {
-            // Out-of-range rate is a data integrity bug; refuse the batch
-            // rather than silently billing a wrong amount.
-            let _ = tx.rollback().await;
-            tracing::error!(
-                "traffic_batch: group {} has out-of-range rate {} (expected 0.1..=100)",
-                group_id,
-                rate
-            );
-            return Ok(vec![TrafficEntryResult::Overflow]);
-        }
-
         // ── Pass 1: validate u64→i64 per entry (a single entry's upload or
         // download alone can exceed i64::MAX; reject before any DB read). ──
         // Aggregate duplicate rule_ids INTO ONE delta first so the per-rule
@@ -131,25 +104,16 @@ impl TrafficRepository for SqliteRepository {
         }
 
         // ── Pass 2: ownership + existing-value resolution.
-        // SINGLE query per distinct rule_id: id+uid gated by device_group_in.
-        // A miss means "not available to this node" (missing OR foreign) — we
-        // do NOT run a second "does this id exist elsewhere?" query; that was
-        // the rule-id existence oracle. The reason is logged, not returned.
         struct Resolved {
             rule_id: i64,
             uid: i64,
             delta_up: u64,
             delta_down: u64,
-            /// v1.0.8: billed bytes charged to the USER = round((up+down) * rate).
-            /// Kept separate from delta_up/delta_down (real bytes for the rule).
             billed_delta: i64,
         }
         let mut resolved: Vec<Resolved> = Vec::with_capacity(rule_delta.len());
-        // Track the per-USER aggregate delta (a user may own several rules in
-        // this batch) for the cumulative overflow check.
         let mut user_delta: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
         for (rule_id, (dup, ddown)) in &rule_delta {
-            // The rule's own delta must fit in i64 (upload+download summed).
             let rule_delta_sum = match dup.checked_add(*ddown) {
                 Some(v) if v <= i64::MAX as u64 => v as i64,
                 _ => {
@@ -168,8 +132,6 @@ impl TrafficRepository for SqliteRepository {
             .fetch_optional(&mut *tx)
             .await?;
             let Some((rid, uid, rule_used, user_used)) = row else {
-                // Not available: missing OR foreign. Log the id (server-side
-                // only) and roll the whole batch back with a uniform 403.
                 tracing::warn!(
                     "traffic_batch: rule {} not available to group {} \
                      (missing or foreign) — rejecting batch",
@@ -179,22 +141,11 @@ impl TrafficRepository for SqliteRepository {
                 let _ = tx.rollback().await;
                 return Ok(vec![TrafficEntryResult::Unavailable]);
             };
-            // Per-rule cumulative overflow: existing + this batch's delta.
-            // Rule statistics are REAL bytes (rate does not apply here).
             if rule_used.checked_add(rule_delta_sum).is_none() {
                 let _ = tx.rollback().await;
                 return Ok(vec![TrafficEntryResult::Overflow]);
             }
-            // v1.0.8: billed delta charged to the user = round(real * rate).
-            // f64 mul can't overflow (rule_delta_sum ≤ i64::MAX, rate ≤ 100),
-            // but the rounded result must fit in i64 — guard it.
-            let billed_raw = (rule_delta_sum as f64) * rate;
-            let billed_delta = if billed_raw.is_finite() && billed_raw <= i64::MAX as f64 {
-                billed_raw.round() as i64
-            } else {
-                let _ = tx.rollback().await;
-                return Ok(vec![TrafficEntryResult::Overflow]);
-            };
+            let billed_delta = rule_delta_sum;
             // Per-user cumulative: existing user total + (running user delta),
             // charged in BILLED bytes (rate applied).
             let cur_user_delta = *user_delta.get(&uid).unwrap_or(&0);

@@ -117,7 +117,7 @@ async fn extract_auth_user(parts: &mut Parts, state: &AppState) -> Result<AuthUs
     //   - the admin flag comes from this same row, NOT from the JWT claim, so
     //     a demoted admin loses privileges immediately (and a promoted user
     //     gains them without re-login). `claims.admin` is deliberately ignored.
-    let (banned, db_token_version, must_change_password, db_admin) =
+    let (db_token_version, must_change_password, db_admin) =
         match state.db.find_auth_state_by_id(token_data.claims.sub).await {
             Ok(Some(auth_state)) => auth_state,
             Ok(None) => return Err(AuthError::Unauthorized), // user deleted
@@ -126,10 +126,6 @@ async fn extract_auth_user(parts: &mut Parts, state: &AppState) -> Result<AuthUs
                 return Err(AuthError::Db);
             }
         };
-
-    if banned {
-        return Err(AuthError::Unauthorized);
-    }
     if token_data.claims.token_version != db_token_version {
         // Token issued before a version bump → revoked. 401 so the frontend
         // forces a fresh login.

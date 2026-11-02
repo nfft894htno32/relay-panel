@@ -5,100 +5,24 @@ mod auth;
 mod groups;
 mod nodes;
 mod password;
-mod plans;
-mod profiles;
 mod rules;
-mod settings;
-mod shop;
-mod users;
 
 pub use groups::*;
 pub use password::*;
-pub use plans::*;
-pub use profiles::*;
 pub use rules::*;
-pub use settings::*;
-pub use shop::*;
-pub use users::*;
 
-/// A user WITHOUT the password hash — for API responses. Never expose the
-/// password hash via any endpoint; use this struct instead of `User` in list
-/// responses. Deriving FromRow + listing every non-password column means
-/// SELECT * also works (the password column is just ignored).
-#[derive(Debug, Serialize, sqlx::FromRow)]
-pub struct UserPublic {
-    pub id: i64,
-    pub username: String,
-    pub balance: String,
-    pub plan_id: Option<i64>,
-    /// v1.0.7: replaces group_id. true = user may use all device groups.
-    pub all_device_groups: bool,
-    pub max_rules: i32,
-    pub speed_limit: i32,
-    pub ip_limit: i32,
-    pub traffic_used: i64,
-    pub traffic_limit: i64,
-    pub admin: bool,
-    pub banned: bool,
-    pub created_at: String,
-    /// v1.0.8: plan expiry (NULL = no expiry).
-    #[serde(default)]
-    pub plan_expire_at: Option<String>,
-    /// v1.0.8: admin suspension.
-    #[serde(default)]
-    pub suspended: bool,
-}
-
-/// A user's view of THEIR OWN account (GET /user/me). Same non-password fields
-/// as [`UserPublic`] — the password hash is never exposed by any endpoint.
-/// Kept as a distinct type (rather than reusing UserPublic) so the "self" view
-/// is explicit in the response and can diverge later (e.g. hide admin/banned
-/// from a non-admin's own view, or add email) without touching the admin list
-/// projection.
+/// A user's view of THEIR OWN account (GET /user/me).
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct UserSelf {
     pub id: i64,
     pub username: String,
     pub admin: bool,
-    pub balance: String,
-    /// v0.4.10: the user's plan (NULL if unset). plan_name is its human-readable
-    /// label, resolved via a separate lookup (no plan → plan_name NULL too).
-    pub plan_id: Option<i64>,
-    pub plan_name: Option<String>,
-    pub max_rules: i32,
-    /// v0.4.10: how many rules the user currently owns (for the account center's
-    /// "current / limit" display). Counted live via count_by_uid.
     pub current_rules: i64,
     pub traffic_used: i64,
-    pub traffic_limit: i64,
-    /// v0.4.10: renamed from created_at for the account-center contract. The DB
-    /// column is still created_at; this is the JSON field name clients see.
     pub registered_at: String,
-    /// v0.4.10 PR4: when true the frontend redirects to the force-password-
-    /// change page (the user can only reach /user/me + /user/password until
-    /// they change it). The DB column is the source of truth.
     pub must_change_password: bool,
-    /// v1.0.8: plan expiry (NULL = no expiry).
-    #[serde(default)]
-    pub plan_expire_at: Option<String>,
-    /// v1.0.8: admin suspension (login allowed; forwarding gated).
-    #[serde(default)]
-    pub suspended: bool,
-    /// v1.0.8: true when this user is unrestricted (admin, or
-    /// all_device_groups=1) — every inbound line is usable. When false,
-    /// `available_groups` lists the specific lines they're authorized for.
-    #[serde(default)]
-    pub all_groups: bool,
-    /// v1.0.8: names of the device groups (lines) this user can currently use.
-    /// Empty when `all_groups` is true (nothing to enumerate) or when the user
-    /// has no authorization at all.
-    #[serde(default)]
-    pub available_groups: Vec<String>,
 }
 
-/// Build an error ApiResponse. Accepts `&str` or `String` (or anything else
-/// `Into<String>`), so callers can pass a `format!()` result directly without
-/// leaking it (the old `Box::leak` workaround) or hand-constructing ApiResponse.
 fn err<T: Serialize, S: Into<String>>(code: i32, msg: S) -> ApiResponse<T> {
     ApiResponse {
         code,
@@ -109,14 +33,11 @@ fn err<T: Serialize, S: Into<String>>(code: i32, msg: S) -> ApiResponse<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{change_password, reset_user_password, ResetPasswordRequest};
     use super::{
-        create_group, create_rule, create_user, delete_group, delete_rule, delete_user, err,
-        get_me, get_registration_settings, list_groups, list_rules, reset_rule_traffic,
-        reset_user_traffic, update_group, update_registration_settings, update_rule, update_user,
-        ApiResponse, ChangePasswordRequest, CreateUserRequest, ListRulesQuery,
+        change_password, create_group, create_rule, delete_group, delete_rule, get_me, list_groups,
+        list_rules, reset_rule_traffic, update_group, update_rule, ChangePasswordRequest,
+        ListRulesQuery,
     };
-    use crate::api::auth::{register, registration_status};
     use crate::api::middleware::{AdminOnly, AuthUser};
     use crate::api::system::ReleaseCache;
     use crate::api::ws::NodeConnections;
@@ -125,12 +46,10 @@ mod tests {
     use crate::db::schema::SCHEMA_SQL;
     use crate::db::sqlite_repo::SqliteRepository;
     use axum::extract::{Path, Query, State};
-    use axum::http::HeaderMap;
     use axum::Json;
     use relay_shared::protocol::{
-        CreateGroupRequest, CreateRuleRequest, GroupType, Protocol, PublicTransport,
-        RegisterRequest, RegistrationSettingsRequest, UpdateGroupRequest, UpdateRuleRequest,
-        UpdateUserRequest,
+        CreateGroupRequest, CreateRuleRequest, GroupType, LoadBalanceStrategy, Protocol,
+        ProxyProtocolVersion, UpdateGroupRequest, UpdateRuleRequest,
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::SqlitePool;
@@ -155,7 +74,6 @@ mod tests {
                 jwt_secret: "test-secret".into(),
                 public_dir: "public".into(),
                 public_panel_url: String::new(),
-                registration_enabled: false,
                 cors_origins: vec![],
                 geoip_enabled: false,
                 geoip_cache_ttl: 604_800,
@@ -168,26 +86,6 @@ mod tests {
             )),
         };
         (state, pool)
-    }
-
-    async fn add_user(pool: &SqlitePool, id: i64, username: &str, admin: bool) -> String {
-        let hash = bcrypt::hash(format!("old-password-{id}"), 4).unwrap();
-        // v1.0.7: default test users to all_device_groups=1 (unrestricted) so the
-        // rule-validation tests exercise the validation path, not the new
-        // "unassigned = cannot forward" default. Permission-specific tests
-        // override this via assign_user_groups().
-        sqlx::query(
-            "INSERT INTO users (id, username, password, admin, all_device_groups, balance, max_rules, traffic_used, traffic_limit, banned) \
-             VALUES (?, ?, ?, ?, 1, '0', 5, 0, 0, 0)",
-        )
-        .bind(id)
-        .bind(username)
-        .bind(&hash)
-        .bind(admin)
-        .execute(pool)
-        .await
-        .unwrap();
-        hash
     }
 
     async fn add_group(pool: &SqlitePool, id: i64, uid: i64, name: &str) {
@@ -203,410 +101,25 @@ mod tests {
         .unwrap();
     }
 
-    /// v0.4.12 PR1: insert a group with an explicit group_type ('in'/'out'/'monitor').
-    async fn add_group_typed(pool: &SqlitePool, id: i64, uid: i64, name: &str, gtype: &str) {
-        sqlx::query(
-            "INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(id)
-        .bind(name)
-        .bind(gtype)
-        .bind(format!("token-{id}-{uid}"))
-        .bind(uid)
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
-    async fn add_rule(
-        pool: &SqlitePool,
-        id: i64,
-        uid: i64,
-        group_id: i64,
-        port: i64,
-        traffic: i64,
-    ) {
-        sqlx::query(
-            "INSERT INTO forward_rules \
-             (id, name, uid, listen_port, device_group_in, target_addr, target_port, traffic_used) \
-             VALUES (?, ?, ?, ?, ?, '127.0.0.1', 80, ?)",
-        )
-        .bind(id)
-        .bind(format!("rule-{id}"))
-        .bind(uid)
-        .bind(port)
-        .bind(group_id)
-        .bind(traffic)
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn update_user_edits_allowed_fields_and_preserves_password_and_admin_role() {
-        let (state, pool) = test_state().await;
-        let original_hash = add_user(&pool, 2, "alice", false).await;
-
-        let Json(resp) = update_user(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Path(2),
-            Json(UpdateUserRequest {
-                balance: Some("12.34".into()),
-                max_rules: Some(42),
-                traffic_limit: Some(1024),
-                banned: Some(true),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "update should succeed: {}", resp.message);
-
-        let row: (String, i32, i64, bool, String, bool) = sqlx::query_as(
-            "SELECT balance, max_rules, traffic_limit, banned, password, admin FROM users WHERE id = 2",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(row.0, "12.34");
-        assert_eq!(row.1, 42);
-        assert_eq!(row.2, 1024);
-        assert!(row.3);
-        assert_eq!(row.4, original_hash, "admin edit must not touch password");
-        assert!(!row.5, "admin edit must not grant admin role");
-    }
-
-    /// v0.3.5: balance is strictly validated (non-negative decimal, ≤ 2 fraction
-    /// digits, ≤ 9999999999.99). Invalid input must be rejected BEFORE any DB
-    /// write — the schema has no CHECK constraint yet, so this is the only
-    /// guard. The handler must (a) reject obvious garbage, (b) reject negatives
-    /// and oversize values, (c) reject NaN / exponent / locale strings, and
-    /// (d) canonicalise the value that is stored.
-    #[tokio::test]
-    async fn update_user_rejects_invalid_balances_and_canonicalises_valid_ones() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-
-        // The list is intentionally heterogeneous: each negative case proves a
-        // different rule. The valid case at the end proves canonicalisation
-        // (input has extra leading zeros + a 1-digit fraction, expected output
-        // is the canonical 2-digit-fraction form).
-        let cases: &[(&str, bool)] = &[
-            ("", false),
-            ("-1", false),
-            ("-0.01", false),
-            ("+1", false),
-            ("1e3", false),
-            ("NaN", false),
-            ("Infinity", false),
-            ("abc", false),
-            ("1,000.00", false),
-            ("12.345", false),
-            ("10000000000", false),
-            ("0", true),
-            ("0012.30", true),
-        ];
-        for (input, should_succeed) in cases {
-            let Json(resp) = update_user(
-                AdminOnly { user_id: 1 },
-                State(state.clone()),
-                Path(2),
-                Json(UpdateUserRequest {
-                    balance: Some((*input).into()),
-                    ..Default::default()
-                }),
-            )
-            .await;
-            assert_eq!(
-                resp.code == 0,
-                *should_succeed,
-                "balance {input:?}: expected succeed={should_succeed}, got code={} msg={}",
-                resp.code,
-                resp.message
-            );
-            if !should_succeed {
-                assert_eq!(
-                    resp.code, 400,
-                    "rejection should be a 400, got {} (msg={})",
-                    resp.code, resp.message
-                );
-            }
-        }
-
-        // After the run the row should hold the canonical form (last successful
-        // input was "0012.30"). Verify nothing about the user row leaked from
-        // the rejected cases.
-        let (balance,): (String,) = sqlx::query_as("SELECT balance FROM users WHERE id = 2")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(balance, "12.30", "balance must be canonicalised in storage");
-    }
-
-    #[tokio::test]
-    async fn reset_user_traffic_zeros_user_and_owned_rules_only() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_user(&pool, 3, "bob", false).await;
-        add_group(&pool, 20, 2, "alice-in").await;
-        add_group(&pool, 30, 3, "bob-in").await;
-        sqlx::query("UPDATE users SET traffic_used = 111 WHERE id = 2")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE users SET traffic_used = 222 WHERE id = 3")
-            .execute(&pool)
-            .await
-            .unwrap();
-        add_rule(&pool, 200, 2, 20, 12000, 333).await;
-        add_rule(&pool, 201, 2, 20, 12001, 444).await;
-        add_rule(&pool, 300, 3, 30, 13000, 555).await;
-
-        let Json(resp) =
-            reset_user_traffic(AdminOnly { user_id: 1 }, State(state.clone()), Path(2)).await;
-        assert_eq!(resp.code, 0, "reset should succeed: {}", resp.message);
-
-        let user2: (i64,) = sqlx::query_as("SELECT traffic_used FROM users WHERE id = 2")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let user3: (i64,) = sqlx::query_as("SELECT traffic_used FROM users WHERE id = 3")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let sum2: (i64,) =
-            sqlx::query_as("SELECT SUM(traffic_used) FROM forward_rules WHERE uid = 2")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        let sum3: (i64,) =
-            sqlx::query_as("SELECT SUM(traffic_used) FROM forward_rules WHERE uid = 3")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(user2.0, 0);
-        assert_eq!(sum2.0, 0);
-        assert_eq!(user3.0, 222, "other user total must be untouched");
-        assert_eq!(sum3.0, 555, "other user's rules must be untouched");
-    }
-
-    #[tokio::test]
-    async fn delete_user_refuses_admin_without_deleting_admin_resources() {
-        let (state, pool) = test_state().await;
-        add_group(&pool, 10, 1, "admin-in").await;
-        add_rule(&pool, 100, 1, 10, 11000, 999).await;
-
-        let Json(resp) = delete_user(AdminOnly { user_id: 1 }, State(state.clone()), Path(1)).await;
-        assert_eq!(resp.code, 404);
-
-        let user_exists: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let group_exists: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM device_groups WHERE id = 10")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        let rule_exists: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM forward_rules WHERE id = 100")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(user_exists.0, 1);
-        assert_eq!(group_exists.0, 1, "admin group must remain");
-        assert_eq!(rule_exists.0, 1, "admin rule must remain");
-    }
-
-    #[tokio::test]
-    async fn create_user_makes_non_admin_and_rejects_duplicates_and_bad_input() {
-        let (state, pool) = test_state().await;
-
-        // Happy path: creates a regular (non-admin) user.
-        let Json(ok) = create_user(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Json(CreateUserRequest {
-                username: "bob".into(),
-                password: "secret123".into(),
-            }),
-        )
-        .await;
-        assert_eq!(ok.code, 0, "create should succeed: {}", ok.message);
-
-        // v0.4.10: an admin-created user must inherit the default plan's quota
-        // (plan 1 = 'free': max_rules=5, traffic=107374182400) atomically, the
-        // same as self-registration — NOT a bare insert with schema defaults.
-        let row: (i64, bool, Option<i64>, i64, i64) = sqlx::query_as(
-            "SELECT id, admin, plan_id, max_rules, traffic_limit FROM users WHERE username = 'bob'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(!row.1, "created user must be NON-admin");
-        assert_eq!(row.2, Some(1), "created user must be attached to plan 1");
-        assert_eq!(row.3, 5, "max_rules must be inherited from plan 1");
-        assert_eq!(
-            row.4, 107374182400,
-            "traffic_limit must be inherited from plan 1"
-        );
-
-        // Duplicate username → 409.
-        let Json(dup) = create_user(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Json(CreateUserRequest {
-                username: "bob".into(),
-                password: "secret123".into(),
-            }),
-        )
-        .await;
-        assert_eq!(dup.code, 409);
-
-        // v0.4.10: unified password policy is 8..=72 UTF-8 bytes (matches
-        // register / change / admin-reset). 7 bytes is the just-too-short
-        // boundary → 400; the old policy (>=6) would have wrongly accepted it.
-        let Json(short) = create_user(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Json(CreateUserRequest {
-                username: "carol".into(),
-                password: "1234567".into(), // 7 bytes
-            }),
-        )
-        .await;
-        assert_eq!(short.code, 400, "7-byte password must be rejected");
-
-        // Exactly 8 bytes is the lower bound → accepted.
-        let Json(min_ok) = create_user(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Json(CreateUserRequest {
-                username: "dave".into(),
-                password: "12345678".into(), // 8 bytes
-            }),
-        )
-        .await;
-        assert_eq!(
-            min_ok.code, 0,
-            "8-byte password must be accepted: {}",
-            min_ok.message
-        );
-
-        // 73 bytes exceeds the bcrypt 72-byte limit → 400.
-        let Json(long) = create_user(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Json(CreateUserRequest {
-                username: "erin".into(),
-                password: "a".repeat(73),
-            }),
-        )
-        .await;
-        assert_eq!(long.code, 400, "73-byte password must be rejected");
-
-        // Invalid username → 400.
-        let Json(bad) = create_user(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Json(CreateUserRequest {
-                username: "bad name!".into(),
-                password: "secret123".into(),
-            }),
-        )
-        .await;
-        assert_eq!(bad.code, 400);
-    }
-
-    #[tokio::test]
-    async fn change_password_requires_current_password_and_updates_only_password() {
-        let (state, pool) = test_state().await;
-        let old_password = "old-password-2";
-        let old_hash = bcrypt::hash(old_password, 4).unwrap();
-        sqlx::query("INSERT INTO users (id, username, password, admin, balance) VALUES (2, 'alice', ?, 0, '77')")
-            .bind(&old_hash)
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let Json(bad) = super::change_password(
-            AuthUser {
-                user_id: 2,
-                admin: false,
-            },
-            State(state.clone()),
-            Json(ChangePasswordRequest {
-                current_password: "wrong-password".into(),
-                new_password: "new-password".into(),
-            }),
-        )
-        .await;
-        assert_eq!(bad.code, 401);
-
-        let Json(ok) = super::change_password(
-            AuthUser {
-                user_id: 2,
-                admin: false,
-            },
-            State(state.clone()),
-            Json(ChangePasswordRequest {
-                current_password: old_password.into(),
-                new_password: "new-password".into(),
-            }),
-        )
-        .await;
-        assert_eq!(ok.code, 0, "password change should succeed: {}", ok.message);
-
-        let row: (String, String) =
-            sqlx::query_as("SELECT password, balance FROM users WHERE id = 2")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(bcrypt::verify("new-password", &row.0).unwrap());
-        assert_eq!(row.1, "77", "non-password fields must be untouched");
-    }
-
-    // ── rule/group 404 + no-spurious-broadcast (v0.3.6) ──
-    //
-    // Before v0.3.6, update/delete on a non-existent id returned success AND
-    // broadcast config_changed — a no-op mutation needlessly triggering a node
-    // re-fetch. These pin the new contract: 404 + zero broadcasts when nothing
-    // changed, success + exactly one broadcast when something did.
-
     async fn seed_rule_and_group(pool: &SqlitePool) {
-        add_user(pool, 2, "alice", false).await;
-        add_group(pool, 20, 2, "gin").await;
-        // v0.4.11 PR1: rules with ws/tls_simple transport must bind a matching profile.
-        // Seed a ws profile first, then create the rule with ws transport.
-        sqlx::query(
-            "INSERT INTO tunnel_profiles (id, name, transport, tls_mode, ws_path, host_header, sni, is_builtin, uid) \
-             VALUES (51, 'ws-seed', 'ws', 'none', '/relay', '', '', 1, 1)",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-        // Rule with ws transport (public_transport='ws', node_transport='ws') and bound profile.
+        add_group(pool, 20, 1, "gin").await;
         sqlx::query(
             "INSERT INTO forward_rules (id, name, uid, paused, listen_port, protocol, \
-             public_transport, node_transport, entry_transport, forward_mode, \
-             device_group_in, target_addr, target_port, tunnel_profile_id) \
-             VALUES (200, 'test-rule', 2, 0, 12000, 'tcp', 'ws', 'ws', 'ws', \
-             'direct', 20, '127.0.0.1', 80, 51)",
+             device_group_in, target_addr, target_port) \
+             VALUES (200, 'test-rule', 1, 0, 12000, 'tcp', 20, '127.0.0.1', 80)",
         )
         .execute(pool)
         .await
         .unwrap();
     }
 
-    /// Count how many config_changed broadcasts a handler call produced, by
-    /// registering a live WS connection on the shared NodeConnections and
-    /// draining its receiver for ~50ms after the call.
-    async fn expect_broadcasts(
+    async fn expect_group_pushes(
         state: &AppState,
+        group_id: i64,
         expected: usize,
         f: impl std::future::Future<Output = ()>,
     ) {
-        let (_id, mut rx) = state.node_connections.register(99, None).await;
+        let (_id, mut rx) = state.node_connections.register(group_id, None).await;
         f.await;
         let mut n = 0;
         for _ in 0..20 {
@@ -617,14 +130,79 @@ mod tests {
         }
         assert_eq!(
             n, expected,
-            "expected {expected} config_changed broadcasts, got {n}"
+            "expected {expected} config_changed pushes on group {group_id}, got {n}"
         );
     }
 
     #[tokio::test]
-    async fn update_rule_nonexistent_returns_404_no_broadcast() {
+    async fn change_password_requires_current_password_and_updates_password() {
+        let (state, pool) = test_state().await;
+        let old_password = "old-password-1";
+        let old_hash = bcrypt::hash(old_password, 4).unwrap();
+        sqlx::query("UPDATE users SET password = ? WHERE id = 1")
+            .bind(&old_hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let Json(bad) = change_password(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state.clone()),
+            Json(ChangePasswordRequest {
+                current_password: "wrong-password".into(),
+                new_password: "new-password".into(),
+            }),
+        )
+        .await;
+        assert_eq!(bad.code, 401);
+
+        let Json(ok) = change_password(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state.clone()),
+            Json(ChangePasswordRequest {
+                current_password: old_password.into(),
+                new_password: "new-password".into(),
+            }),
+        )
+        .await;
+        assert_eq!(ok.code, 0, "password change should succeed: {}", ok.message);
+
+        let (pw,): (String,) = sqlx::query_as("SELECT password FROM users WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(bcrypt::verify("new-password", &pw).unwrap());
+    }
+
+    #[tokio::test]
+    async fn get_me_returns_admin_account_summary() {
+        let (state, pool) = test_state().await;
+        seed_rule_and_group(&pool).await;
+        let Json(resp) = get_me(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state),
+        )
+        .await;
+        assert_eq!(resp.code, 0);
+        let me = resp.data.unwrap();
+        assert_eq!(me.id, 1);
+        assert!(me.admin);
+        assert_eq!(me.current_rules, 1);
+    }
+
+    #[tokio::test]
+    async fn update_rule_nonexistent_returns_404_no_push() {
         let (state, _pool) = test_state().await;
-        expect_broadcasts(&state, 0, async {
+        expect_group_pushes(&state, 20, 0, async {
             let Json(resp) = update_rule(
                 AuthUser {
                     user_id: 1,
@@ -644,10 +222,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_rule_existing_succeeds_and_broadcasts_once() {
+    async fn update_rule_existing_succeeds_and_pushes_to_group_once() {
         let (state, pool) = test_state().await;
         seed_rule_and_group(&pool).await;
-        expect_broadcasts(&state, 1, async {
+        expect_group_pushes(&state, 20, 1, async {
             let Json(resp) = update_rule(
                 AuthUser {
                     user_id: 1,
@@ -666,9 +244,6 @@ mod tests {
         .await;
     }
 
-    /// v1.2.0: a non-zero auto-restart interval below the floor is rejected.
-    /// A 1-minute restart loop drops connections faster than clients can
-    /// reconnect, which turns the safety valve into a permanent outage.
     #[tokio::test]
     async fn update_rule_rejects_auto_restart_below_floor() {
         let (state, pool) = test_state().await;
@@ -693,7 +268,6 @@ mod tests {
             resp.message
         );
 
-        // 0 = off is always allowed, and so is anything at/above the floor.
         for v in [0, relay_shared::models::MIN_AUTO_RESTART_MINUTES] {
             let Json(resp) = update_rule(
                 AuthUser {
@@ -712,16 +286,11 @@ mod tests {
         }
     }
 
-    /// v1.2.0: setting ONLY max_connections must not switch off a rule's
-    /// scheduled restart. The two share a form but are independent settings, and
-    /// defaulting the omitted one to 0 would make an unrelated edit silently
-    /// disable auto-restart.
     #[tokio::test]
     async fn update_rule_partial_conn_controls_does_not_clobber_the_other() {
         let (state, pool) = test_state().await;
         seed_rule_and_group(&pool).await;
 
-        // Turn auto-restart on (10 min), leaving the cap unset.
         let Json(resp) = update_rule(
             AuthUser {
                 user_id: 1,
@@ -737,7 +306,6 @@ mod tests {
         .await;
         assert_eq!(resp.code, 0, "{}", resp.message);
 
-        // Now set ONLY the cap. auto_restart_minutes must survive.
         let Json(resp) = update_rule(
             AuthUser {
                 user_id: 1,
@@ -766,3208 +334,237 @@ mod tests {
         );
     }
 
-    /// v0.4.8 PR2: changing a rule's protocol to UDP while it's bound to a WS
-    /// profile must be rejected, even when tunnel_profile_id is NOT in the
-    /// request (the binding is loaded from the stored rule). Without this the
-    /// node would skip the listener at config-build time.
     #[tokio::test]
-    async fn update_rule_protocol_udp_with_ws_profile_rejected() {
+    async fn create_rule_persists_max_connections_auto_restart_and_sni() {
+        let (state, pool) = test_state().await;
+        add_group(&pool, 20, 1, "gin").await;
+
+        let Json(r1) = create_rule(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state.clone()),
+            Json(CreateRuleRequest {
+                name: "sni-de01".into(),
+                listen_port: Some(443),
+                protocol: Protocol::Tcp,
+                sni: Some("Region-DE01.Example.com".into()),
+                device_group_in: 20,
+                device_group_out: None,
+                forward_mode: "direct".into(),
+                target_addr: "10.0.0.1".into(),
+                target_port: 443,
+                targets: None,
+                upload_limit_mbps: None,
+                download_limit_mbps: None,
+                load_balance_strategy: LoadBalanceStrategy::First,
+                proxy_protocol_send: ProxyProtocolVersion::Off,
+                proxy_protocol_accept: false,
+                proxy_protocol_trusted: String::new(),
+                max_connections: Some(250),
+                auto_restart_minutes: Some(15),
+            }),
+        )
+        .await;
+        assert_eq!(r1.code, 0, "{}", r1.message);
+
+        // Second rule on SAME port 443 with different SNI must succeed!
+        let Json(r2) = create_rule(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state.clone()),
+            Json(CreateRuleRequest {
+                name: "sni-de02".into(),
+                listen_port: Some(443),
+                protocol: Protocol::Tcp,
+                sni: Some("region-de02.example.com".into()),
+                device_group_in: 20,
+                device_group_out: None,
+                forward_mode: "direct".into(),
+                target_addr: "10.0.0.2".into(),
+                target_port: 443,
+                targets: None,
+                upload_limit_mbps: None,
+                download_limit_mbps: None,
+                load_balance_strategy: LoadBalanceStrategy::First,
+                proxy_protocol_send: ProxyProtocolVersion::Off,
+                proxy_protocol_accept: false,
+                proxy_protocol_trusted: String::new(),
+                max_connections: Some(300),
+                auto_restart_minutes: Some(0),
+            }),
+        )
+        .await;
+        assert_eq!(
+            r2.code, 0,
+            "second SNI rule on :443 should succeed: {}",
+            r2.message
+        );
+
+        // Duplicate SNI on same port 443 must fail with 409!
+        let Json(dup) = create_rule(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state.clone()),
+            Json(CreateRuleRequest {
+                name: "sni-dup".into(),
+                listen_port: Some(443),
+                protocol: Protocol::Tcp,
+                sni: Some("region-de01.example.com".into()),
+                device_group_in: 20,
+                device_group_out: None,
+                forward_mode: "direct".into(),
+                target_addr: "10.0.0.3".into(),
+                target_port: 443,
+                targets: None,
+                upload_limit_mbps: None,
+                download_limit_mbps: None,
+                load_balance_strategy: LoadBalanceStrategy::First,
+                proxy_protocol_send: ProxyProtocolVersion::Off,
+                proxy_protocol_accept: false,
+                proxy_protocol_trusted: String::new(),
+                max_connections: None,
+                auto_restart_minutes: None,
+            }),
+        )
+        .await;
+        assert_eq!(dup.code, 409, "duplicate SNI on same port must be 409");
+
+        // Plain TCP rule (no SNI) on port 443 must also fail with 409 since SNI rules occupy 443!
+        let Json(plain_conflict) = create_rule(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state.clone()),
+            Json(CreateRuleRequest {
+                name: "plain-443".into(),
+                listen_port: Some(443),
+                protocol: Protocol::Tcp,
+                sni: None,
+                device_group_in: 20,
+                device_group_out: None,
+                forward_mode: "direct".into(),
+                target_addr: "10.0.0.4".into(),
+                target_port: 443,
+                targets: None,
+                upload_limit_mbps: None,
+                download_limit_mbps: None,
+                load_balance_strategy: LoadBalanceStrategy::First,
+                proxy_protocol_send: ProxyProtocolVersion::Off,
+                proxy_protocol_accept: false,
+                proxy_protocol_trusted: String::new(),
+                max_connections: None,
+                auto_restart_minutes: None,
+            }),
+        )
+        .await;
+        assert_eq!(plain_conflict.code, 409, "plain rule on SNI port must be 409");
+
+        let Json(listed) = list_rules(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            Query(ListRulesQuery::default()),
+            State(state),
+        )
+        .await;
+        let rules = listed.data.unwrap();
+        assert_eq!(rules.len(), 2);
+        let de01 = rules.iter().find(|r| r.name == "sni-de01").unwrap();
+        assert_eq!(de01.sni.as_deref(), Some("region-de01.example.com"));
+        assert_eq!(de01.max_connections, 250);
+        assert_eq!(de01.auto_restart_minutes, 15);
+    }
+
+    #[tokio::test]
+    async fn create_and_update_group_sni_settings() {
+        let (state, _pool) = test_state().await;
+        let Json(created) = create_group(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Json(CreateGroupRequest {
+                name: "Relay-HK".into(),
+                group_type: GroupType::In,
+                connect_host: "1.2.3.4".into(),
+                port_range: "10000-20000".into(),
+                sni_fallback_addr: Some("127.0.0.1:10443".into()),
+                sni_loop_bypass_ips: Some("203.0.113.10, 198.51.100.20".into()),
+            }),
+        )
+        .await;
+        assert_eq!(created.code, 0, "{}", created.message);
+        let g = created.data.unwrap();
+        assert_eq!(g.sni_fallback_addr, "127.0.0.1:10443");
+        assert_eq!(g.sni_loop_bypass_ips, "203.0.113.10,198.51.100.20");
+
+        let Json(upd) = update_group(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path(g.id),
+            Json(UpdateGroupRequest {
+                name: None,
+                group_type: None,
+                connect_host: None,
+                port_range: None,
+                sni_fallback_addr: Some("127.0.0.1:18443".into()),
+                sni_loop_bypass_ips: Some("".into()),
+            }),
+        )
+        .await;
+        assert_eq!(upd.code, 0, "{}", upd.message);
+
+        let Json(groups) = list_groups(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state.clone()),
+        )
+        .await;
+        let updated = groups.data.unwrap().into_iter().find(|x| x.id == g.id).unwrap();
+        assert_eq!(updated.sni_fallback_addr, "127.0.0.1:18443");
+        assert_eq!(updated.sni_loop_bypass_ips, "");
+
+        let Json(del) = delete_group(AdminOnly { user_id: 1 }, State(state), Path(g.id)).await;
+        assert_eq!(del.code, 0);
+    }
+
+    #[tokio::test]
+    async fn reset_and_delete_rule_work() {
         let (state, pool) = test_state().await;
         seed_rule_and_group(&pool).await;
-        // Bind rule 200 to a ws profile.
-        sqlx::query(
-            "INSERT INTO tunnel_profiles (id, name, transport, tls_mode, ws_path, host_header, sni, is_builtin, uid) \
-             VALUES (50, 'ws-x', 'ws', 'none', '/relay', '', '', 0, 2)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query("UPDATE forward_rules SET tunnel_profile_id = 50 WHERE id = 200")
+        sqlx::query("UPDATE forward_rules SET traffic_used = 500 WHERE id = 200")
             .execute(&pool)
             .await
             .unwrap();
 
-        let Json(resp) = update_rule(
+        let Json(rst) = reset_rule_traffic(
             AuthUser {
                 user_id: 1,
                 admin: true,
             },
             State(state.clone()),
             Path(200),
-            Json(UpdateRuleRequest {
-                protocol: Some(Protocol::Udp),
-                ..Default::default()
-            }),
         )
         .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        // v0.4.10 fix / v0.4.11 PR1: the message must state the incompatibility.
-        // The exact wording may vary (incompatible / not supported).
-        assert!(
-            resp.message.contains("incompatible") || resp.message.contains("not supported"),
-            "message should state incompatibility: {}",
-            resp.message
-        );
-    }
+        assert_eq!(rst.code, 0);
 
-    #[tokio::test]
-    async fn delete_rule_nonexistent_returns_404_no_broadcast() {
-        let (state, _pool) = test_state().await;
-        expect_broadcasts(&state, 0, async {
-            let Json(resp) = delete_rule(
-                AuthUser {
-                    user_id: 1,
-                    admin: true,
-                },
-                State(state.clone()),
-                Path(99999),
-            )
-            .await;
-            assert_eq!(resp.code, 404);
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn update_group_nonexistent_returns_404_no_broadcast() {
-        let (state, _pool) = test_state().await;
-        expect_broadcasts(&state, 0, async {
-            let Json(resp) = update_group(
-                AdminOnly { user_id: 1 },
-                State(state.clone()),
-                Path(99999),
-                Json(UpdateGroupRequest {
-                    name: Some("x".into()),
-                    ..Default::default()
-                }),
-            )
-            .await;
-            assert_eq!(resp.code, 404);
-        })
-        .await;
-    }
-
-    // ── v1.0.4: group delete safety ──
-
-    /// Group with rules referencing it returns 409, not 200.
-    #[tokio::test]
-    async fn delete_group_with_rules_returns_409() {
-        let (state, pool) = test_state().await;
-        // Create a group and a rule that references it.
-        add_group(&pool, 10, 1, "test-in").await;
-        add_rule(&pool, 100, 1, 10, 20000, 0).await;
-
-        let Json(resp) =
-            super::delete_group(AdminOnly { user_id: 1 }, State(state.clone()), Path(10)).await;
-        assert_eq!(resp.code, 409, "group with rules must be rejected");
-        assert!(
-            resp.message.contains("条规则"),
-            "message must include rule count"
-        );
-    }
-
-    /// v1.2.4: the audit trail must never become a place to read a live node
-    /// credential out of. Rotation is exactly the operation that produces one,
-    /// and `detail` is free-form text a future edit could carelessly widen —
-    /// so pin it: the new token must appear in NO column of the audit row.
-    #[tokio::test]
-    async fn rotate_group_token_never_writes_the_token_into_the_audit_log() {
-        let (state, pool) = test_state().await;
-        add_group(&pool, 30, 1, "rotate-me").await;
-
-        let Json(resp) =
-            super::rotate_group_token(AdminOnly { user_id: 1 }, State(state.clone()), Path(30))
-                .await;
-        assert_eq!(resp.code, 0, "rotation must succeed: {}", resp.message);
-        // Read the landed token from the DB rather than the response struct:
-        // it is the same value, and the stored credential is the thing that
-        // must not be discoverable through the audit log.
-        let token: String = sqlx::query_scalar("SELECT token FROM device_groups WHERE id = 30")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(
-            !token.is_empty(),
-            "a blank token would make this test vacuous"
-        );
-
-        let rows = state.db.query_audit_log(None, 50, 0).await.unwrap();
-        let entry = rows
-            .iter()
-            .find(|e| e.action == "rotate_group_token")
-            .expect("rotation must be audited");
-        for (column, value) in [
-            ("detail", &entry.detail),
-            ("target_id", &entry.target_id),
-            ("actor_name", &entry.actor_name),
-            ("target_type", &entry.target_type),
-        ] {
-            assert!(
-                !value.contains(&token),
-                "audit column {column} leaked the rotated node token"
-            );
-        }
-    }
-
-    /// v1.2.8: an audit entry about a group must name it, not just its id.
-    ///
-    /// An id only helps somebody who already knows which group it is — and the
-    /// log is meant to be read months later, by which point the group may have
-    /// been renamed or deleted. The name is captured at write time for the same
-    /// reason the actor name is.
-    #[tokio::test]
-    async fn group_audit_entries_record_the_group_name() {
-        let (state, pool) = test_state().await;
-        add_group(&pool, 41, 1, "hk-line").await;
-
-        let Json(resp) =
-            super::rotate_group_token(AdminOnly { user_id: 1 }, State(state.clone()), Path(41))
-                .await;
-        assert_eq!(resp.code, 0, "rotation must succeed: {}", resp.message);
-
-        let rows = state.db.query_audit_log(None, 50, 0).await.unwrap();
-        let entry = rows
-            .iter()
-            .find(|e| e.action == "rotate_group_token")
-            .expect("rotation must be audited");
-        assert!(
-            entry.detail.contains("hk-line"),
-            "the group name must be in the detail, got {:?}",
-            entry.detail
-        );
-        assert!(
-            entry.detail.contains("#41"),
-            "the id must stay alongside the name (names are not unique), got {:?}",
-            entry.detail
-        );
-    }
-
-    /// v1.2.8: the upgrade entry must not claim the node upgraded.
-    ///
-    /// The panel writes it the moment `send_node` hands the command to the WS
-    /// socket. Everything that can actually fail happens afterwards, on the
-    /// node — download, sha256, backup, swap — and the node never reports back.
-    /// An entry that reads like a finished upgrade is a claim the panel has no
-    /// evidence for, which is worse than saying less.
-    #[tokio::test]
-    async fn upgrade_audit_says_dispatched_not_completed() {
-        let (state, pool) = test_state().await;
-        add_group(&pool, 43, 1, "cn-line").await;
-
-        crate::service::audit::record(
-            &state,
-            Some(1),
-            "upgrade_node",
-            "node",
-            "node-abc",
-            &format!(
-                "分组 {} · 已下发 → 1.2.2（升级结果以节点上报版本为准）",
-                crate::service::audit::group_label(&state, 43).await
-            ),
-        )
-        .await;
-
-        let rows = state.db.query_audit_log(None, 50, 0).await.unwrap();
-        let entry = rows
-            .iter()
-            .find(|e| e.action == "upgrade_node")
-            .expect("dispatch must be audited");
-        assert!(
-            entry.detail.contains("已下发"),
-            "the entry must say the command was dispatched, got {:?}",
-            entry.detail
-        );
-        assert!(
-            entry.detail.contains("cn-line"),
-            "and still name the group, got {:?}",
-            entry.detail
-        );
-    }
-
-    /// Deleting a group is the case that MUST capture the name up front: after
-    /// the row is gone the id can never be resolved again, so an entry written
-    /// with only the id is permanently unreadable.
-    #[tokio::test]
-    async fn deleting_a_group_records_the_name_it_had() {
-        let (state, pool) = test_state().await;
-        add_group(&pool, 42, 1, "doomed-line").await;
-
-        let Json(resp) =
-            super::delete_group(AdminOnly { user_id: 1 }, State(state.clone()), Path(42)).await;
-        assert_eq!(resp.code, 0, "delete must succeed: {}", resp.message);
-        let gone: Option<i64> = sqlx::query_scalar("SELECT id FROM device_groups WHERE id = 42")
-            .fetch_optional(&pool)
-            .await
-            .unwrap();
-        assert!(gone.is_none(), "the group must really be deleted");
-
-        let rows = state.db.query_audit_log(None, 50, 0).await.unwrap();
-        let entry = rows
-            .iter()
-            .find(|e| e.action == "delete_group")
-            .expect("deletion must be audited");
-        assert!(
-            entry.detail.contains("doomed-line"),
-            "the deleted group's name must survive in the audit entry, got {:?}",
-            entry.detail
-        );
-    }
-
-    /// v1.2.4: the public site endpoint is reachable with NO token, so it must
-    /// carry branding only. The support contact is for this operator's users,
-    /// not for anyone who can reach the port.
-    ///
-    /// (The announcement used to be checked here too. It moved to its own table
-    /// in v1.2.4 and is served by an authenticated endpoint of its own.)
-    #[tokio::test]
-    async fn public_site_endpoint_exposes_branding_but_not_the_contact() {
-        let (state, _pool) = test_state().await;
-        let Json(saved) = crate::api::site::update_site_settings(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Json(crate::api::site::UpdateSiteRequest {
-                site_name: "我的中转".into(),
-                subtitle: "私有部署".into(),
-                announcement: String::new(),
-                announcement_type: "info".into(),
-                contact: "tg:@someone".into(),
-                show_node_labels: false,
-            }),
-        )
-        .await;
-        assert_eq!(saved.code, 0, "save must succeed: {}", saved.message);
-
-        // The public view: no AuthUser / AdminOnly extractor at all.
-        let Json(public) = crate::api::site::get_public_site(State(state.clone())).await;
-        let body = serde_json::to_string(&public.data.expect("public site data")).unwrap();
-        assert!(body.contains("我的中转"), "branding must be public");
-        assert!(
-            !body.contains("tg:@someone"),
-            "public endpoint leaked the support contact"
-        );
-
-        // The signed-in view does carry it — otherwise this test would pass
-        // vacuously with the field simply missing everywhere.
-        let Json(notice) = crate::api::site::get_site_notice(
+        let Json(del) = delete_rule(
             AuthUser {
                 user_id: 1,
                 admin: true,
             },
             State(state),
-        )
-        .await;
-        assert_eq!(notice.data.expect("notice data").contact, "tg:@someone");
-    }
-
-    /// An empty group can be deleted successfully.
-    #[tokio::test]
-    async fn delete_empty_group_succeeds() {
-        let (state, pool) = test_state().await;
-        add_group(&pool, 20, 1, "empty-in").await;
-
-        let Json(resp) =
-            super::delete_group(AdminOnly { user_id: 1 }, State(state.clone()), Path(20)).await;
-        assert_eq!(
-            resp.code, 0,
-            "empty group must be deletable: {}",
-            resp.message
-        );
-    }
-
-    /// v1.0.4: count_rules_by_group detects rule references correctly.
-    #[tokio::test]
-    async fn count_rules_by_group_detects_rule_references() {
-        let (state, pool) = test_state().await;
-        add_group(&pool, 30, 1, "node-group").await;
-        add_rule(&pool, 300, 1, 30, 20001, 0).await;
-
-        let count = state.db.count_rules_by_group(30).await.unwrap();
-        assert_eq!(count, 1, "group 30 should have 1 rule referencing it");
-
-        // After deleting the rule, the group is free.
-        state
-            .db
-            .delete_rule(300, &crate::db::repo::ResourceScope::All)
-            .await
-            .unwrap();
-        let count2 = state.db.count_rules_by_group(30).await.unwrap();
-        assert_eq!(
-            count2, 0,
-            "after rule deletion, group should have 0 references"
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_group_nonexistent_returns_404_no_broadcast() {
-        let (state, _pool) = test_state().await;
-        expect_broadcasts(&state, 0, async {
-            let Json(resp) =
-                super::delete_group(AdminOnly { user_id: 1 }, State(state.clone()), Path(99999))
-                    .await;
-            assert_eq!(resp.code, 404);
-        })
-        .await;
-    }
-
-    /// v0.4.8 PR3: err() accepts both &str and owned String (via impl Into<String>),
-    /// so a format!() message doesn't need Box::leak.
-    #[test]
-    fn err_accepts_str_and_owned_string() {
-        let from_str: ApiResponse<()> = err(400, "static");
-        assert_eq!(from_str.code, 400);
-        assert_eq!(from_str.message, "static");
-
-        let from_owned: ApiResponse<()> = err(409, format!("used by {} rules", 3));
-        assert_eq!(from_owned.code, 409);
-        assert_eq!(from_owned.message, "used by 3 rules");
-        assert!(from_owned.data.is_none());
-    }
-
-    // ── v0.4.9: GET /user/me ──
-
-    /// get_me returns the calling user's own non-password fields. The password
-    /// hash is NEVER in the response (UserSelf has no such field).
-    #[tokio::test]
-    async fn get_me_returns_own_info_without_password() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        // Give alice a distinguishable balance/limits/traffic so we can assert
-        // the right row came back.
-        sqlx::query(
-            "UPDATE users SET balance='12.50', max_rules=7, traffic_used=1024, \
-             traffic_limit=1048576 WHERE id=2",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let Json(resp) = get_me(
-            AuthUser {
-                user_id: 2,
-                admin: false,
-            },
-            State(state.clone()),
-        )
-        .await;
-        assert_eq!(resp.code, 0);
-        let me = resp.data.expect("data present");
-        assert_eq!(me.id, 2);
-        assert_eq!(me.username, "alice");
-        assert_eq!(me.balance, "12.50");
-        assert_eq!(me.max_rules, 7);
-        assert_eq!(me.traffic_used, 1024);
-        assert_eq!(me.traffic_limit, 1_048_576);
-        assert!(!me.admin);
-        // v0.4.10: account projection fields. add_user leaves plan_id NULL and
-        // creates no rules, so plan_name is None and current_rules is 0.
-        assert_eq!(me.plan_id, None);
-        assert_eq!(me.plan_name, None);
-        assert_eq!(me.current_rules, 0);
-        assert!(
-            !me.registered_at.is_empty(),
-            "registered_at must be populated"
-        );
-        // UserSelf has no password-hash field by construction. We assert the
-        // serialized response carries neither a bcrypt hash (always starts
-        // "$2") nor a bare `"password":` key. We deliberately do NOT assert the
-        // substring "password" is absent, because v0.4.10 PR4 added the
-        // legitimate `must_change_password` field which contains that substring.
-        let serialized = serde_json::to_string(&me).unwrap();
-        assert!(
-            !serialized.contains("$2"),
-            "bcrypt hash must never appear in /user/me response: {serialized}"
-        );
-        assert!(
-            !serialized.contains("\"password\""),
-            "password-hash key must never appear in /user/me response: {serialized}"
-        );
-        // v0.4.10: the JSON field is registered_at (renamed from created_at).
-        assert!(
-            serialized.contains("registered_at"),
-            "JSON must use registered_at key: {serialized}"
-        );
-    }
-
-    /// v0.4.10: when the user has a plan_id set, plan_name is resolved from
-    /// the plans table (plan_id=1 is the seeded 'free' plan).
-    #[tokio::test]
-    async fn get_me_includes_plan_name_when_plan_set() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        sqlx::query("UPDATE users SET plan_id = 1 WHERE id = 2")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let Json(resp) = get_me(
-            AuthUser {
-                user_id: 2,
-                admin: false,
-            },
-            State(state.clone()),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        let me = resp.data.unwrap();
-        assert_eq!(me.plan_id, Some(1));
-        assert_eq!(me.plan_name.as_deref(), Some("free"));
-    }
-
-    /// v0.4.10: a plan_id pointing at a non-existent plan yields plan_name
-    /// None (defensive — FK should prevent this, but the projection must not
-    /// panic or 500 on a dangling reference).
-    #[tokio::test]
-    async fn get_me_plan_name_none_when_plan_missing() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        // Force a dangling plan_id (FK off so SQLite accepts it).
-        sqlx::query("PRAGMA foreign_keys = OFF")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE users SET plan_id = 999 WHERE id = 2")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("PRAGMA foreign_keys = ON")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let Json(resp) = get_me(
-            AuthUser {
-                user_id: 2,
-                admin: false,
-            },
-            State(state.clone()),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        let me = resp.data.unwrap();
-        assert_eq!(me.plan_id, Some(999));
-        assert_eq!(me.plan_name, None, "missing plan must yield plan_name None");
-    }
-
-    /// v0.4.10: current_rules reflects the user's actual forward_rules count.
-    #[tokio::test]
-    async fn get_me_current_rules_reflects_rule_count() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 20, 2, "alice-in").await;
-        // Two rules owned by alice.
-        add_rule(&pool, 100, 2, 20, 12000, 0).await;
-        add_rule(&pool, 101, 2, 20, 12001, 0).await;
-
-        let Json(resp) = get_me(
-            AuthUser {
-                user_id: 2,
-                admin: false,
-            },
-            State(state.clone()),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        let me = resp.data.unwrap();
-        assert_eq!(
-            me.current_rules, 2,
-            "current_rules must equal owned rule count"
-        );
-    }
-
-    /// A non-admin reading their own account works (this is the whole point of
-    /// /user/me — the account page is the non-admin's landing page).
-    #[tokio::test]
-    async fn get_me_works_for_non_admin() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 5, "bob", false).await;
-        let Json(resp) = get_me(
-            AuthUser {
-                user_id: 5,
-                admin: false,
-            },
-            State(state.clone()),
-        )
-        .await;
-        assert_eq!(resp.code, 0);
-        assert_eq!(resp.data.unwrap().username, "bob");
-    }
-
-    /// A deleted user (JWT still valid but row gone) → 404, not 500.
-    #[tokio::test]
-    async fn get_me_returns_404_for_deleted_user() {
-        let (state, _pool) = test_state().await;
-        let Json(resp) = get_me(
-            AuthUser {
-                user_id: 999,
-                admin: false,
-            },
-            State(state.clone()),
-        )
-        .await;
-        assert_eq!(resp.code, 404);
-        assert!(resp.data.is_none());
-    }
-
-    // ── v0.4.10 resource-ownership isolation ──
-    // These pin the per-user scoping at the HANDLER level: a non-admin may only
-    // see/modify their own rules + groups; another user's (or a non-existent)
-    // resource is a uniform 404; a forged owner_uid is ignored; an admin keeps
-    // unscoped access.
-
-    fn auth(user_id: i64, admin: bool) -> AuthUser {
-        AuthUser { user_id, admin }
-    }
-
-    fn rule_req(name: &str, port: u16, group_in: i64, owner_uid: Option<i64>) -> CreateRuleRequest {
-        CreateRuleRequest {
-            name: name.into(),
-            listen_port: Some(port),
-            protocol: Protocol::Tcp,
-            owner_uid,
-            device_group_in: group_in,
-            device_group_out: None,
-            forward_mode: "direct".into(),
-            route_mode: Default::default(),
-            public_transport: Default::default(),
-            ws_path: None,
-            target_addr: "10.0.0.5".into(),
-            target_port: 80,
-            targets: None,
-            load_balance_strategy: Default::default(),
-            upload_limit_mbps: None,
-            download_limit_mbps: None,
-            tunnel_profile_id: None,
-            proxy_protocol_send: Default::default(),
-            proxy_protocol_accept: false,
-            proxy_protocol_trusted: String::new(),
-        }
-    }
-
-    /// list_rules is owner-scoped: a non-admin sees only their own rules, an
-    /// admin sees everyone's.
-    #[tokio::test]
-    async fn list_rules_is_owner_scoped() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_user(&pool, 3, "bob", false).await;
-        add_group(&pool, 10, 2, "alice-in").await;
-        add_group(&pool, 11, 3, "bob-in").await;
-        add_rule(&pool, 100, 2, 10, 20000, 0).await;
-        add_rule(&pool, 101, 3, 11, 20001, 0).await;
-
-        // Alice sees only her own rule.
-        let Json(resp) = list_rules(
-            auth(2, false),
-            Query(ListRulesQuery::default()),
-            State(state.clone()),
-        )
-        .await;
-        let rules = resp.data.unwrap();
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].id, 100);
-
-        // Admin sees both.
-        let Json(resp) = list_rules(
-            auth(1, true),
-            Query(ListRulesQuery::default()),
-            State(state.clone()),
-        )
-        .await;
-        assert_eq!(resp.data.unwrap().len(), 2);
-    }
-
-    /// v1.2.15: resetting a rule's traffic zeroes that rule's counter only —
-    /// never the owner's quota, which is counted separately — and is
-    /// owner-scoped: a user cannot touch someone else's rule, an admin can.
-    #[tokio::test]
-    async fn reset_rule_traffic_zeroes_the_rule_only_and_is_owner_scoped() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_user(&pool, 3, "bob", false).await;
-        add_group(&pool, 10, 2, "alice-in").await;
-        add_group(&pool, 11, 3, "bob-in").await;
-        add_rule(&pool, 100, 2, 10, 20000, 0).await;
-        add_rule(&pool, 101, 3, 11, 20001, 0).await;
-        sqlx::query("UPDATE forward_rules SET traffic_used = 5000")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE users SET traffic_used = 7000 WHERE id IN (2, 3)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let rule_used = |id: i64| {
-            let pool = pool.clone();
-            async move {
-                let (v,): (i64,) =
-                    sqlx::query_as("SELECT traffic_used FROM forward_rules WHERE id = ?")
-                        .bind(id)
-                        .fetch_one(&pool)
-                        .await
-                        .unwrap();
-                v
-            }
-        };
-
-        // The update itself is scoped too, not only the handler's lookup in
-        // front of it: Alice's scope reaches none of Bob's rules, and only the
-        // one rule asked for.
-        use crate::db::repo::{ResourceScope, RuleRepository};
-        let n =
-            RuleRepository::reset_rule_traffic(state.db.as_ref(), 101, &ResourceScope::Owner(2))
-                .await
-                .unwrap();
-        assert_eq!(n, 0);
-        assert_eq!(rule_used(101).await, 5000);
-
-        // Alice cannot reset Bob's rule: 404, and it keeps its traffic.
-        let Json(resp) = reset_rule_traffic(auth(2, false), State(state.clone()), Path(101)).await;
-        assert_eq!(resp.code, 404);
-        assert_eq!(rule_used(101).await, 5000);
-
-        // Alice resets her own rule: that rule is zeroed — not her other one —
-        // and her quota is not.
-        add_rule(&pool, 102, 2, 10, 20002, 0).await;
-        sqlx::query("UPDATE forward_rules SET traffic_used = 5000 WHERE id = 102")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let Json(resp) = reset_rule_traffic(auth(2, false), State(state.clone()), Path(100)).await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        assert_eq!(rule_used(100).await, 0);
-        assert_eq!(rule_used(102).await, 5000, "only the rule asked for");
-        let (alice_used,): (i64,) = sqlx::query_as("SELECT traffic_used FROM users WHERE id = 2")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(alice_used, 7000, "the owner's quota must not move");
-        let (audits,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM audit_log WHERE action = 'reset_rule_traffic' AND target_id = '100'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(audits, 1);
-
-        // An admin may reset anyone's rule.
-        let Json(resp) = reset_rule_traffic(auth(1, true), State(state.clone()), Path(101)).await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        assert_eq!(rule_used(101).await, 0);
-
-        // A rule that does not exist is a 404, not a silent success.
-        let Json(resp) = reset_rule_traffic(auth(1, true), State(state.clone()), Path(999)).await;
-        assert_eq!(resp.code, 404);
-    }
-
-    /// A failed repository read must never be rendered as an empty successful
-    /// rules list: the UI would tell an operator that every rule disappeared.
-    #[tokio::test]
-    async fn list_rules_database_error_is_not_an_empty_success() {
-        let (state, pool) = test_state().await;
-        pool.close().await;
-
-        let Json(resp) = list_rules(
-            auth(1, true),
-            Query(ListRulesQuery::default()),
-            State(state),
-        )
-        .await;
-        assert_eq!(resp.code, 500);
-        assert!(resp.data.is_none());
-    }
-
-    /// v0.4.20: admin can filter rules by owner_uid query param.
-    #[tokio::test]
-    async fn list_rules_owner_uid_admin_only() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_user(&pool, 3, "bob", false).await;
-        add_group(&pool, 10, 2, "alice-in").await;
-        add_group(&pool, 11, 3, "bob-in").await;
-        add_rule(&pool, 100, 2, 10, 20000, 0).await;
-        add_rule(&pool, 101, 3, 11, 20001, 0).await;
-
-        // Admin filters by owner_uid=2 → only alice's rule.
-        let Json(resp) = list_rules(
-            auth(1, true),
-            Query(ListRulesQuery { owner_uid: Some(2) }),
-            State(state.clone()),
-        )
-        .await;
-        let rules = resp.data.unwrap();
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].id, 100);
-
-        // Non-admin passing owner_uid → ignored, still sees only own rules.
-        let Json(resp) = list_rules(
-            auth(2, false),
-            Query(ListRulesQuery { owner_uid: Some(3) }),
-            State(state.clone()),
-        )
-        .await;
-        let rules = resp.data.unwrap();
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].id, 100); // still alice's own rule
-    }
-
-    /// A non-admin updating/deleting another user's rule gets a uniform 404 —
-    /// indistinguishable from "rule doesn't exist".
-    #[tokio::test]
-    async fn cross_user_rule_access_is_404() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_user(&pool, 3, "bob", false).await;
-        add_group(&pool, 11, 3, "bob-in").await;
-        add_rule(&pool, 101, 3, 11, 20001, 0).await;
-
-        // Alice tries to rename bob's rule → 404.
-        let Json(resp) = update_rule(
-            auth(2, false),
-            State(state.clone()),
-            Path(101),
-            Json(UpdateRuleRequest {
-                name: Some("hijacked".into()),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 404, "{}", resp.message);
-
-        // Alice tries to delete bob's rule → 404, and the rule survives.
-        let Json(resp) = delete_rule(auth(2, false), State(state.clone()), Path(101)).await;
-        assert_eq!(resp.code, 404);
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM forward_rules WHERE id = 101")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(n, 1, "bob's rule must survive alice's delete attempt");
-    }
-
-    /// A non-admin's forged owner_uid in create_rule is IGNORED: the rule is
-    /// attributed to the caller, not the spoofed target.
-    #[tokio::test]
-    async fn create_rule_ignores_forged_owner_uid_for_non_admin() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_user(&pool, 3, "bob", false).await;
-        // v0.4.12 PR1: inbound group must be admin-owned 'in' (uid=1 = seeded admin).
-        add_group(&pool, 10, 1, "shared-in").await;
-
-        // Alice claims owner_uid = 3 (bob). It must be ignored.
-        let Json(resp) = create_rule(
-            auth(2, false),
-            State(state.clone()),
-            Json(rule_req("r", 20000, 10, Some(3))),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-
-        let owner: (i64,) = sqlx::query_as("SELECT uid FROM forward_rules WHERE name = 'r'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            owner.0, 2,
-            "forged owner_uid must be ignored; alice owns it"
-        );
-    }
-
-    // ── v1.2.15: PROXY protocol ──
-
-    async fn pp_row(pool: &sqlx::SqlitePool, name: &str) -> (String, bool, String) {
-        sqlx::query_as(
-            "SELECT proxy_protocol_send, proxy_protocol_accept, proxy_protocol_trusted \
-             FROM forward_rules WHERE name = ?",
-        )
-        .bind(name)
-        .fetch_one(pool)
-        .await
-        .unwrap()
-    }
-
-    async fn node_at(state: &AppState, group: i64, node: &str, version: &str) {
-        state
-            .db
-            .set(
-                &format!("node_status:{group}:{node}"),
-                &serde_json::json!({ "node_version": version, "public_ipv4": "203.0.113.9" })
-                    .to_string(),
-            )
-            .await
-            .unwrap();
-    }
-
-    /// A TCP rule's PROXY protocol settings are stored — the trusted list
-    /// normalized — and reach the node's config for the TCP listener.
-    #[tokio::test]
-    async fn proxy_protocol_is_stored_and_reaches_the_node_config() {
-        use relay_shared::protocol::ProxyProtocolVersion;
-        let (state, pool) = test_state().await;
-        add_group(&pool, 10, 1, "in").await;
-        node_at(&state, 10, "n1", "1.2.9").await;
-        let mut req = rule_req("pp", 20000, 10, None);
-        req.proxy_protocol_send = ProxyProtocolVersion::V2;
-        req.proxy_protocol_accept = true;
-        req.proxy_protocol_trusted = " 203.0.113.7，10.0.0.0/8\n2001:db8::/32 ".into();
-        let Json(resp) = create_rule(auth(1, true), State(state.clone()), Json(req)).await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        assert_eq!(
-            pp_row(&pool, "pp").await,
-            (
-                "v2".into(),
-                true,
-                "203.0.113.7,10.0.0.0/8,2001:db8::/32".into()
-            )
-        );
-
-        let cfg = crate::service::node_config::build_node_config(state.db.as_ref(), 10)
-            .await
-            .unwrap();
-        let l = &cfg.listeners[0];
-        assert_eq!(l.proxy_protocol.send, ProxyProtocolVersion::V2);
-        assert!(l.proxy_protocol.accept);
-        assert_eq!(
-            l.proxy_protocol.trusted,
-            vec!["203.0.113.7", "10.0.0.0/8", "2001:db8::/32"]
-        );
-    }
-
-    /// Refused where it cannot work: a UDP rule, a malformed trusted source,
-    /// and a group with a node older than node-v1.2.9 (it would ignore the
-    /// setting and break every connection). Nothing is created.
-    #[tokio::test]
-    async fn proxy_protocol_is_refused_where_it_cannot_work() {
-        use relay_shared::protocol::ProxyProtocolVersion;
-        let (state, pool) = test_state().await;
-        add_group(&pool, 10, 1, "in").await;
-
-        let mut udp = rule_req("udp", 20001, 10, None);
-        udp.protocol = Protocol::Udp;
-        udp.proxy_protocol_send = ProxyProtocolVersion::V1;
-        let Json(resp) = create_rule(auth(1, true), State(state.clone()), Json(udp)).await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        assert!(resp.message.contains("TCP"), "{}", resp.message);
-
-        let mut bad = rule_req("bad", 20002, 10, None);
-        bad.proxy_protocol_accept = true;
-        bad.proxy_protocol_trusted = "10.0.0.1, 10.0.0.0/33".into();
-        let Json(resp) = create_rule(auth(1, true), State(state.clone()), Json(bad)).await;
-        assert_eq!(resp.code, 400);
-        assert!(resp.message.contains("10.0.0.0/33"), "{}", resp.message);
-
-        node_at(&state, 10, "old", "1.2.8").await;
-        let gated = || {
-            let mut r = rule_req("gated", 20003, 10, None);
-            r.proxy_protocol_send = ProxyProtocolVersion::V1;
-            r
-        };
-        let Json(resp) = create_rule(auth(1, true), State(state.clone()), Json(gated())).await;
-        assert_eq!(resp.code, 400);
-        // node_at writes no last_seen, so this node reads as offline: it is
-        // marked, and the message says retired nodes can be deleted.
-        assert!(
-            resp.message.contains("203.0.113.9 (1.2.8, 离线)"),
-            "{}",
-            resp.message
-        );
-        assert!(resp.message.contains("节点状态页删除"), "{}", resp.message);
-
-        // A node that is reporting right now is named without the marker or
-        // the hint.
-        state
-            .db
-            .set(
-                "node_status:10:old",
-                &serde_json::json!({
-                    "node_version": "1.2.8",
-                    "public_ipv4": "203.0.113.9",
-                    "last_seen": chrono::Utc::now().to_rfc3339(),
-                })
-                .to_string(),
-            )
-            .await
-            .unwrap();
-        let Json(resp) = create_rule(auth(1, true), State(state.clone()), Json(gated())).await;
-        assert_eq!(resp.code, 400);
-        assert!(
-            resp.message.contains("203.0.113.9 (1.2.8)"),
-            "{}",
-            resp.message
-        );
-        assert!(!resp.message.contains("节点状态页删除"), "{}", resp.message);
-
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM forward_rules")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(n, 0, "a refused rule must not be created");
-
-        // Once the node is upgraded the same rule goes through.
-        node_at(&state, 10, "old", "1.2.9").await;
-        let Json(resp) = create_rule(auth(1, true), State(state.clone()), Json(gated())).await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-    }
-
-    /// An edit is checked against the rule it leaves behind: switching a rule
-    /// with PROXY protocol on to UDP is refused; turning it off first works;
-    /// turning it on with an old node in the group is refused.
-    #[tokio::test]
-    async fn proxy_protocol_edits_are_checked_against_the_resulting_rule() {
-        use relay_shared::protocol::ProxyProtocolVersion;
-        let (state, pool) = test_state().await;
-        add_group(&pool, 10, 1, "in").await;
-        let mut req = rule_req("e", 20000, 10, None);
-        req.proxy_protocol_send = ProxyProtocolVersion::V1;
-        let Json(resp) = create_rule(auth(1, true), State(state.clone()), Json(req)).await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        let (id,): (i64,) = sqlx::query_as("SELECT id FROM forward_rules WHERE name = 'e'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let edit = |body: serde_json::Value| {
-            let state = state.clone();
-            async move {
-                let Json(resp) = update_rule(
-                    auth(1, true),
-                    State(state),
-                    Path(id),
-                    Json(serde_json::from_value(body).unwrap()),
-                )
-                .await;
-                resp
-            }
-        };
-
-        let resp = edit(serde_json::json!({ "protocol": "udp" })).await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        assert_eq!(pp_row(&pool, "e").await.0, "v1");
-
-        let resp = edit(serde_json::json!({ "proxy_protocol_send": "off" })).await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        assert_eq!(pp_row(&pool, "e").await.0, "off");
-
-        node_at(&state, 10, "old", "1.2.8").await;
-        let resp = edit(serde_json::json!({ "proxy_protocol_accept": true })).await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        assert!(!pp_row(&pool, "e").await.1);
-
-        // An unrelated edit does not trip the node check.
-        let resp = edit(serde_json::json!({ "name": "renamed" })).await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-    }
-
-    /// An admin MAY create a rule on behalf of another user via owner_uid.
-    #[tokio::test]
-    async fn create_rule_admin_can_set_owner_uid() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 3, "bob", false).await;
-        // v0.4.12 PR1: inbound group must be admin-owned (uid=1). The rule owner
-        // (bob) is independent of the inbound group's owner.
-        add_group(&pool, 11, 1, "shared-in").await;
-
-        let Json(resp) = create_rule(
-            auth(1, true),
-            State(state.clone()),
-            Json(rule_req("r", 20000, 11, Some(3))),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        let owner: (i64,) = sqlx::query_as("SELECT uid FROM forward_rules WHERE name = 'r'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(owner.0, 3, "admin set owner to bob");
-    }
-
-    /// create_rule enforces that the referenced inbound group belongs to the
-    /// rule's owner: a non-admin can't attach a rule to someone else's group.
-    #[tokio::test]
-    async fn create_rule_rejects_foreign_inbound_group() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_user(&pool, 3, "bob", false).await;
-        add_group(&pool, 11, 3, "bob-in").await; // bob's group
-
-        // Alice references bob's group 11 → rejected (group not hers).
-        let Json(resp) = create_rule(
-            auth(2, false),
-            State(state.clone()),
-            Json(rule_req("r", 20000, 11, None)),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-    }
-
-    /// v0.4.11 PR3: a non-admin CAN bind a rule to an inbound group owned by an
-    /// ADMIN ("shared inbound" infrastructure). This is the positive case the
-    /// foreign-group rejection must not break.
-    #[tokio::test]
-    async fn create_rule_allows_admin_shared_inbound_group() {
-        let (state, pool) = test_state().await;
-        // user id=1 is the seeded admin; it owns the shared group.
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 11, 1, "shared-in").await; // admin's group
-
-        // Alice references the admin's shared group 11 → allowed.
-        let Json(resp) = create_rule(
-            auth(2, false),
-            State(state.clone()),
-            Json(rule_req("r", 20000, 11, None)),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-    }
-
-    // ── v1.0.7 regression: per-user device-group authorization ──
-
-    /// Restrict a user to an explicit device-group allowlist (all_device_groups
-    /// stays 0). An empty list = unassigned = cannot forward.
-    async fn assign_user_groups(pool: &SqlitePool, uid: i64, allowed: &[i64]) {
-        sqlx::query("UPDATE users SET all_device_groups = 0 WHERE id = ?")
-            .bind(uid)
-            .execute(pool)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM user_device_groups WHERE user_id = ?")
-            .bind(uid)
-            .execute(pool)
-            .await
-            .unwrap();
-        for gid in allowed {
-            sqlx::query("INSERT INTO user_device_groups (user_id, device_group_id) VALUES (?, ?)")
-                .bind(uid)
-                .bind(gid)
-                .execute(pool)
-                .await
-                .unwrap();
-        }
-    }
-
-    /// REGRESSION: a user authorized for group 1 must NOT be able to create a
-    /// rule on group 2.
-    #[tokio::test]
-    async fn create_rule_rejects_group_outside_user_authorization() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 1, 1, "admin-in-1").await;
-        add_group(&pool, 2, 1, "admin-in-2").await;
-        // Alice is authorized for ONLY device group 1.
-        assign_user_groups(&pool, 2, &[1]).await;
-
-        // Group 1 → allowed.
-        let Json(ok) = create_rule(
-            auth(2, false),
-            State(state.clone()),
-            Json(rule_req("r1", 20001, 1, None)),
-        )
-        .await;
-        assert_eq!(ok.code, 0, "group 1 must be allowed: {}", ok.message);
-
-        // Group 2 → forbidden (403).
-        let Json(deny) = create_rule(
-            auth(2, false),
-            State(state.clone()),
-            Json(rule_req("r2", 20002, 2, None)),
-        )
-        .await;
-        assert_eq!(
-            deny.code, 403,
-            "group 2 must be rejected (permission bypass)"
-        );
-    }
-
-    /// REGRESSION: an empty authorized list means NO access → deny (the bug
-    /// treated empty as "allow all").
-    #[tokio::test]
-    async fn create_rule_empty_authorization_denies_all() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 1, 1, "admin-in-1").await;
-        // Alice is authorized for NOTHING (default: restricted, no assignments).
-        assign_user_groups(&pool, 2, &[]).await;
-
-        let Json(deny) = create_rule(
-            auth(2, false),
-            State(state.clone()),
-            Json(rule_req("r", 20001, 1, None)),
-        )
-        .await;
-        assert_eq!(deny.code, 403, "empty authorization must deny, not allow");
-    }
-
-    /// REGRESSION: removing a device group from a user's authorization pauses
-    /// the user's existing rules on that group (kept, not deleted).
-    #[tokio::test]
-    async fn changing_user_group_pauses_unauthorized_rules() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 1, 1, "admin-in-1").await;
-        add_group(&pool, 2, 1, "admin-in-2").await;
-        // Alice initially authorized for both groups.
-        assign_user_groups(&pool, 2, &[1, 2]).await;
-        // Alice has a rule on group 2.
-        add_rule(&pool, 100, 2, 2, 20002, 0).await;
-
-        // Re-assign Alice to ONLY group 1 (group 2 no longer authorized).
-        let Json(resp) = update_user(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Path(2),
-            Json(UpdateUserRequest {
-                device_group_ids: Some(vec![1]),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-
-        // Rule 100 (on group 2) must now be paused, NOT deleted.
-        let row: (i64, bool) =
-            sqlx::query_as("SELECT id, paused FROM forward_rules WHERE id = 100")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(row.1, "rule on now-unauthorized group must be paused");
-    }
-
-    /// REGRESSION (review round 2): flipping a user from all_device_groups=true
-    /// to false must pause their rules on groups that are no longer authorized.
-    #[tokio::test]
-    async fn flipping_user_to_restricted_pauses_unauthorized_rules() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 1, 1, "admin-in-1").await;
-        add_group(&pool, 2, 1, "admin-in-2").await;
-        // Alice initially may use ALL device groups.
-        sqlx::query("UPDATE users SET all_device_groups = 1 WHERE id = 2")
-            .execute(&pool)
-            .await
-            .unwrap();
-        // Alice has a rule on group 2 (allowed while all_device_groups=true).
-        add_rule(&pool, 100, 2, 2, 20002, 0).await;
-
-        // Admin flips Alice to restricted (all_device_groups=false). With no
-        // explicit assignments, ALL of her rules become unauthorized → paused.
-        let Json(resp) = update_user(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Path(2),
-            Json(UpdateUserRequest {
-                all_device_groups: Some(false),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-
-        let row: (i64, bool) =
-            sqlx::query_as("SELECT id, paused FROM forward_rules WHERE id = 100")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(
-            row.1,
-            "rule must be paused after user flipped to restricted (all_device_groups=false)"
-        );
-    }
-
-    /// REGRESSION: updating the device-group authorization together with
-    /// balance/quota must apply ALL fields (the bug early-returned, dropping the
-    /// rest).
-    #[tokio::test]
-    async fn update_user_applies_authz_and_other_fields_together() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-
-        let Json(resp) = update_user(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Path(2),
-            Json(UpdateUserRequest {
-                all_device_groups: Some(true),
-                max_rules: Some(99),
-                balance: Some("50.00".into()),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-
-        let row: (bool, i64, String) =
-            sqlx::query_as("SELECT all_device_groups, max_rules, balance FROM users WHERE id = 2")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(row.0, "all_device_groups must be set");
-        assert_eq!(row.1, 99, "max_rules must ALSO be applied (not dropped)");
-        assert_eq!(row.2, "50.00", "balance must ALSO be applied (not dropped)");
-    }
-
-    /// v0.4.12 PR1: a regular user's OWN historical inbound group is NOT a valid
-    /// rule entry — only admin-owned 'in' groups are. (Device groups are
-    /// admin-managed shared infrastructure.)
-    #[tokio::test]
-    async fn create_rule_rejects_users_own_historical_group() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 30, 2, "alice-own-in").await; // alice's own 'in' group
-
-        let Json(resp) = create_rule(
-            auth(2, false),
-            State(state.clone()),
-            Json(rule_req("r", 20000, 30, None)),
-        )
-        .await;
-        assert_eq!(
-            resp.code, 400,
-            "a user's own (non-admin) group must be rejected: {}",
-            resp.message
-        );
-    }
-
-    /// v0.4.12 PR1: an admin-owned OUT (or monitor) group is NOT a valid rule
-    /// entry — device_group_in must be `group_type='in'`.
-    #[tokio::test]
-    async fn create_rule_rejects_admin_out_group_as_inbound() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group_typed(&pool, 40, 1, "admin-out", "out").await; // admin 'out' group
-
-        let Json(resp) = create_rule(
-            auth(2, false),
-            State(state.clone()),
-            Json(rule_req("r", 20000, 40, None)),
-        )
-        .await;
-        assert_eq!(
-            resp.code, 400,
-            "an admin 'out' group must be rejected as device_group_in: {}",
-            resp.message
-        );
-    }
-
-    /// v0.4.20: create_rule rejects forward_mode="group".
-    #[tokio::test]
-    async fn create_rule_rejects_group_forward_mode() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 20, 1, "shared-in").await;
-
-        let Json(resp) = create_rule(
-            auth(2, false),
-            State(state.clone()),
-            Json(CreateRuleRequest {
-                forward_mode: "group".into(),
-                ..rule_req("test", 20000, 20, None)
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        assert!(resp.message.contains("direct"));
-    }
-
-    /// v0.4.20: create_rule rejects non-null device_group_out.
-    #[tokio::test]
-    async fn create_rule_rejects_device_group_out() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 20, 1, "shared-in").await;
-
-        let Json(resp) = create_rule(
-            auth(2, false),
-            State(state.clone()),
-            Json(CreateRuleRequest {
-                device_group_out: Some(99),
-                ..rule_req("test", 20000, 20, None)
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        assert!(resp.message.contains("device_group_out"));
-    }
-
-    /// v0.4.20: update_rule rejects forward_mode="group".
-    #[tokio::test]
-    async fn update_rule_rejects_group_forward_mode() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 20, 1, "shared-in").await;
-        add_rule(&pool, 200, 2, 20, 12000, 0).await;
-
-        let Json(resp) = update_rule(
-            auth(2, false),
-            State(state.clone()),
             Path(200),
-            Json(UpdateRuleRequest {
-                forward_mode: Some("group".into()),
-                ..Default::default()
-            }),
         )
         .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        assert!(resp.message.contains("direct"));
-    }
-
-    /// v0.4.20: update_rule rejects non-null device_group_out.
-    #[tokio::test]
-    async fn update_rule_rejects_device_group_out() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 20, 1, "shared-in").await;
-        add_rule(&pool, 200, 2, 20, 12000, 0).await;
-
-        let Json(resp) = update_rule(
-            auth(2, false),
-            State(state.clone()),
-            Path(200),
-            Json(UpdateRuleRequest {
-                device_group_out: Some(99),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        assert!(resp.message.contains("device_group_out"));
-    }
-
-    #[tokio::test]
-    async fn group_access_is_owner_scoped() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_user(&pool, 3, "bob", false).await;
-        add_group(&pool, 10, 2, "alice-in").await;
-        add_group(&pool, 11, 3, "bob-in").await;
-
-        // Alice lists only her group.
-        let Json(resp) = list_groups(auth(2, false), State(state.clone())).await;
-        let groups = resp.data.unwrap();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].id, 10);
-
-        // Admin lists both.
-        let Json(resp) = list_groups(auth(1, true), State(state.clone())).await;
-        assert_eq!(resp.data.unwrap().len(), 2);
-
-        // v0.4.12 PR1: delete_group is admin-only (scope All). An admin may
-        // delete any group regardless of owner.
-        let Json(resp) =
-            delete_group(AdminOnly { user_id: 1 }, State(state.clone()), Path(11)).await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM device_groups WHERE id = 11")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(n, 0, "admin deleted bob's group");
-    }
-
-    /// v0.4.12 PR1: create_group is admin-only and IGNORES owner_uid — the
-    /// group always belongs to the creating admin (a regular-user-owned group
-    /// would be unmanageable and never shared).
-    #[tokio::test]
-    async fn create_group_ignores_owner_uid_and_assigns_admin() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_user(&pool, 3, "bob", false).await;
-
-        let Json(resp) = create_group(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Json(CreateGroupRequest {
-                name: "g".into(),
-                group_type: GroupType::In,
-                connect_host: "1.2.3.4".into(),
-                port_range: "20000-30000".into(),
-                owner_uid: Some(3),
-                rate: None,
-                hidden: None,
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        let owner: (i64,) = sqlx::query_as("SELECT uid FROM device_groups WHERE name = 'g'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            owner.0, 1,
-            "owner_uid must be ignored; group belongs to the creating admin"
-        );
-    }
-
-    // ── v0.4.10 fix PR: tunnel-profile builtin scoping + group ownership ──
-    // These pin the two security gaps closed by the fix PR:
-    //   C6 — a regular user's rule may bind ONLY a builtin tunnel profile
-    //        (decided by the RULE OWNER's role, not the operator's)
-    //   C7 — update_rule must reject pointing a rule at a group owned by
-    //        someone other than the rule's owner (the invariant
-    //        rule.uid == group_in.uid == group_out.uid holds for ALL operators)
-
-    /// Helper: insert a tunnel profile row directly (test_state runs SCHEMA_SQL
-    /// only, no Migration 6 builtin seed), so tests can pick builtin vs custom.
-    async fn add_profile(pool: &SqlitePool, id: i64, name: &str, is_builtin: bool, uid: i64) {
-        // v0.4.11 PR1: profiles are now ws/tls_simple only; 'direct' is no longer valid.
-        sqlx::query(
-            "INSERT INTO tunnel_profiles (id, name, transport, tls_mode, ws_path, host_header, sni, is_builtin, uid) \
-             VALUES (?, ?, 'ws', 'none', '/relay', '', '', ?, ?)",
-        )
-        .bind(id)
-        .bind(name)
-        .bind(is_builtin)
-        .bind(uid)
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
-    /// Retired ingress is rejected even with a valid admin-owned custom template.
-    #[tokio::test]
-    async fn create_rule_rejects_retired_custom_profile_for_user() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 20, 1, "shared-in").await; // admin-owned inbound (v0.4.12 PR1)
-        add_profile(&pool, 50, "custom", false, 1).await; // admin's custom ws profile
-
-        let Json(resp) = create_rule(
-            auth(2, false),
-            State(state.clone()),
-            Json(rule_req_with_profile("r", 12000, 20, None, Some(50))),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        assert!(resp.message.contains("retired"));
-    }
-
-    /// Builtin templates do not bypass the node's retired-transport restriction.
-    #[tokio::test]
-    async fn create_rule_rejects_retired_builtin_profile_for_user() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 20, 1, "shared-in").await; // admin-owned inbound (v0.4.12 PR1)
-        add_profile(&pool, 51, "builtin-ws", true, 1).await;
-
-        let Json(resp) = create_rule(
-            auth(2, false),
-            State(state.clone()),
-            Json(rule_req_with_profile("r", 12001, 20, None, Some(51))),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        assert!(resp.message.contains("retired"));
-    }
-
-    /// Administrators cannot create a retired-transport rule either.
-    #[tokio::test]
-    async fn create_rule_admin_cannot_bind_retired_custom_profile() {
-        let (state, pool) = test_state().await;
-        // user id=1 is the seeded admin
-        add_group(&pool, 20, 1, "admin-in").await;
-        add_profile(&pool, 50, "custom", false, 1).await;
-
-        let Json(resp) = create_rule(
-            auth(1, true),
-            State(state.clone()),
-            Json(rule_req_with_profile("r", 12002, 20, None, Some(50))),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        assert!(resp.message.contains("retired"));
-    }
-
-    /// Acting on behalf of another owner does not bypass transport validation.
-    #[tokio::test]
-    async fn create_rule_admin_rejects_retired_profile_for_other_owner() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 20, 1, "shared-in").await; // admin-owned inbound (v0.4.12 PR1)
-        add_profile(&pool, 50, "custom", false, 1).await;
-
-        // Admin creates a rule owned by alice, binds the custom profile.
-        let Json(resp) = create_rule(
-            auth(1, true),
-            State(state.clone()),
-            Json(rule_req_with_profile("r", 12003, 20, Some(2), Some(50))),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        assert!(resp.message.contains("retired"));
-    }
-
-    /// C7: a regular user re-pointing their rule's device_group_in at ANOTHER
-    /// user's group is rejected.
-    #[tokio::test]
-    async fn update_rule_rejects_foreign_inbound_group() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_user(&pool, 3, "bob", false).await;
-        add_group(&pool, 20, 2, "alice-in").await;
-        add_group(&pool, 21, 3, "bob-in").await; // bob's group
-        add_rule(&pool, 200, 2, 20, 12000, 0).await;
-
-        // Alice tries to point her rule at bob's inbound group.
-        let Json(resp) = update_rule(
-            auth(2, false),
-            State(state.clone()),
-            Path(200),
-            Json(UpdateRuleRequest {
-                device_group_in: Some(21),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        assert!(resp.message.contains("device_group_in"));
-    }
-
-    /// v0.4.20: device_group_out is no longer supported — any non-null value
-    /// is rejected at the API boundary before ownership checks.
-    #[tokio::test]
-    async fn update_rule_rejects_foreign_outbound_group() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_user(&pool, 3, "bob", false).await;
-        add_group(&pool, 20, 2, "alice-in").await;
-        add_group(&pool, 30, 3, "bob-out").await;
-        add_rule(&pool, 200, 2, 20, 12000, 0).await;
-
-        let Json(resp) = update_rule(
-            auth(2, false),
-            State(state.clone()),
-            Path(200),
-            Json(UpdateRuleRequest {
-                device_group_out: Some(30),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        assert!(resp.message.contains("device_group_out"));
-    }
-
-    /// v0.4.12 PR1: a regular user re-pointing their rule at one of their OWN
-    /// (non-admin) groups is now REJECTED — device_group_in must be an
-    /// admin-owned 'in' group. (The allowed path — swapping to an admin shared
-    /// group — is covered by update_rule_allows_admin_shared_inbound_group.)
-    #[tokio::test]
-    async fn update_rule_rejects_owner_group_swap() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 20, 1, "shared-in").await; // admin-owned (valid current inbound)
-        add_group(&pool, 21, 2, "alice-in-2").await; // alice's own group (invalid target)
-        add_rule(&pool, 200, 2, 20, 12000, 0).await;
-
-        let Json(resp) = update_rule(
-            auth(2, false),
-            State(state.clone()),
-            Path(200),
-            Json(UpdateRuleRequest {
-                device_group_in: Some(21),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(
-            resp.code, 400,
-            "swapping to the user's own (non-admin) group must be rejected: {}",
-            resp.message
-        );
-    }
-
-    /// v0.4.11 PR3: a non-admin CAN re-point their rule at an ADMIN-owned shared
-    /// inbound group via update_rule.
-    #[tokio::test]
-    async fn update_rule_allows_admin_shared_inbound_group() {
-        let (state, pool) = test_state().await;
-        // user id=1 is the seeded admin; it owns the shared group.
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 20, 2, "alice-in").await;
-        add_group(&pool, 21, 1, "shared-in").await; // admin's group
-        add_rule(&pool, 200, 2, 20, 12000, 0).await;
-
-        let Json(resp) = update_rule(
-            auth(2, false),
-            State(state.clone()),
-            Path(200),
-            Json(UpdateRuleRequest {
-                device_group_in: Some(21),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-    }
-    #[tokio::test]
-    async fn update_rule_admin_rejects_group_owned_by_different_user() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_user(&pool, 3, "bob", false).await;
-        add_group(&pool, 20, 2, "alice-in").await;
-        add_group(&pool, 21, 3, "bob-in").await; // bob's group
-        add_rule(&pool, 200, 2, 20, 12000, 0).await; // alice's rule
-
-        // Admin edits alice's rule, tries to point it at bob's group.
-        let Json(resp) = update_rule(
-            auth(1, true),
-            State(state.clone()),
-            Path(200),
-            Json(UpdateRuleRequest {
-                device_group_in: Some(21),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        assert!(resp.message.contains("device_group_in"));
-    }
-
-    /// v0.4.12 PR1: an admin editing alice's rule CAN point it at an admin-owned
-    /// shared 'in' group (the new valid inbound). Pointing at alice's own group
-    /// is no longer valid (covered by update_rule_rejects_owner_group_swap).
-    #[tokio::test]
-    async fn update_rule_admin_can_swap_to_admin_shared_group() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 20, 1, "shared-in-1").await; // admin-owned (valid current)
-        add_group(&pool, 21, 1, "shared-in-2").await; // admin-owned (valid target)
-        add_rule(&pool, 200, 2, 20, 12000, 0).await;
-
-        let Json(resp) = update_rule(
-            auth(1, true),
-            State(state.clone()),
-            Path(200),
-            Json(UpdateRuleRequest {
-                device_group_in: Some(21),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-    }
-
-    /// C6 (update side): an admin editing a regular user's rule CANNOT rebind it
-    /// to a custom profile (the rule owner is the regular user → BuiltinOnly).
-    #[tokio::test]
-    async fn update_rule_admin_rejects_custom_profile_for_non_admin_owned_rule() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 20, 2, "alice-in").await;
-        add_profile(&pool, 50, "custom", false, 1).await;
-        add_rule(&pool, 200, 2, 20, 12000, 0).await;
-
-        let Json(resp) = update_rule(
-            auth(1, true),
-            State(state.clone()),
-            Path(200),
-            Json(UpdateRuleRequest {
-                tunnel_profile_id: Some(Some(50)),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-    }
-
-    fn rule_req_with_profile(
-        name: &str,
-        port: u16,
-        group_in: i64,
-        owner_uid: Option<i64>,
-        profile_id: Option<i64>,
-    ) -> CreateRuleRequest {
-        // v0.4.11 PR1: when a profile is provided, transport must be ws (matches profile).
-        let public_transport = if profile_id.is_some() {
-            PublicTransport::Ws
-        } else {
-            PublicTransport::Raw
-        };
-        CreateRuleRequest {
-            name: name.into(),
-            listen_port: Some(port),
-            protocol: Protocol::Tcp,
-            owner_uid,
-            device_group_in: group_in,
-            device_group_out: None,
-            forward_mode: "direct".into(),
-            route_mode: Default::default(),
-            public_transport,
-            ws_path: None,
-            target_addr: "10.0.0.5".into(),
-            target_port: 80,
-            targets: None,
-            load_balance_strategy: Default::default(),
-            upload_limit_mbps: None,
-            download_limit_mbps: None,
-            tunnel_profile_id: profile_id,
-            proxy_protocol_send: Default::default(),
-            proxy_protocol_accept: false,
-            proxy_protocol_trusted: String::new(),
-        }
-    }
-
-    // ── v0.4.10 PR3: registration + settings handler tests ──
-
-    /// registration_status returns enabled=false on an unseeded DB (safe default).
-    #[tokio::test]
-    async fn registration_status_returns_false_when_unseeded() {
-        let (state, _pool) = test_state().await;
-        let Json(resp) = registration_status(State(state.clone())).await;
-        assert_eq!(resp.code, 0);
-        assert!(
-            !resp.data.unwrap().enabled,
-            "unseeded DB must report registration disabled"
-        );
-    }
-
-    /// registration_status reflects the DB row once seeded.
-    #[tokio::test]
-    async fn registration_status_reflects_db_setting() {
-        let (state, _pool) = test_state().await;
-        state
-            .db
-            .set_registration_settings(true, 1, &[1])
-            .await
-            .unwrap();
-
-        let Json(resp) = registration_status(State(state.clone())).await;
-        assert_eq!(resp.code, 0);
-        assert!(resp.data.unwrap().enabled);
-    }
-
-    /// register returns 403 when registration is disabled (unseeded → false).
-    #[tokio::test]
-    async fn register_rejects_when_disabled() {
-        let (state, _pool) = test_state().await;
-        let Json(resp) = register(
-            State(state.clone()),
-            None,
-            HeaderMap::new(),
-            Json(RegisterRequest {
-                username: "newuser".into(),
-                password: "validpass1".into(),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 403, "{}", resp.message);
-    }
-
-    /// register rejects a password shorter than 8 bytes.
-    #[tokio::test]
-    async fn register_rejects_short_password() {
-        let (state, _pool) = test_state().await;
-        state
-            .db
-            .set_registration_settings(true, 1, &[1])
-            .await
-            .unwrap();
-
-        let Json(resp) = register(
-            State(state.clone()),
-            None,
-            HeaderMap::new(),
-            Json(RegisterRequest {
-                username: "newuser".into(),
-                password: "short".into(), // 5 bytes
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-    }
-
-    /// register rejects a password longer than 72 bytes (bcrypt boundary).
-    #[tokio::test]
-    async fn register_rejects_long_password() {
-        let (state, _pool) = test_state().await;
-        state
-            .db
-            .set_registration_settings(true, 1, &[1])
-            .await
-            .unwrap();
-
-        let Json(resp) = register(
-            State(state.clone()),
-            None,
-            HeaderMap::new(),
-            Json(RegisterRequest {
-                username: "newuser".into(),
-                password: "x".repeat(73),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-    }
-
-    /// register rejects a password where the UTF-8 byte length exceeds 72 even
-    /// though the character count is small (e.g. multibyte CJK / emoji).
-    #[tokio::test]
-    async fn register_rejects_multibyte_password_exceeding_byte_limit() {
-        let (state, _pool) = test_state().await;
-        state
-            .db
-            .set_registration_settings(true, 1, &[1])
-            .await
-            .unwrap();
-        // 25 × '中' = 25 chars but 75 UTF-8 bytes (> 72).
-        let pw = "中".repeat(25);
-        assert_eq!(pw.len(), 75);
-
-        let Json(resp) = register(
-            State(state.clone()),
-            None,
-            HeaderMap::new(),
-            Json(RegisterRequest {
-                username: "newuser".into(),
-                password: pw,
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(
-            resp.code, 400,
-            "multibyte password over 72 bytes must be rejected"
-        );
-    }
-
-    /// A successful registration inherits the plan's quota fields atomically.
-    #[tokio::test]
-    async fn register_inherits_plan_quota() {
-        let (state, pool) = test_state().await;
-        state
-            .db
-            .set_registration_settings(true, 1, &[1])
-            .await
-            .unwrap();
-
-        let Json(resp) = register(
-            State(state.clone()),
-            None,
-            HeaderMap::new(),
-            Json(RegisterRequest {
-                username: "alice".into(),
-                password: "validpass1".into(),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-
-        // The seeded 'free' plan is max_rules=5, traffic=107374182400.
-        let user: relay_shared::models::User =
-            sqlx::query_as("SELECT * FROM users WHERE username = 'alice'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(user.plan_id, Some(1));
-        assert_eq!(
-            user.max_rules, 5,
-            "max_rules must be inherited from the plan"
-        );
-        assert_eq!(
-            user.traffic_limit, 107374182400,
-            "traffic_limit must be inherited from plan.traffic"
-        );
-        assert!(!user.admin, "registered users are never admins");
-    }
-
-    /// register returns 409 on a duplicate username (UNIQUE constraint).
-    #[tokio::test]
-    async fn register_rejects_duplicate_username() {
-        let (state, _pool) = test_state().await;
-        state
-            .db
-            .set_registration_settings(true, 1, &[1])
-            .await
-            .unwrap();
-
-        let req = RegisterRequest {
-            username: "alice".into(),
-            password: "validpass1".into(),
-            ..Default::default()
-        };
-        let Json(r1) = register(
-            State(state.clone()),
-            None,
-            HeaderMap::new(),
-            Json(req.clone()),
-        )
-        .await;
-        assert_eq!(r1.code, 0);
-        let Json(r2) = register(State(state.clone()), None, HeaderMap::new(), Json(req)).await;
-        assert_eq!(r2.code, 409, "duplicate username must yield 409");
-    }
-
-    /// admin update_registration_settings rejects a non-existent default plan.
-    #[tokio::test]
-    async fn admin_update_settings_rejects_missing_plan() {
-        let (state, _pool) = test_state().await;
-        let Json(resp) = update_registration_settings(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Json(RegistrationSettingsRequest {
-                enabled: true,
-                default_plan_id: 999, // does not exist
-                allowed_plan_ids: vec![999],
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-    }
-
-    /// admin update_registration_settings persists a valid config and the
-    /// subsequent registration_status reflects it.
-    #[tokio::test]
-    async fn admin_update_settings_persists_and_takes_effect() {
-        let (state, _pool) = test_state().await;
-        let Json(resp) = update_registration_settings(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Json(RegistrationSettingsRequest {
-                enabled: true,
-                default_plan_id: 1,
-                allowed_plan_ids: vec![1],
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        let data = resp.data.unwrap();
-        assert!(data.registration_enabled);
-        assert_eq!(data.default_registration_plan_id, 1);
-
-        // registration_status now reports enabled=true.
-        let Json(status) = registration_status(State(state.clone())).await;
-        assert!(status.data.unwrap().enabled);
-    }
-
-    /// admin get_registration_settings returns safe defaults on an unseeded DB.
-    #[tokio::test]
-    async fn admin_get_settings_returns_defaults_when_unseeded() {
-        let (state, _pool) = test_state().await;
-        let Json(resp) =
-            get_registration_settings(AdminOnly { user_id: 1 }, State(state.clone())).await;
-        assert_eq!(resp.code, 0);
-        let data = resp.data.unwrap();
-        assert!(!data.registration_enabled);
-        assert_eq!(data.default_registration_plan_id, 1);
-        assert_eq!(data.allowed_plan_ids, vec![1]);
-    }
-
-    // ── v0.4.21 PR2: registration multi-plan settings ──
-
-    /// update_registration_settings persists allowed_plan_ids and the updated
-    /// registration_status reflects the plan list.
-    #[tokio::test]
-    async fn admin_update_settings_with_allowed_plans() {
-        let (state, _pool) = test_state().await;
-        let Json(resp) = update_registration_settings(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Json(RegistrationSettingsRequest {
-                enabled: true,
-                default_plan_id: 1,
-                allowed_plan_ids: vec![1],
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        let data = resp.data.unwrap();
-        assert!(data.registration_enabled);
-        assert_eq!(data.default_registration_plan_id, 1);
-        assert_eq!(data.allowed_plan_ids, vec![1]);
-
-        // registration_status now returns plans.
-        let Json(status) = registration_status(State(state.clone())).await;
-        let s = status.data.unwrap();
-        assert!(s.enabled);
-        assert_eq!(s.default_plan_id, 1);
-        assert_eq!(s.plans.len(), 1);
-        assert_eq!(s.plans[0].id, 1);
-    }
-
-    /// registration_status only returns plans that are in allowed_plan_ids.
-    #[tokio::test]
-    async fn registration_status_only_returns_allowed_plans() {
-        let (state, _pool) = test_state().await;
-        // There's only plan 1 seeded, but we can still verify filtering works:
-        // allowed_plan_ids=[], but the service rejects empty. Instead, use an
-        // id that doesn't exist alongside plan 1.
-        // Plan 1 exists; plan 999 does not. allowed=[1] should only return [1].
-        let Json(_resp) = update_registration_settings(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Json(RegistrationSettingsRequest {
-                enabled: true,
-                default_plan_id: 1,
-                allowed_plan_ids: vec![1],
-            }),
-        )
-        .await;
-        let Json(status) = registration_status(State(state.clone())).await;
-        let s = status.data.unwrap();
-        // Only plan 1 is in the allowed list and exists.
-        assert_eq!(s.plans.len(), 1);
-        assert_eq!(s.plans[0].id, 1);
-    }
-
-    /// register with a plan_id that is in the allowed list succeeds.
-    #[tokio::test]
-    async fn register_with_valid_plan_id_succeeds() {
-        let (state, _pool) = test_state().await;
-        state
-            .db
-            .set_registration_settings(true, 1, &[1])
-            .await
-            .unwrap();
-        let req = RegisterRequest {
-            username: "planuser".into(),
-            password: "validpass1".into(),
-            plan_id: Some(1),
-        };
-        let Json(resp) = register(State(state.clone()), None, HeaderMap::new(), Json(req)).await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-    }
-
-    /// register with a plan_id NOT in the allowed list returns 400.
-    #[tokio::test]
-    async fn register_with_disallowed_plan_id_fails() {
-        let (state, _pool) = test_state().await;
-        state
-            .db
-            .set_registration_settings(true, 1, &[1])
-            .await
-            .unwrap();
-        let req = RegisterRequest {
-            username: "badplan".into(),
-            password: "validpass1".into(),
-            plan_id: Some(999),
-        };
-        let Json(resp) = register(State(state.clone()), None, HeaderMap::new(), Json(req)).await;
-        assert_eq!(resp.code, 400, "must reject plan not in allowed list");
-    }
-
-    /// register without plan_id uses the default plan.
-    #[tokio::test]
-    async fn register_without_plan_id_uses_default() {
-        let (state, _pool) = test_state().await;
-        state
-            .db
-            .set_registration_settings(true, 1, &[1])
-            .await
-            .unwrap();
-        let req = RegisterRequest {
-            username: "defplan".into(),
-            password: "validpass1".into(),
-            ..Default::default()
-        };
-        let Json(resp) = register(State(state.clone()), None, HeaderMap::new(), Json(req)).await;
-        assert_eq!(resp.code, 0, "should use default plan_id=1");
-    }
-
-    /// update_registration_settings rejects empty allowed_plan_ids.
-    #[tokio::test]
-    async fn admin_update_settings_rejects_empty_allowed() {
-        let (state, _pool) = test_state().await;
-        let Json(resp) = update_registration_settings(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Json(RegistrationSettingsRequest {
-                enabled: true,
-                default_plan_id: 1,
-                allowed_plan_ids: vec![],
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "empty allowed_plan_ids must be rejected");
-    }
-
-    /// update_registration_settings rejects default_plan_id not in allowed.
-    #[tokio::test]
-    async fn admin_update_settings_rejects_default_not_in_allowed() {
-        let (state, _pool) = test_state().await;
-        // Plan 1 exists; use it as the only allowed, but set default=999.
-        let Json(resp) = update_registration_settings(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Json(RegistrationSettingsRequest {
-                enabled: true,
-                default_plan_id: 999,
-                allowed_plan_ids: vec![1],
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "default not in allowed must be rejected");
-    }
-
-    /// update_registration_settings rejects a non-existent plan in allowed.
-    #[tokio::test]
-    async fn admin_update_settings_rejects_nonexistent_allowed_plan() {
-        let (state, _pool) = test_state().await;
-        let Json(resp) = update_registration_settings(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Json(RegistrationSettingsRequest {
-                enabled: true,
-                default_plan_id: 1,
-                allowed_plan_ids: vec![1, 999],
-            }),
-        )
-        .await;
-        assert_eq!(
-            resp.code, 400,
-            "non-existent plan in allowed_plan_ids must be rejected"
-        );
-    }
-
-    /// v0.4.21 PR2: registration_status returns only plans in the allowed list
-    /// when the DB has multiple plans. Constructs real multi-plan data.
-    #[tokio::test]
-    async fn registration_status_filters_multi_plan() {
-        let (state, pool) = test_state().await;
-        // Insert a second plan with different quota.
-        sqlx::query(
-            "INSERT INTO plans (id, name, max_rules, traffic, speed_limit, ip_limit, price) \
-             VALUES (2, 'premium', 10, 0, 0, 5, '9.99')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Set allowed=[1,2] — registration_status should return both.
-        state
-            .db
-            .set_registration_settings(true, 1, &[1, 2])
-            .await
-            .unwrap();
-        let Json(status) = registration_status(State(state.clone())).await;
-        let s = status.data.unwrap();
-        assert_eq!(s.plans.len(), 2, "should return both allowed plans");
-        let ids: Vec<i64> = s.plans.iter().map(|p| p.id).collect();
-        assert!(ids.contains(&1));
-        assert!(ids.contains(&2));
-
-        // Set allowed=[2] — plan 1 should be filtered out.
-        state
-            .db
-            .set_registration_settings(true, 2, &[2])
-            .await
-            .unwrap();
-        let Json(status2) = registration_status(State(state.clone())).await;
-        let s2 = status2.data.unwrap();
-        assert_eq!(
-            s2.plans.len(),
-            1,
-            "plan 1 must be filtered when not allowed"
-        );
-        assert_eq!(s2.plans[0].id, 2);
-        assert_eq!(s2.plans[0].max_rules, 10);
-    }
-
-    /// v0.4.21 PR2: registering with plan_id=2 inherits plan 2's quota,
-    /// NOT plan 1's.
-    #[tokio::test]
-    async fn register_with_plan_2_inherits_plan_2_quota() {
-        let (state, pool) = test_state().await;
-        sqlx::query(
-            "INSERT INTO plans (id, name, max_rules, traffic, speed_limit, ip_limit, price) \
-             VALUES (2, 'premium', 10, 0, 0, 5, '9.99')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        state
-            .db
-            .set_registration_settings(true, 2, &[1, 2])
-            .await
-            .unwrap();
-
-        let req = RegisterRequest {
-            username: "premium_user".into(),
-            password: "validpass1".into(),
-            plan_id: Some(2),
-        };
-        let Json(resp) = register(State(state.clone()), None, HeaderMap::new(), Json(req)).await;
-        assert_eq!(resp.code, 0, "register with plan 2 should succeed");
-
-        // Verify the user inherited plan 2's quota.
-        let user: relay_shared::models::User =
-            sqlx::query_as("SELECT * FROM users WHERE username = 'premium_user'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(user.plan_id, Some(2), "user.plan_id must be 2");
-        assert_eq!(user.max_rules, 10, "max_rules must come from plan 2");
-        assert_eq!(user.traffic_limit, 0, "traffic_limit must come from plan 2");
-    }
-
-    // ── v0.4.10 PR4: admin password reset + self change ──
-
-    /// Admin reset bumps the target's token_version and sets must_change_password.
-    #[tokio::test]
-    async fn admin_reset_password_sets_must_change_and_bumps_version() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-
-        let Json(resp) = reset_user_password(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Path(2),
-            Json(ResetPasswordRequest {
-                new_password: "temp-pass-1".into(),
-                must_change_password: true,
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-
-        let s = state.db.find_auth_state_by_id(2).await.unwrap().unwrap();
-        assert_eq!(s.1, 1, "token_version bumped");
-        assert!(s.2, "must_change_password set");
-    }
-
-    /// Admin cannot reset ANOTHER admin's password (privilege protection).
-    #[tokio::test]
-    async fn admin_cannot_reset_other_admin_password() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "admin2", true).await; // another admin
-
-        let Json(resp) = reset_user_password(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Path(2),
-            Json(ResetPasswordRequest {
-                new_password: "temp-pass-1".into(),
-                must_change_password: true,
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 403, "{}", resp.message);
-    }
-
-    /// An admin cannot reset their own password here: /user/password requires
-    /// the current password, so a stolen admin JWT can't take the account over.
-    #[tokio::test]
-    async fn admin_cannot_reset_own_password() {
-        let (state, _pool) = test_state().await;
-
-        let Json(resp) = reset_user_password(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Path(1),
-            Json(ResetPasswordRequest {
-                new_password: "temp-pass-1".into(),
-                must_change_password: false,
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 403, "{}", resp.message);
-    }
-
-    /// change_password is limited to 5 attempts a minute per user, wrong
-    /// current password included.
-    #[tokio::test]
-    async fn change_password_is_rate_limited() {
-        let (state, pool) = test_state().await;
-        let hash = bcrypt::hash("old-pass-1", 4).unwrap();
-        sqlx::query(
-            "INSERT INTO users (id, username, password, admin, token_version, must_change_password) \
-             VALUES (77, 'limited', ?, 0, 0, 0)",
-        )
-        .bind(&hash)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let mut last = 0;
-        for _ in 0..6 {
-            let Json(resp) = change_password(
-                AuthUser {
-                    user_id: 77,
-                    admin: false,
-                },
-                State(state.clone()),
-                Json(ChangePasswordRequest {
-                    current_password: "wrong-pass-1".into(),
-                    new_password: "new-pass-1".into(),
-                }),
-            )
-            .await;
-            last = resp.code;
-        }
-        assert_eq!(last, 429);
-    }
-
-    /// Admin reset rejects a short password (< 8 bytes).
-    #[tokio::test]
-    async fn admin_reset_password_rejects_short() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        let Json(resp) = reset_user_password(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Path(2),
-            Json(ResetPasswordRequest {
-                new_password: "short".into(),
-                must_change_password: true,
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-    }
-
-    /// Admin reset of a non-existent user → 404.
-    #[tokio::test]
-    async fn admin_reset_password_missing_user_404() {
-        let (state, _pool) = test_state().await;
-        let Json(resp) = reset_user_password(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Path(999),
-            Json(ResetPasswordRequest {
-                new_password: "temp-pass-1".into(),
-                must_change_password: true,
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 404, "{}", resp.message);
-    }
-
-    /// Self change_password bumps token_version and clears must_change_password.
-    #[tokio::test]
-    async fn self_change_password_bumps_version() {
-        let (state, pool) = test_state().await;
-        // Seed a user whose current password we know (bcrypt of "old-pass-1").
-        let hash = bcrypt::hash("old-pass-1", 4).unwrap();
-        sqlx::query(
-            "INSERT INTO users (id, username, password, admin, token_version, must_change_password) \
-             VALUES (2, 'alice', ?, 0, 0, 1)",
-        )
-        .bind(&hash)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let Json(resp) = change_password(
-            AuthUser {
-                user_id: 2,
-                admin: false,
-            },
-            State(state.clone()),
-            Json(ChangePasswordRequest {
-                current_password: "old-pass-1".into(),
-                new_password: "new-pass-1".into(),
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-
-        let s = state.db.find_auth_state_by_id(2).await.unwrap().unwrap();
-        assert_eq!(s.1, 1, "token_version bumped on self change");
-        assert!(!s.2, "must_change_password cleared on self change");
-    }
-
-    /// change_password rejects a short new password (< 8 bytes).
-    #[tokio::test]
-    async fn self_change_password_rejects_short() {
-        let (state, pool) = test_state().await;
-        let hash = bcrypt::hash("old-pass-1", 4).unwrap();
-        sqlx::query("INSERT INTO users (id, username, password, admin) VALUES (2, 'alice', ?, 0)")
-            .bind(&hash)
-            .execute(&pool)
-            .await
-            .unwrap();
-        let Json(resp) = change_password(
-            AuthUser {
-                user_id: 2,
-                admin: false,
-            },
-            State(state.clone()),
-            Json(ChangePasswordRequest {
-                current_password: "old-pass-1".into(),
-                new_password: "short".into(),
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-    }
-
-    /// v1.2.12 (pre-release review): plan expiry is compared as TEXT, so the
-    /// admin API must store the canonical form. `2026-9-1 00:00:00` parses —
-    /// and stored as typed it sorted after `2026-09-30 …`, keeping a plan
-    /// meant to end on 1 September alive for the rest of the month.
-    #[tokio::test]
-    async fn admin_plan_expiry_is_stored_in_the_canonical_form() {
-        use super::admin_set_user_plan;
-        use relay_shared::protocol::AdminSetUserPlanRequest;
-
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-
-        let Json(resp) = admin_set_user_plan(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Path(2),
-            Json(AdminSetUserPlanRequest {
-                clear: false,
-                plan_expire_at: Some(" 2026-9-1 0:00:00 ".into()),
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        let (stored,): (Option<String>,) =
-            sqlx::query_as("SELECT plan_expire_at FROM users WHERE id = 2")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(stored.as_deref(), Some("2026-09-01 00:00:00"));
-
-        let Json(resp) = admin_set_user_plan(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Path(2),
-            Json(AdminSetUserPlanRequest {
-                clear: false,
-                plan_expire_at: Some("2026/09/01 00:00:00".into()),
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-    }
-
-    /// v1.2.12: a client over its per-IP budget is refused before any bcrypt,
-    /// whatever username it rotates to (the per-username limit alone was
-    /// bypassed exactly that way).
-    #[tokio::test]
-    async fn login_is_limited_per_client_ip_across_usernames() {
-        use crate::api::auth::login;
-        use crate::api::auth_throttle::IP_LIMITER;
-        use axum::extract::ConnectInfo;
-        use axum::Extension;
-        use relay_shared::protocol::LoginRequest;
-
-        let (state, _pool) = test_state().await;
-        // An address no other test uses; the limiter is process-wide.
-        let peer: std::net::SocketAddr = "203.0.113.250:40000".parse().unwrap();
-        for _ in 0..20 {
-            IP_LIMITER.hit(&peer.ip());
-        }
-        let started = std::time::Instant::now();
-        let Json(resp) = login(
-            State(state.clone()),
-            Some(Extension(ConnectInfo(peer))),
-            HeaderMap::new(),
-            Json(LoginRequest {
-                username: "never-tried-before".into(),
-                password: "whatever1".into(),
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 429, "{}", resp.message);
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(100),
-            "refused without running bcrypt"
-        );
-    }
-
-    /// v1.2.12: a login that cannot match (oversized username/password) is
-    /// refused up front — no bcrypt, no rate-limit entry.
-    #[tokio::test]
-    async fn login_refuses_oversized_input_without_bcrypt() {
-        use crate::api::auth::login;
-        use relay_shared::protocol::LoginRequest;
-
-        let (state, _pool) = test_state().await;
-        for (username, password) in [
-            ("a".repeat(65), "whatever1".to_string()),
-            ("admin".to_string(), "p".repeat(1025)),
-            (String::new(), "whatever1".to_string()),
-        ] {
-            let started = std::time::Instant::now();
-            let Json(resp) = login(
-                State(state.clone()),
-                None,
-                HeaderMap::new(),
-                Json(LoginRequest { username, password }),
-            )
-            .await;
-            assert_eq!(resp.code, 401, "{}", resp.message);
-            assert!(started.elapsed() < std::time::Duration::from_millis(100));
-        }
-    }
-
-    // ── v1.2.13: node records of a deleted group ──
-    // Deleting a group left its nodes' status rows behind — offline rows are
-    // never aged out — and the remove button refused them, because it looked
-    // the (deleted) group up first.
-
-    async fn put_status(state: &AppState, key: &str) {
-        state
-            .db
-            .set(key, r#"{"last_seen":"2026-10-04T00:00:00Z"}"#)
-            .await
-            .unwrap();
-    }
-
-    async fn has_status(state: &AppState, key: &str) -> bool {
-        state.db.get(key).await.unwrap().is_some()
-    }
-
-    #[tokio::test]
-    async fn deleting_a_group_removes_its_node_records() {
-        let (state, pool) = test_state().await;
-        add_group(&pool, 1, 1, "doomed").await;
-        add_group(&pool, 10, 1, "neighbour").await;
-        put_status(&state, "node_status:1:node-a").await;
-        put_status(&state, "node_status:1").await;
-        put_status(&state, "node_status:10:node-b").await;
-        state.db.set("node_label:1:node-a", "HK-1").await.unwrap();
-        state.db.set("node_label:10:node-b", "JP-1").await.unwrap();
-
-        let Json(resp) =
-            super::delete_group(AdminOnly { user_id: 1 }, State(state.clone()), Path(1)).await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-
-        assert!(!has_status(&state, "node_status:1:node-a").await);
-        assert!(
-            !has_status(&state, "node_label:1:node-a").await,
-            "the node's label goes with the group"
-        );
-        assert!(
-            has_status(&state, "node_label:10:node-b").await,
-            "group 10's labels stay"
-        );
-        assert!(
-            !has_status(&state, "node_status:1").await,
-            "the legacy per-group row goes too"
-        );
-        assert!(
-            has_status(&state, "node_status:10:node-b").await,
-            "group 10 shares the key prefix and must keep its rows"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_refused_group_deletion_keeps_its_node_records() {
-        let (state, pool) = test_state().await;
-        add_group(&pool, 1, 1, "in-use").await;
-        add_rule(&pool, 100, 1, 1, 20001, 0).await;
-        put_status(&state, "node_status:1:node-a").await;
-
-        let Json(resp) =
-            super::delete_group(AdminOnly { user_id: 1 }, State(state.clone()), Path(1)).await;
-        assert_eq!(resp.code, 409, "{}", resp.message);
-        assert!(has_status(&state, "node_status:1:node-a").await);
-    }
-
-    #[tokio::test]
-    async fn a_node_record_outliving_its_group_can_be_removed() {
-        use crate::api::stats::{delete_node_status, DeleteStatusQuery};
-
-        let (state, _pool) = test_state().await;
-        // Group 7 does not exist, as after a deletion that predates the
-        // cleanup above.
-        put_status(&state, "node_status:7:node-a").await;
-
-        let Json(resp) = delete_node_status(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Path((7,)),
-            Query(DeleteStatusQuery {
-                node_id: Some("node-a".into()),
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        assert!(!has_status(&state, "node_status:7:node-a").await);
-    }
-
-    /// Reading the node list must not age rows out: a node silent for 30 days
-    /// is still listed, painted offline, and only a manual delete removes it.
-    #[tokio::test]
-    async fn a_long_offline_node_stays_listed_as_offline() {
-        use crate::api::stats::get_node_status;
-
-        let (state, pool) = test_state().await;
-        add_group(&pool, 1, 1, "line").await;
-        let old = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-        state
-            .db
-            .set(
-                "node_status:1:node-a",
-                &format!(r#"{{"last_seen":"{old}","node_id":"node-a"}}"#),
-            )
-            .await
-            .unwrap();
-
-        for _ in 0..2 {
-            let Json(resp) = get_node_status(
-                crate::api::middleware::AuthUser {
-                    user_id: 1,
-                    admin: true,
-                },
-                State(state.clone()),
-            )
-            .await;
-            assert_eq!(resp.code, 0, "{}", resp.message);
-            let rows = resp.data.unwrap();
-            assert_eq!(rows.len(), 1, "the offline row must still be listed");
-            assert_eq!(rows[0]["online"], serde_json::json!(false));
-        }
-        assert!(has_status(&state, "node_status:1:node-a").await);
-    }
-
-    #[tokio::test]
-    async fn removing_a_node_record_that_is_not_there_is_still_404() {
-        use crate::api::stats::{delete_node_status, DeleteStatusQuery};
-
-        let (state, pool) = test_state().await;
-        add_group(&pool, 1, 1, "line").await;
-        put_status(&state, "node_status:1:node-a").await;
-
-        let Json(resp) = delete_node_status(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Path((1,)),
-            Query(DeleteStatusQuery {
-                node_id: Some("node-b".into()),
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 404, "{}", resp.message);
-        assert!(has_status(&state, "node_status:1:node-a").await);
-    }
-
-    // ── local-address targets: non-admin owners may not forward to them ──
-
-    fn local_rule_req(name: &str, port: u16, owner_uid: Option<i64>) -> CreateRuleRequest {
-        let mut req = rule_req(name, port, 11, owner_uid);
-        req.target_addr = "127.0.0.1".into();
-        req
-    }
-
-    #[tokio::test]
-    async fn create_rule_user_cannot_target_local_address() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 11, 1, "shared-in").await;
-
-        let Json(resp) = create_rule(
-            auth(2, false),
-            State(state.clone()),
-            Json(local_rule_req("r", 20000, None)),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        assert!(resp.message.contains("127.0.0.1"), "{}", resp.message);
-
-        // The multi-target form is checked too (a local host hidden among
-        // otherwise fine targets), and so is the metadata address.
-        let mut req = rule_req("r2", 20001, 11, None);
-        req.targets = Some(vec![
-            relay_shared::protocol::RuleTargetRequest {
-                host: "10.0.0.5".into(),
-                port: 80,
-                enabled: true,
-            },
-            relay_shared::protocol::RuleTargetRequest {
-                host: "169.254.169.254".into(),
-                port: 80,
-                enabled: false,
-            },
-        ]);
-        let Json(resp) = create_rule(auth(2, false), State(state.clone()), Json(req)).await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-
-        // A private address is still fine.
-        let Json(resp) = create_rule(
-            auth(2, false),
-            State(state.clone()),
-            Json(rule_req("ok", 20002, 11, None)),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-    }
-
-    #[tokio::test]
-    async fn create_rule_admin_can_target_local_address_for_self() {
-        let (state, pool) = test_state().await;
-        add_group(&pool, 11, 1, "shared-in").await;
-        let Json(resp) = create_rule(
-            auth(1, true),
-            State(state.clone()),
-            Json(local_rule_req("r", 20000, None)),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-    }
-
-    #[tokio::test]
-    async fn create_rule_admin_for_user_owner_cannot_target_local_address() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 3, "bob", false).await;
-        add_group(&pool, 11, 1, "shared-in").await;
-        let Json(resp) = create_rule(
-            auth(1, true),
-            State(state.clone()),
-            Json(local_rule_req("r", 20000, Some(3))),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM forward_rules")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(n, 0);
-    }
-
-    #[tokio::test]
-    async fn update_rule_user_cannot_retarget_to_local_address() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 11, 1, "shared-in").await;
-        add_rule(&pool, 200, 2, 11, 12000, 0).await;
-
-        for body in [
-            UpdateRuleRequest {
-                targets: Some(vec![relay_shared::protocol::RuleTargetRequest {
-                    host: "0x7f000001".into(),
-                    port: 80,
-                    enabled: true,
-                }]),
-                ..Default::default()
-            },
-            UpdateRuleRequest {
-                target_addr: Some("localhost".into()),
-                ..Default::default()
-            },
-        ] {
-            let Json(resp) =
-                update_rule(auth(2, false), State(state.clone()), Path(200), Json(body)).await;
-            assert_eq!(resp.code, 400, "{}", resp.message);
-        }
-    }
-
-    /// An admin editing a regular user's rule is judged by the rule's owner.
-    #[tokio::test]
-    async fn update_rule_admin_editing_user_rule_cannot_set_local_target() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 11, 1, "shared-in").await;
-        add_rule(&pool, 200, 2, 11, 12000, 0).await;
-        add_rule(&pool, 201, 1, 11, 12001, 0).await;
-
-        let local = || UpdateRuleRequest {
-            target_addr: Some("127.0.0.1".into()),
-            ..Default::default()
-        };
-        let Json(resp) = update_rule(
-            auth(1, true),
-            State(state.clone()),
-            Path(200),
-            Json(local()),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        // The admin's own rule is unrestricted.
-        let Json(resp) = update_rule(
-            auth(1, true),
-            State(state.clone()),
-            Path(201),
-            Json(local()),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-    }
-
-    /// Existing rules that already point at a local address keep working: an
-    /// edit that does not touch the targets is not checked.
-    #[tokio::test]
-    async fn update_rule_user_existing_local_rule_can_still_be_renamed() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 11, 1, "shared-in").await;
-        // add_rule stores target 127.0.0.1 directly in the table.
-        add_rule(&pool, 200, 2, 11, 12000, 0).await;
-
-        let Json(resp) = update_rule(
-            auth(2, false),
-            State(state.clone()),
-            Path(200),
-            Json(UpdateRuleRequest {
-                name: Some("renamed".into()),
-                upload_limit_mbps: Some(5),
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-    }
-
-    // ── listen ports: non-admin owners stay inside the group's port range ──
-
-    async fn set_group_range(pool: &SqlitePool, gid: i64, range: &str) {
-        sqlx::query("UPDATE device_groups SET port_range = ? WHERE id = ?")
-            .bind(range)
-            .bind(gid)
-            .execute(pool)
-            .await
-            .unwrap();
-    }
-
-    /// A group left at the 1-65535 default means 10000-65535 to a user, the
-    /// same pool auto-assignment draws from; an explicit range is honored.
-    #[tokio::test]
-    async fn create_rule_user_port_must_be_inside_the_group_range() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 11, 1, "shared-in").await;
-
-        for (port, code) in [(80u16, 400), (9999, 400), (10000, 0), (65535, 0)] {
-            let Json(resp) = create_rule(
-                auth(2, false),
-                State(state.clone()),
-                Json(rule_req(&format!("r{port}"), port, 11, None)),
-            )
-            .await;
-            assert_eq!(resp.code, code, "port {port}: {}", resp.message);
-        }
-
-        set_group_range(&pool, 11, "30000-30010").await;
-        for (port, code) in [(29999u16, 400), (30011, 400), (30000, 0), (30010, 0)] {
-            let Json(resp) = create_rule(
-                auth(2, false),
-                State(state.clone()),
-                Json(rule_req(&format!("s{port}"), port, 11, None)),
-            )
-            .await;
-            assert_eq!(resp.code, code, "port {port}: {}", resp.message);
-        }
-    }
-
-    /// Admins are not restricted, but the owner decides: an admin creating a
-    /// rule for a user is held to the user's range.
-    #[tokio::test]
-    async fn create_rule_admin_ignores_the_range_unless_the_owner_is_a_user() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 3, "bob", false).await;
-        add_group(&pool, 11, 1, "shared-in").await;
-        set_group_range(&pool, 11, "30000-30010").await;
-
-        let Json(resp) = create_rule(
-            auth(1, true),
-            State(state.clone()),
-            Json(rule_req("own", 80, 11, None)),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-
-        let Json(resp) = create_rule(
-            auth(1, true),
-            State(state.clone()),
-            Json(rule_req("for-bob", 80, 11, Some(3))),
-        )
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM forward_rules WHERE uid = 3")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(n, 0);
-    }
-
-    /// Only an edit that moves the port or the group is checked; a rule left
-    /// where it is keeps working even if the range was narrowed since.
-    #[tokio::test]
-    async fn update_rule_user_port_is_checked_only_when_it_moves() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 11, 1, "shared-in").await;
-        add_group(&pool, 12, 1, "other-in").await;
-        set_group_range(&pool, 12, "40000-40010").await;
-        add_rule(&pool, 200, 2, 11, 12000, 0).await;
-        set_group_range(&pool, 11, "30000-30010").await;
-
-        let upd = |body: UpdateRuleRequest| {
-            let state = state.clone();
-            async move {
-                let Json(resp) =
-                    update_rule(auth(2, false), State(state), Path(200), Json(body)).await;
-                resp
-            }
-        };
-        // Untouched port: fine, even though 12000 is now outside the range.
-        let resp = upd(UpdateRuleRequest {
-            name: Some("renamed".into()),
-            ..Default::default()
-        })
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        // Moving the port out of the range, or to another group whose range
-        // does not hold the current port, is refused.
-        let resp = upd(UpdateRuleRequest {
-            listen_port: Some(31000),
-            ..Default::default()
-        })
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        let resp = upd(UpdateRuleRequest {
-            device_group_in: Some(12),
-            ..Default::default()
-        })
-        .await;
-        assert_eq!(resp.code, 400, "{}", resp.message);
-        // Moving it inside the range works.
-        let resp = upd(UpdateRuleRequest {
-            listen_port: Some(30005),
-            ..Default::default()
-        })
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-    }
-
-    // ── admin flag comes from the database, not the token ──
-
-    fn sign_token(sub: i64, admin: bool, token_version: i64) -> String {
-        use crate::api::middleware::Claims;
-        jsonwebtoken::encode(
-            &jsonwebtoken::Header::default(),
-            &Claims {
-                sub,
-                admin,
-                token_version,
-                exp: chrono::Utc::now().timestamp() as usize + 3600,
-            },
-            &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
-        )
-        .unwrap()
-    }
-
-    async fn admin_gate(state: &AppState, token: &str) -> bool {
-        use axum::extract::FromRequestParts;
-        let (mut parts, _) = axum::http::Request::builder()
-            .uri("/admin/anything")
-            .header("Authorization", format!("Bearer {token}"))
-            .body(())
-            .unwrap()
-            .into_parts();
-        AdminOnly::from_request_parts(&mut parts, state)
-            .await
-            .is_ok()
-    }
-
-    #[tokio::test]
-    async fn demoted_admin_with_old_admin_token_is_rejected() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "carol", true).await;
-        let token = sign_token(2, true, 0);
-        assert!(admin_gate(&state, &token).await, "still an admin in the db");
-
-        sqlx::query("UPDATE users SET admin = 0 WHERE id = 2")
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert!(
-            !admin_gate(&state, &token).await,
-            "token says admin but the db no longer does"
-        );
-    }
-
-    /// The database is authoritative both ways: a token minted with
-    /// admin=false for a user who is an admin now still gets admin access.
-    #[tokio::test]
-    async fn db_admin_wins_over_token_claim() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "dave", true).await;
-        assert!(admin_gate(&state, &sign_token(2, false, 0)).await);
-
-        add_user(&pool, 3, "erin", false).await;
-        assert!(!admin_gate(&state, &sign_token(3, true, 0)).await);
-    }
-
-    // ── PUT /groups/order ──
-
-    /// Send `PUT /groups/order` through the real router, as the given user.
-    /// Returns the HTTP status and, when the body is the JSON envelope, its code.
-    async fn put_group_order(
-        state: &AppState,
-        user_id: i64,
-        admin: bool,
-        body: serde_json::Value,
-    ) -> (axum::http::StatusCode, Option<i64>) {
-        use tower::ServiceExt;
-        let claims = crate::api::middleware::Claims {
-            sub: user_id,
-            admin,
-            token_version: 0,
-            exp: chrono::Utc::now().timestamp() as usize + 3600,
-        };
-        let token = jsonwebtoken::encode(
-            &jsonwebtoken::Header::default(),
-            &claims,
-            &jsonwebtoken::EncodingKey::from_secret(state.config.jwt_secret.as_bytes()),
-        )
-        .unwrap();
-        let req = axum::http::Request::builder()
-            .method("PUT")
-            .uri("/groups/order")
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Content-Type", "application/json")
-            .body(axum::body::Body::from(body.to_string()))
-            .unwrap();
-        let resp = crate::api::routes()
-            .with_state(state.clone())
-            .oneshot(req)
-            .await
-            .unwrap();
-        let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-            .await
-            .unwrap();
-        let code = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|v| v["code"].as_i64());
-        (status, code)
-    }
-
-    async fn listed_group_ids(state: &AppState) -> Vec<i64> {
-        use crate::db::repo::ResourceScope;
-        state
-            .db
-            .list_groups(&ResourceScope::All)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|g| g.id)
-            .collect()
-    }
-
-    /// The admin sets the order; every listing follows and it is audited.
-    #[tokio::test]
-    async fn an_admin_can_reorder_groups_and_it_is_audited() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "admin2", true).await;
-        add_group(&pool, 1, 1, "alpha").await;
-        add_group(&pool, 2, 1, "beta").await;
-        add_group(&pool, 3, 1, "gamma").await;
-
-        let (status, code) =
-            put_group_order(&state, 2, true, serde_json::json!({ "ids": [3, 1, 2] })).await;
-        assert_eq!(status, axum::http::StatusCode::OK);
-        assert_eq!(code, Some(0));
-        assert_eq!(listed_group_ids(&state).await, vec![3, 1, 2]);
-
-        let rows = state.db.query_audit_log(None, 50, 0).await.unwrap();
-        let entry = rows
-            .iter()
-            .find(|e| e.action == "reorder_groups")
-            .expect("a reorder must be audited");
-        assert_eq!(entry.detail, "gamma > alpha > beta");
-        assert_eq!(entry.actor_name, "admin2");
-    }
-
-    /// An id that is not a group, a repeated id and an empty list are all
-    /// refused with 400, and the order is left alone.
-    #[tokio::test]
-    async fn reordering_with_unknown_repeated_or_no_ids_is_refused() {
-        let (state, pool) = test_state().await;
-        add_group(&pool, 1, 1, "alpha").await;
-        add_group(&pool, 2, 1, "beta").await;
-
-        for ids in [
-            serde_json::json!([2, 99, 1]),
-            serde_json::json!([2, 2, 1]),
-            serde_json::json!([]),
-        ] {
-            let (_, code) =
-                put_group_order(&state, 1, true, serde_json::json!({ "ids": ids })).await;
-            assert_eq!(code, Some(400), "ids {ids}");
-            assert_eq!(listed_group_ids(&state).await, vec![1, 2], "ids {ids}");
-        }
-        let rows = state.db.query_audit_log(None, 50, 0).await.unwrap();
-        assert!(
-            rows.iter().all(|e| e.action != "reorder_groups"),
-            "a refused reorder must not be audited"
-        );
-    }
-
-    /// A regular user cannot change the order: HTTP 403, nothing changes.
-    #[tokio::test]
-    async fn a_non_admin_cannot_reorder_groups() {
-        let (state, pool) = test_state().await;
-        add_user(&pool, 2, "alice", false).await;
-        add_group(&pool, 1, 1, "alpha").await;
-        add_group(&pool, 2, 1, "beta").await;
-
-        let (status, _) =
-            put_group_order(&state, 2, false, serde_json::json!({ "ids": [2, 1] })).await;
-        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
-        assert_eq!(listed_group_ids(&state).await, vec![1, 2]);
-        let rows = state.db.query_audit_log(None, 50, 0).await.unwrap();
-        assert!(rows.iter().all(|e| e.action != "reorder_groups"));
-    }
-
-    /// A group created through the API goes last, also after a reorder.
-    #[tokio::test]
-    async fn a_group_created_after_a_reorder_is_listed_last() {
-        let (state, pool) = test_state().await;
-        add_group(&pool, 1, 1, "alpha").await;
-        add_group(&pool, 2, 1, "beta").await;
-        let (_, code) =
-            put_group_order(&state, 1, true, serde_json::json!({ "ids": [2, 1] })).await;
-        assert_eq!(code, Some(0));
-
-        let Json(resp) = create_group(
-            AdminOnly { user_id: 1 },
-            State(state.clone()),
-            Json(CreateGroupRequest {
-                name: "late".into(),
-                group_type: GroupType::In,
-                connect_host: "1.2.3.4".into(),
-                port_range: "20000-30000".into(),
-                owner_uid: None,
-                rate: None,
-                hidden: None,
-            }),
-        )
-        .await;
-        assert_eq!(resp.code, 0, "{}", resp.message);
-        let new_id = resp.data.unwrap().id;
-        assert_eq!(listed_group_ids(&state).await, vec![2, 1, new_id]);
-    }
-
-    /// /nodes (admin) stamps each row with its group's display order, so the page
-    /// can list the groups in the order the admin arranged.
-    #[tokio::test]
-    async fn admin_node_rows_carry_the_group_sort_order() {
-        let (state, pool) = test_state().await;
-        add_group(&pool, 1, 1, "alpha").await;
-        add_group(&pool, 2, 1, "beta").await;
-        put_status(&state, "node_status:1:node-a").await;
-        put_status(&state, "node_status:2:node-b").await;
-        let (_, code) =
-            put_group_order(&state, 1, true, serde_json::json!({ "ids": [2, 1] })).await;
-        assert_eq!(code, Some(0));
-
-        let Json(resp) = crate::api::stats::get_node_status(
-            AuthUser {
-                user_id: 1,
-                admin: true,
-            },
-            State(state.clone()),
-        )
-        .await;
-        let mut order: Vec<(i64, i64)> = resp
-            .data
-            .unwrap()
-            .iter()
-            .map(|r| {
-                (
-                    r["group_id"].as_i64().unwrap(),
-                    r["group_sort_order"].as_i64().unwrap(),
-                )
-            })
-            .collect();
-        order.sort();
-        assert_eq!(order, vec![(1, 2), (2, 1)]);
+        assert_eq!(del.code, 0);
     }
 }

@@ -13,16 +13,11 @@ use sqlx::SqlitePool;
 mod announcements;
 mod groups;
 mod kvs;
-mod orders;
-mod profiles;
-mod redeem;
 mod rules;
-mod settings;
 mod stats;
 #[cfg(test)]
 mod tests;
 mod traffic;
-mod user_groups;
 mod users;
 
 pub struct SqliteRepository {

@@ -1,9 +1,8 @@
-import { Form, Input, Button, Card, message, Typography, Segmented, Alert } from 'antd';
-import { UserOutlined, LockOutlined, InfoCircleOutlined } from '@ant-design/icons';
+import { Form, Input, Button, Card, message, Typography, Segmented } from 'antd';
+import { UserOutlined, LockOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
-import { useEffect, useState } from 'react';
 import api from '../api/client';
-import type { ApiEnvelope, LoginResponse, RegistrationStatus } from '../api/types';
+import type { ApiEnvelope, LoginResponse } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { useAuth } from '../auth/useAuth';
 import { useSite } from '../hooks/useSite';
@@ -15,23 +14,6 @@ export default function Login() {
   const { t, lang, setLang } = useI18n();
   const { login } = useAuth();
   const site = useSite();
-  // v0.4.10 PR3: whether to show the "create account" link. null = still
-  // loading (don't flash the link then remove it); a network failure leaves
-  // it hidden rather than guessing.
-  const [regEnabled, setRegEnabled] = useState<boolean | null>(null);
-  // v0.4.22: whether to show the "change default password" security banner.
-  // Driven by the server's must_change_password flag on the admin account.
-  const [showPwdWarning, setShowPwdWarning] = useState(false);
-
-  useEffect(() => {
-    api
-      .get<unknown, ApiEnvelope<RegistrationStatus>>('/auth/registration-status')
-      .then((res) => {
-        setRegEnabled(res.data?.enabled === true);
-        setShowPwdWarning(res.data?.default_password_change_required === true);
-      })
-      .catch(() => setRegEnabled(false));
-  }, []);
 
   const onFinish = async (values: { username: string; password: string }) => {
     try {
@@ -40,12 +22,8 @@ export default function Login() {
         message.error(res.message || t('loginFailedMsg'));
         return;
       }
-      // v0.4.10: login() persists the token then fetches /user/me so the role
-      // comes from the server (not the login response, which could diverge).
       await login(res.data.token);
       message.success(t('loginSuccess'));
-      // Both roles land on / — RoleHome renders Dashboard (admin) or
-      // redirects regular users to /account (the regular dashboard was removed).
       navigate('/');
     } catch {
       message.error(t('loginFailed'));
@@ -56,9 +34,6 @@ export default function Login() {
     <div style={{
       display: 'flex', justifyContent: 'center', alignItems: 'center',
       minHeight: '100vh', background: 'var(--rp-bg)',
-      // A gutter on phones; the top leaves room for the language switch. The
-      // same at the bottom, and inside the 100vh (border-box), so the card
-      // stays exactly centred on a desktop with no scrollbar.
       padding: '56px 16px',
       boxSizing: 'border-box',
     }}>
@@ -75,24 +50,9 @@ export default function Login() {
       </div>
       <Card style={{ width: '100%', maxWidth: 380, boxShadow: 'var(--rp-shadow)' }}>
         <div style={{ textAlign: 'center', marginBottom: 28 }}>
-          {/* v1.2.4: operator-configurable branding, falling back to the
-              translated default so an unconfigured panel looks unchanged. */}
           <Title level={3} style={{ margin: 0, fontWeight: 600 }}>{site.site_name || t('brand')}</Title>
           <Text type="secondary" style={{ fontSize: 13 }}>{site.subtitle || t('subtitle')}</Text>
         </div>
-
-        {/* v0.3.6 / v0.4.22: first-login security reminder. Only shown when
-            the admin account still has must_change_password set (driven by
-            the /auth/registration-status response). */}
-        {showPwdWarning && (
-          <Alert
-            icon={<InfoCircleOutlined />}
-            type="warning"
-            showIcon
-            style={{ marginBottom: 16, fontSize: 12 }}
-            title={t('changeDefaultPasswordWarning')}
-          />
-        )}
 
         <Form onFinish={onFinish} size="large">
           <Form.Item name="username" rules={[{ required: true, message: t('usernameRequired') }]}>
@@ -105,16 +65,9 @@ export default function Login() {
             <Button type="primary" htmlType="submit" block>{t('login')}</Button>
           </Form.Item>
         </Form>
-        {regEnabled && (
-          <div style={{ marginTop: 4, textAlign: 'center' }}>
-            <Button type="link" size="small" style={{ padding: 0 }} onClick={() => navigate('/register')}>
-              {t('createAccount')}
-            </Button>
-          </div>
-        )}
         <div style={{ marginTop: 16, textAlign: 'center' }}>
           <a
-            href="https://github.com/MoeShinX/relay-panel"
+            href="https://github.com/nfft894htno32/relay-panel"
             target="_blank"
             rel="noopener noreferrer"
             style={{ fontSize: 12, color: 'var(--rp-text-tertiary)' }}

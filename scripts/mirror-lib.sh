@@ -40,7 +40,7 @@
 # and may set:
 #   RP_GIT=(git ...)    how to run git (default: git)
 
-RP_REPO_URL="https://github.com/MoeShinX/relay-panel.git"
+RP_REPO_URL="https://github.com/nfft894htno32/relay-panel.git"
 
 # Order matters. The empty prefix is a direct connection. The first
 # RP_TRUSTED_COUNT entries of each list are TRUSTED, the rest PUBLIC.

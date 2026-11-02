@@ -40,6 +40,7 @@ export interface ExportEntry {
   listen_port: number;
   name: string;
   protocol: string;
+  sni?: string;
 }
 
 /** What the import box accepts for `protocol`. */
@@ -83,7 +84,14 @@ export function buildExportJSON(rules: ForwardRule[]): string {
   const simplified: ExportEntry[] = rules.filter(isExportable).map(r => {
     const targets = ruleTargets(r).filter(t => t.enabled);
     const dest = targets.map(t => formatDest(t.host, t.port));
-    return { dest, listen_port: r.listen_port, name: r.name, protocol: r.protocol };
+    const sni = r.sni?.trim();
+    return {
+      dest,
+      listen_port: r.listen_port,
+      name: r.name,
+      protocol: r.protocol,
+      ...(sni ? { sni } : {}),
+    };
   });
   return JSON.stringify(simplified);
 }
@@ -161,6 +169,7 @@ export interface ImportEntry {
   listen_port?: number;
   dest?: string[];
   protocol?: string;
+  sni?: string;
 }
 
 /**
@@ -206,6 +215,10 @@ export function validateImportEntry(e: unknown): string | null {
   const protocol = e['protocol'];
   if (protocol !== undefined && !(IMPORT_PROTOCOLS as readonly unknown[]).includes(protocol))
     return `protocol must be one of ${IMPORT_PROTOCOLS.join(', ')}`;
+  // sni: optional; when present it must be a string.
+  const sni = e['sni'];
+  if (sni !== undefined && sni !== null && typeof sni !== 'string')
+    return 'sni must be a string';
   return null;
 }
 
@@ -215,14 +228,16 @@ export function validateImportEntry(e: unknown): string | null {
  * Centralises the `as` cast so the consuming code (handleImport) doesn't lie
  * about types in multiple places.
  */
-export function asValidatedEntry(e: unknown): { name: string; listen_port: number; dest: string[]; protocol?: ImportProtocol } {
+export function asValidatedEntry(e: unknown): { name: string; listen_port: number; dest: string[]; protocol?: ImportProtocol; sni?: string } {
   // validateImportEntry already checked the runtime types; re-assert here only
   // to satisfy TS. This never throws for an entry that passed validation.
   const o = e as Record<string, unknown>;
+  const rawSni = typeof o['sni'] === 'string' ? o['sni'].trim() : '';
   return {
     name: o['name'] as string,
     listen_port: o['listen_port'] as number,
     dest: o['dest'] as string[],
     protocol: o['protocol'] as ImportProtocol | undefined,
+    ...(rawSni ? { sni: rawSni } : {}),
   };
 }

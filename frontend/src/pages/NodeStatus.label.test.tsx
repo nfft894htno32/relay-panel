@@ -43,13 +43,4 @@ describe('node names on the node status page', () => {
     render(<NodeStatus />);
     expect(await screen.findByText('HK-1 备用')).toBeInTheDocument();
   });
-
-  it('a user gets no editing, and sees a name only when the panel sent one', async () => {
-    mockUseAuth.mockReturnValue({ isAdmin: false });
-    mockGet.mockImplementation((url: string) =>
-      Promise.resolve(url === '/nodes/shared' ? ok([node({ label: 'HK-1' })]) : ok([])));
-    render(<NodeStatus />);
-    expect(await screen.findByText('HK-1')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /编辑备注|nodeLabelEdit/ })).toBeNull();
-  });
 });

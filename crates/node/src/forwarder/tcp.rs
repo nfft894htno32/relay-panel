@@ -173,7 +173,7 @@ pub async fn serve_tcp_listener(
 /// Classify whether an `accept` error is worth retrying. Transient OS-level
 /// resource exhaustion (too many open files, out of memory) clears on its own;
 /// retrying is the right call. A bad-fd or closed-listener error is permanent.
-fn is_transient_accept_error(e: &std::io::Error) -> bool {
+pub(super) fn is_transient_accept_error(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     matches!(
         e.kind(),
@@ -200,9 +200,6 @@ async fn handle_tcp_connection(
     source_ipv4: Option<Ipv4Addr>,
     proxy_protocol: &ProxyProtocolConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // node-v1.2.9: who the connection is really from, and where it was really
-    // headed. Normally the socket's own peer and local addresses; behind
-    // another relay hop that sends PROXY protocol, the ones in its header.
     let local_addr = inbound.local_addr()?;
     let (real_client, real_dst, leftover) = if proxy_protocol.accept {
         if !super::proxy_protocol::peer_trusted(client_addr.ip(), &proxy_protocol.trusted) {
@@ -247,13 +244,38 @@ async fn handle_tcp_connection(
         (client_addr, local_addr, Vec::new())
     };
 
-    // v0.4.6: pick targets per the rule's load-balancing strategy. The selector
-    // returns the ordered indices to attempt; we connect to the first reachable.
-    //
-    // v1.0.5: keep the REAL reason each target failed (DNS / timeout / no route /
-    // source-bind) instead of collapsing everything into "no target available".
-    // On a multi-NIC server a silent failure is impossible to diagnose, so we
-    // accumulate per-target reasons and log them together when nothing connects.
+    forward_to_rule_targets(
+        inbound,
+        client_addr,
+        real_client,
+        real_dst,
+        &leftover,
+        &targets,
+        &selector,
+        rate_limit,
+        &counter,
+        rule_id,
+        source_ipv4,
+        proxy_protocol,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn forward_to_rule_targets(
+    inbound: TcpStream,
+    client_addr: SocketAddr,
+    real_client: SocketAddr,
+    real_dst: SocketAddr,
+    initial_bytes: &[u8],
+    targets: &[String],
+    selector: &Arc<TargetSelector>,
+    rate_limit: RateLimit,
+    counter: &Arc<TrafficCounter>,
+    rule_id: i64,
+    source_ipv4: Option<Ipv4Addr>,
+    proxy_protocol: &ProxyProtocolConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut outbound = None;
     let mut failures: Vec<String> = Vec::new();
     for idx in selector.order() {
@@ -272,14 +294,10 @@ async fn handle_tcp_connection(
                 break;
             }
             Ok(Err(e)) => {
-                // tcp_connect already classifies the cause (InvalidIp / Connect /
-                // Bind). Preserve it verbatim so DNS vs. refused vs. source-bind
-                // failures are distinguishable in the log.
                 selector.report(idx, false);
                 failures.push(format!("{} -> {}", target, e));
             }
             Err(_) => {
-                // Outer timeout fired: the connect didn't finish within 5s.
                 selector.report(idx, false);
                 failures.push(format!("{} -> timed out after 5s", target));
             }
@@ -306,42 +324,22 @@ async fn handle_tcp_connection(
 
     tracing::debug!("TCP: {} -> {}", real_client, outbound.peer_addr()?);
 
-    // node-v1.2.9: the header first, before any client byte. Not billed: it is
-    // the relay's own control data, a few dozen bytes per connection.
     let mut outbound = outbound;
     if proxy_protocol.send != ProxyProtocolVersion::Off {
         let header = super::proxy_protocol::encode(proxy_protocol.send, real_client, real_dst);
         outbound.write_all(&header).await?;
     }
 
-    // v1.0.8: ZERO-COPY fast path. An UNLIMITED rule on Linux is forwarded with
-    // splice(2) — bytes move inside the kernel via a pipe and are never copied
-    // into userspace, which slashes CPU on high-throughput links. A rate-limited
-    // rule CANNOT use splice (the bytes must reach userspace to be throttled),
-    // but that's fine: a capped rule isn't running at max throughput, so the
-    // userspace copy's CPU cost is negligible. Byte counts still come back from
-    // the splice return values, so billing is unaffected. Non-Linux always uses
-    // the userspace copy below.
-    // v1.2.3: one handle per connection, taken BEFORE the copy starts. Both
-    // paths below report through it on every chunk, so a connection's bytes are
-    // billable while it is still open. They used to be summed into a local and
-    // submitted once at close, which meant a persistent connection moved
-    // unlimited traffic without ever touching its owner's quota.
     let bytes = counter.handle(rule_id).await;
 
-    // node-v1.2.9: client bytes that arrived in the same read as the previous
-    // hop's PROXY header. They are the client's first data: forwarded ahead of
-    // the copy below, throttled and billed like the rest.
-    if !leftover.is_empty() {
-        rate_limit.acquire_upload(leftover.len() as u64).await;
-        outbound.write_all(&leftover).await?;
-        bytes.add_upload(leftover.len() as u64);
+    if !initial_bytes.is_empty() {
+        rate_limit.acquire_upload(initial_bytes.len() as u64).await;
+        outbound.write_all(initial_bytes).await?;
+        bytes.add_upload(initial_bytes.len() as u64);
     }
 
     #[cfg(target_os = "linux")]
     if matches!(rate_limit, RateLimit::Unlimited) {
-        // (up = client→target, down = target→client) — the same attribution the
-        // userspace path uses below.
         let up_sink = bytes.clone();
         let down_sink = bytes.clone();
         if let Err(e) = super::splice::zero_copy_bidirectional(
@@ -357,14 +355,6 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
-    // Userspace bidirectional copy with traffic counting + per-rule rate
-    // limiting (the rate-limited path, and the fallback on non-Linux). We own
-    // both halves and pump both directions concurrently. When either side
-    // returns (the remote closed the connection) we shut down the matching write
-    // half so the other copy also sees EOF and returns.
-    //
-    // v0.4.6: each chunk is throttled through the shared RateLimit BEFORE being
-    // written, so the rule's aggregate cap holds across all connections.
     let (mut ri, mut wi) = inbound.into_split();
     let (mut ro, mut wo) = outbound.into_split();
 
@@ -374,10 +364,6 @@ async fn handle_tcp_connection(
     let rl_down = rate_limit;
 
     let upload = Box::pin(async move {
-        // v1.0.8: 32 KiB copy buffer (this userspace path is only used by
-        // rate-limited rules, which are capped anyway; the unlimited fast path
-        // uses splice above). Heap-allocated as part of this Box::pin'd future,
-        // so it does not grow the task stack.
         let mut buf = [0u8; 32 * 1024];
         loop {
             let n = match ri.read(&mut buf).await {
@@ -394,7 +380,6 @@ async fn handle_tcp_connection(
         let _ = wo.shutdown().await;
     });
     let download = Box::pin(async move {
-        // v1.0.8: 32 KiB copy buffer (see the upload side above).
         let mut buf = [0u8; 32 * 1024];
         loop {
             let n = match ro.read(&mut buf).await {
@@ -415,6 +400,42 @@ async fn handle_tcp_connection(
 
     tracing::debug!("TCP: connection closed for {}", client_addr);
     Ok(())
+}
+
+/// Forward an unrouted / fallback / anti-loop TCP stream to `fallback_addr`
+/// (e.g. `127.0.0.1:10443`), replaying any initial bytes already read.
+pub(super) async fn forward_to_fallback(
+    mut inbound: TcpStream,
+    initial_bytes: &[u8],
+    fallback_addr: &str,
+    source_ipv4: Option<Ipv4Addr>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut outbound = match tokio::time::timeout(
+        Duration::from_secs(5),
+        super::outbound::tcp_connect(fallback_addr, source_ipv4, 5),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("fallback connect {}: {}", fallback_addr, e).into()),
+        Err(_) => return Err(format!("fallback connect {} timed out", fallback_addr).into()),
+    };
+
+    if !initial_bytes.is_empty() {
+        outbound.write_all(initial_bytes).await?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = super::splice::zero_copy_bidirectional(inbound, outbound, |_| {}, |_| {}).await;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

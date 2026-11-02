@@ -106,9 +106,6 @@ impl NodeConnections {
     /// groups like broadcast_all). Returns the number of connections the message
     /// was handed to (dead senders pruned). Does NOT close the connections.
     ///
-    /// v0.4.14: directed diagnosis now uses `send_node` instead; this group-wide
-    /// send is retained as general infrastructure (no current caller).
-    #[allow(dead_code)]
     pub async fn send_group(&self, group_id: i64, msg: &str) -> usize {
         let mut map = self.inner.write().await;
         let Some(conns) = map.get_mut(&group_id) else {

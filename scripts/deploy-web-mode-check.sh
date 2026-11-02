@@ -94,7 +94,7 @@ if [ "${1:-}" = "compose" ]; then
     shift
     case "$*" in
         *' config --images')
-            printf 'ghcr.io/moeshinx/relay-panel-panel:1.2.15\n'
+            printf 'ghcr.io/nfft894htno32/relay-panel-panel:1.2.15\n'
             case "$*" in *'--profile caddy'*) echo 'caddy:2-alpine' ;; esac
             case "$*" in *'--profile postgres'*) echo 'postgres:16-alpine' ;; esac
             exit 0 ;;
@@ -391,27 +391,27 @@ pass 'fresh install takes no backup'
 # directly from ghcr.io / Docker Hub when they answer.
 res=$(run_case pull-direct env)
 dir=${res%|*}; log=${res#*|}
-assert_log_has "$log" 'IMG pull ghcr.io/moeshinx/relay-panel-panel:1.2.15'
+assert_log_has "$log" 'IMG pull ghcr.io/nfft894htno32/relay-panel-panel:1.2.15'
 grep -q 'caddy' "$log" && fail 'the caddy image must not be pulled when caddy is not enabled'
 grep -q '^IMG tag' "$log" && fail 'nothing needs tagging when the registries answer directly'
 pass 'direct pull: panel image only, no re-tagging'
 
 # A pinned image that is already here is used as is; RELAYPANEL_FORCE_PULL=1
 # pulls it anyway.
-res=$(run_case pull-local env HARNESS_LOCAL_IMAGES='ghcr.io/moeshinx/relay-panel-panel:1.2.15')
+res=$(run_case pull-local env HARNESS_LOCAL_IMAGES='ghcr.io/nfft894htno32/relay-panel-panel:1.2.15')
 log=${res#*|}
 grep -q '^IMG pull' "$log" && fail 'an image already here under a pinned tag must not be pulled again'
-res=$(run_case pull-local-forced env HARNESS_LOCAL_IMAGES='ghcr.io/moeshinx/relay-panel-panel:1.2.15' RELAYPANEL_FORCE_PULL=1)
+res=$(run_case pull-local-forced env HARNESS_LOCAL_IMAGES='ghcr.io/nfft894htno32/relay-panel-panel:1.2.15' RELAYPANEL_FORCE_PULL=1)
 log=${res#*|}
-assert_log_has "$log" 'IMG pull ghcr.io/moeshinx/relay-panel-panel:1.2.15'
+assert_log_has "$log" 'IMG pull ghcr.io/nfft894htno32/relay-panel-panel:1.2.15'
 pass 'a pinned image already here is not pulled again unless forced'
 
 # ghcr.io and Docker Hub blocked, down.relaypanel.dev (trusted) serves: pulled by
 # tag, tagged back to the names the compose file uses, before `up`.
 res=$(run_case pull-mirror env HARNESS_REACHABLE='down.relaypanel.dev docker.m.daocloud.io' RELAYPANEL_WEB_MODE=caddy RELAYPANEL_DOMAIN=mirror.example.com)
 dir=${res%|*}; log=${res#*|}
-assert_log_has "$log" 'IMG pull -q down.relaypanel.dev/moeshinx/relay-panel-panel:1.2.15'
-assert_log_has "$log" 'IMG tag down.relaypanel.dev/moeshinx/relay-panel-panel:1.2.15 ghcr.io/moeshinx/relay-panel-panel:1.2.15'
+assert_log_has "$log" 'IMG pull -q down.relaypanel.dev/nfft894htno32/relay-panel-panel:1.2.15'
+assert_log_has "$log" 'IMG tag down.relaypanel.dev/nfft894htno32/relay-panel-panel:1.2.15 ghcr.io/nfft894htno32/relay-panel-panel:1.2.15'
 assert_log_has "$log" 'IMG pull -q down.relaypanel.dev/library/caddy:2-alpine'
 assert_log_has "$log" 'IMG tag down.relaypanel.dev/library/caddy:2-alpine caddy:2-alpine'
 grep -q '^CURL_DIGEST' "$log" && fail 'a trusted route needs no digest lookup'
@@ -426,8 +426,8 @@ pass 'trusted mirror pull: images tagged back to the compose names before up'
 res=$(run_case pull-public env HARNESS_REACHABLE='ghcr.nju.edu.cn docker.m.daocloud.io' HARNESS_DIGEST_HOSTS='ghcr.io docker.io' RELAYPANEL_WEB_MODE=caddy RELAYPANEL_DOMAIN=public.example.com)
 dir=${res%|*}; log=${res#*|}
 digest="sha256:0000000000000000000000000000000000000000000000000000000000000007"
-assert_log_has "$log" "IMG pull ghcr.nju.edu.cn/moeshinx/relay-panel-panel@$digest"
-assert_log_has "$log" "IMG tag ghcr.nju.edu.cn/moeshinx/relay-panel-panel@$digest ghcr.io/moeshinx/relay-panel-panel:1.2.15"
+assert_log_has "$log" "IMG pull ghcr.nju.edu.cn/nfft894htno32/relay-panel-panel@$digest"
+assert_log_has "$log" "IMG tag ghcr.nju.edu.cn/nfft894htno32/relay-panel-panel@$digest ghcr.io/nfft894htno32/relay-panel-panel:1.2.15"
 assert_log_has "$log" "IMG pull docker.m.daocloud.io/library/caddy@$digest"
 assert_log_has "$log" "IMG tag docker.m.daocloud.io/library/caddy@$digest caddy:2-alpine"
 grep -E '^IMG pull (ghcr.nju|docker.m.daocloud)' "$log" | grep -v '@sha256:' && fail 'a public mirror must only be pulled by digest'

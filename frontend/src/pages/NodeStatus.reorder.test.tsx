@@ -89,15 +89,6 @@ describe('group order on the node-status page', () => {
     expect(shownOrder()).toEqual([2, 3, 1]);
   });
 
-  it('a regular user sees the same order, without handles', async () => {
-    mockUseAuth.mockReturnValue({ isAdmin: false });
-    serve([node(1, 3), node(2, 1), node(3, 2)], { shared: true });
-    render(<NodeStatus />);
-    await flush();
-    expect(shownOrder()).toEqual([2, 3, 1]);
-    expect(handles()).toHaveLength(0);
-  });
-
   it('on a phone an admin sees the order but no handles', async () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     mockIsMobile.mockReturnValue(true);

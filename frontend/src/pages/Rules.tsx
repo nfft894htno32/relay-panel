@@ -4,7 +4,7 @@ import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse } from '../api/types';
+import type { ApiEnvelope, ForwardRule, DeviceGroup, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, RestartResponse } from '../api/types';
 import { MIN_AUTO_RESTART_MINUTES } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { useTableScroll } from '../hooks/useIsMobile';
@@ -47,7 +47,6 @@ function payloadWithTargets<T extends Record<string, unknown>>(values: T & { tar
   };
 }
 
-/** Trigger a browser download of a text file. */
 function downloadText(filename: string, text: string) {
   const blob = new Blob([text], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -58,18 +57,13 @@ function downloadText(filename: string, text: string) {
   URL.revokeObjectURL(url);
 }
 
-/** v1.2.15: page sizes for the rules table, and where the choice is kept. */
 const RULE_PAGE_SIZES = [20, 50, 100, 200, 500];
 const RULE_PAGE_SIZE_KEY = 'relaypanel_rules_page_size';
 
 type RuleTab = 'basic' | 'forward';
 
-/** The fields on the 基础 tab; everything else in the rule form is on 转发. */
-const BASIC_TAB_FIELDS = new Set(['name', 'owner_uid', 'listen_port', 'protocol', 'public_transport', 'forward_mode', 'device_group_in']);
+const BASIC_TAB_FIELDS = new Set(['name', 'listen_port', 'protocol', 'sni', 'forward_mode', 'device_group_in']);
 
-/** Where a failed save should look: the tab of the first field that failed. A
- *  field on the tab that is not showing used to fail silently — the button did
- *  nothing and the red text was on a page you could not see. */
 function tabOfFirstError(errorFields: { name: (string | number)[] }[]): RuleTab {
   const first = errorFields[0]?.name[0];
   return typeof first === 'string' && BASIC_TAB_FIELDS.has(first) ? 'basic' : 'forward';
@@ -86,42 +80,18 @@ function storedRulePageSize(): number {
 export default function Rules() {
   const { t } = useI18n();
   const tableScroll = useTableScroll();
-  // v1.2.15: the table was given pageSize 20 as a fixed prop, so picking 100
-  // in the size changer did nothing. The size is state now (remembered), and
-  // up to 500 a page.
   const [rulePageSize, setRulePageSize] = useState<number>(storedRulePageSize);
   const changeRulePageSize = (size: number) => {
     setRulePageSize(size);
     try { localStorage.setItem(RULE_PAGE_SIZE_KEY, String(size)); } catch { /* private mode */ }
   };
-  const { isAdmin, user } = useAuth();
+  const { isAdmin } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
-  // v0.4.20: admin can manage another user's rules via /rules?owner_uid=X.
-  const filterOwnerUid: number | null = isAdmin
-    ? (parseInt(searchParams.get('owner_uid') || '') || null)
-    : null;
   const [rules, setRules] = useState<ForwardRule[]>([]);
   const [groups, setGroups] = useState<DeviceGroup[]>([]);
-  // v0.4.11 PR3: shared inbound groups (admin-owned) for regular users.
-  const [sharedGroups, setSharedGroups] = useState<SharedGroupSummary[]>([]);
-  // v0.4.12 PR1: true when /groups/shared failed to load (DB error). A regular
-  // user then sees a load-failure notice and rule creation is blocked, instead
-  // of a misleading empty inbound dropdown.
-  const [sharedLoadFailed, setSharedLoadFailed] = useState(false);
-  // The backend reports a failed read as `code: 500` inside a 200 response, so
-  // the axios success path runs and `res.data` is null. Without this flag
-  // `setRules(res.data || [])` renders a database outage as "you have no
-  // rules" — the one thing the list must never claim.
   const [listLoadFailed, setListLoadFailed] = useState(false);
-  const [users, setUsers] = useState<User[]>([]);
-  // v1.0.7: a regular user's own traffic quota (admins read each owner's quota
-  // from `users` instead). Used to flag rules whose owner is out of traffic —
-  // those rules stop forwarding even though their `paused` flag stays false.
-  const [selfQuota, setSelfQuota] = useState<{ used: number; limit: number } | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
-  // Which tab of the create / edit dialog is showing. Held here so a failed save
-  // can bring the tab with the error to the front (see onSaveFailed).
   const [createTab, setCreateTab] = useState<RuleTab>('basic');
   const [editTab, setEditTab] = useState<RuleTab>('basic');
   const [importOpen, setImportOpen] = useState(false);
@@ -132,33 +102,12 @@ export default function Rules() {
   const [loading, setLoading] = useState(false);
   const [createForm] = Form.useForm();
   const [editForm] = Form.useForm();
-  // v0.4.8: rule diagnosis modal state.
   const [diagnosing, setDiagnosing] = useState<ForwardRule | null>(null);
   const [diagnoseLoading, setDiagnoseLoading] = useState(false);
   const [diagnoseResult, setDiagnoseResult] = useState<DiagnoseResponse | null>(null);
-  // v1.2.7: the filters live in the URL, not in component state.
-  //
-  // They used to be plain useState, so a refresh dropped them and a link to
-  // "the rules on the HK line matching 8443" could not be sent to anyone —
-  // which is exactly the thing an operator wants to paste into a ticket. The
-  // page already read owner_uid from the query string; group and search now
-  // join it so the whole filter set is one shareable address.
-  //
-  // v0.4.9: selectedGroup === null means "all". Explicit null, not
-  // !selectedGroup, so a future group id of 0 would not read as falsy.
   const selectedGroup: number | null = parseInt(searchParams.get('group') || '') || null;
-  // Client-side filter over the already-loaded rules — /rules returns the whole
-  // (owner-scoped) set, so searching needs no round-trip.
   const ruleSearch = searchParams.get('q') || '';
 
-  /**
-   * Write one filter into the query string, preserving the others.
-   *
-   * `replace` so typing in the search box does not push a history entry per
-   * keystroke — Back should leave the page, not walk the search term backwards
-   * one character at a time. An empty value drops the key entirely rather than
-   * leaving `?q=` behind.
-   */
   const setFilter = useCallback((key: 'group' | 'q', value: string | null) => {
     setSearchParams(prev => {
       const next = new URLSearchParams(prev);
@@ -169,7 +118,6 @@ export default function Rules() {
   }, [setSearchParams]);
 
   const [selectedRowKeys, setSelectedRowKeys] = useState<number[]>([]);
-  // Batch "move to another inbound group": dialog state, then the outcome.
   const [moveOpen, setMoveOpen] = useState(false);
   const [moveTarget, setMoveTarget] = useState<number | undefined>(undefined);
   const [moving, setMoving] = useState(false);
@@ -178,34 +126,10 @@ export default function Rules() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      // v0.4.10: /admin/users is admin-only and NOT in the main Promise.all —
-      // a regular user would 403 and block the whole page load. The owner
-      // column / selector are hidden for non-admins (they only ever own their
-      // own rules), so the users list is fetched separately and only when
-      // isAdmin. A failure here leaves users empty but rules/groups still load.
-      // v0.4.20: admin can filter rules by owner_uid.
-      // Admin on own page → filter to their own rules; admin viewing another
-      // user → use filterOwnerUid; regular user → backend filters automatically.
-      const ownerUid = filterOwnerUid ?? (isAdmin ? (user?.id ?? null) : null);
-      const rulesUrl = ownerUid ? `/rules?owner_uid=${ownerUid}` : '/rules';
-      // allSettled, not all: these are two independent reads and each one's
-      // result must survive the other failing. `Promise.all` rejects on the
-      // first rejection and discards the sibling's value, so a failed /rules
-      // also threw away a perfectly good group list — which is the list the
-      // create-rule form needs, leaving an admin with an empty inbound picker
-      // on a page whose only problem was the rules query.
-      //
-      // The rejection is handled here rather than in a `catch` block because
-      // this body is inside a useCallback, and wrapping it in try/catch/finally
-      // trips react-hooks/preserve-manual-memoization.
       const [rulesRes, groupsRes] = await Promise.allSettled([
-        api.get<unknown, ApiEnvelope<ForwardRule[]>>(rulesUrl),
+        api.get<unknown, ApiEnvelope<ForwardRule[]>>('/rules'),
         api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups'),
       ]);
-      // A read that failed keeps whatever is already on screen rather than
-      // blanking it: the rows are still the last known truth, and replacing
-      // them with an empty table is the false statement this guard exists to
-      // stop. Each list is applied on its own.
       const rules = rulesRes.status === 'fulfilled' && rulesRes.value.code === 0
         ? rulesRes.value
         : null;
@@ -215,97 +139,25 @@ export default function Rules() {
       if (rules) setRules(rules.data || []);
       if (groups) setGroups(groups.data || []);
       setListLoadFailed(!rules || !groups);
-      if (isAdmin) {
-        try {
-          const u = await api.get<unknown, ApiEnvelope<User[]>>('/admin/users');
-          setUsers(u.data || []);
-        } catch {
-          // Non-fatal: owner column falls back to "#uid" labels.
-          setUsers([]);
-        }
-        setSelfQuota(null);
-      } else {
-        setUsers([]);
-        // v1.0.7: a regular user only ever sees their own rules, so one /user/me
-        // read gives the quota needed to flag all of them. Non-fatal on failure.
-        try {
-          const me = await api.get<unknown, ApiEnvelope<UserSelf>>('/user/me');
-          setSelfQuota(me.data ? { used: me.data.traffic_used, limit: me.data.traffic_limit } : null);
-        } catch {
-          setSelfQuota(null);
-        }
-      }
-      // v0.4.12 PR1: shared inbound groups (admin-owned) for regular users.
-      // The endpoint wraps the payload in ApiResponse — a non-zero code is a
-      // load failure (NOT an empty "no lines" state), so we flag it and block
-      // rule creation rather than show an empty inbound dropdown.
-      // Admins get an empty list (they manage groups directly).
-      if (!isAdmin) {
-        try {
-          const sg = await api.get<unknown, ApiEnvelope<SharedGroupSummary[]>>('/groups/shared');
-          if (sg.code !== 0) {
-            setSharedLoadFailed(true);
-            setSharedGroups([]);
-          } else {
-            setSharedLoadFailed(false);
-            setSharedGroups(sg.data || []);
-          }
-        } catch {
-          setSharedLoadFailed(true);
-          setSharedGroups([]);
-        }
-      } else {
-        setSharedLoadFailed(false);
-        setSharedGroups([]);
-      }
     } finally { setLoading(false); }
-  }, [filterOwnerUid, isAdmin, user?.id]);
+  }, []);
 
   useEffect(() => { load(); }, [load]);
 
-  // User lookup map for the "owner" column.
-  const userMap = new Map(users.map(u => [u.id, u.username]));
-  // v1.0.7: owner-quota lookup for the "traffic exhausted" status tag. Admins
-  // resolve each rule's owner from `users`; a regular user uses their own quota
-  // (their rules are all self-owned). traffic_limit === 0 means unlimited.
-  const userById = useMemo(() => new Map(users.map(u => [u.id, u])), [users]);
-  const ruleOverQuota = (r: ForwardRule): boolean => {
-    if (isAdmin) {
-      const u = userById.get(r.uid);
-      return !!u && u.traffic_limit > 0 && u.traffic_used >= u.traffic_limit;
-    }
-    return !!selfQuota && selfQuota.limit > 0 && selfQuota.used >= selfQuota.limit;
-  };
-  // v0.4.9: group lookup map for the "group name" column + filter. Memoized so
-  // the column render + filter options share one derivation.
   const groupMap = useMemo(() => new Map(groups.map(g => [g.id, g])), [groups]);
-  // v1.0.8: group-name + listen-IP lookup for the rule columns. A regular user
-  // does NOT own the (admin-owned) device groups, so GET /groups returns none
-  // for them and the columns rendered "未知分组 / 未配置". Their AUTHORIZED
-  // groups come from /groups/shared (SharedGroupSummary, which carries name +
-  // connect_host) — merge both so name/IP resolve for admins and users alike.
   const groupInfo = useMemo(() => {
     const m = new Map<number, { name: string; connect_host: string }>();
     for (const g of groups) m.set(g.id, { name: g.name, connect_host: g.connect_host });
-    for (const g of sharedGroups) {
-      if (!m.has(g.id)) m.set(g.id, { name: g.name, connect_host: g.connect_host });
-    }
     return m;
-  }, [groups, sharedGroups]);
-  // The rules actually shown: the group filter and the search box compose, so
-  // "this group, port 443" works. Computed once so the table + count stay in
-  // sync.
-  //
-  // Search matches name, listen port and target address. Targets are read via
-  // ruleTargets() rather than target_addr alone: a multi-target rule keeps the
-  // first target in that column, and searching for a backup target should still
-  // find the rule.
+  }, [groups]);
+
   const visibleRules = useMemo(() => {
     const q = ruleSearch.trim().toLowerCase();
     return rules.filter(r => {
       if (selectedGroup !== null && r.device_group_in !== selectedGroup) return false;
       if (!q) return true;
       if (r.name.toLowerCase().includes(q)) return true;
+      if (r.sni && r.sni.toLowerCase().includes(q)) return true;
       if (String(r.listen_port).includes(q)) return true;
       return ruleTargets(r).some(
         tgt => tgt.host.toLowerCase().includes(q) || String(tgt.port).includes(q),
@@ -315,22 +167,16 @@ export default function Rules() {
 
   const handleCreate = async (values: {
     name: string; listen_port: number | null; protocol: string;
-    public_transport?: string;
-    ws_path?: string;
+    sni?: string;
     device_group_in: number; device_group_out: number | null;
     forward_mode: string;
     target_addr?: string; target_port?: number; targets?: RuleTargetInput[];
     load_balance_strategy?: string;
     upload_limit_mbps?: number;
     download_limit_mbps?: number;
-    tunnel_profile_id?: number | null;
-    owner_uid?: number | null;
+    max_connections?: number;
+    auto_restart_minutes?: number;
   }) => {
-    // v0.4.20: WS/TLS tunnel hidden — always raw, no profile.
-    // v0.4.20: forward_mode always direct, no outbound group.
-    // v0.4.20: owner determined by entry point (filterOwnerUid from URL).
-    const owner_uid = filterOwnerUid ?? undefined;
-    // v0.4.20: reject empty targets before payload generation.
     if (formTargets(values).length < 1) {
       message.error(t('targetRequired'));
       return;
@@ -338,12 +184,11 @@ export default function Rules() {
     const payload = payloadWithTargets({
       ...values,
       listen_port: values.listen_port || null,
-      public_transport: 'raw',
-      tunnel_profile_id: null,
+      sni: values.protocol === 'tcp' && values.sni?.trim() ? values.sni.trim() : null,
       forward_mode: 'direct',
-      route_mode: 'direct',
       device_group_out: null,
-      owner_uid,
+      max_connections: values.max_connections ?? 0,
+      auto_restart_minutes: values.auto_restart_minutes ?? 0,
     });
     try {
       const res = await api.post<unknown, ApiEnvelope<null>>('/rules', payload);
@@ -359,6 +204,7 @@ export default function Rules() {
     setEditing(r);
     editForm.setFieldsValue({
       name: r.name, listen_port: r.listen_port, protocol: r.protocol,
+      sni: r.sni ?? '',
       device_group_in: r.device_group_in,
       target_addr: r.target_addr, target_port: r.target_port,
       targets: ruleTargets(r),
@@ -375,9 +221,6 @@ export default function Rules() {
     setEditOpen(true);
   };
 
-  /** A save was refused by the form's own checks. Show the tab that has the
-   *  problem and say what it is, instead of leaving the dialog looking as if the
-   *  button did nothing. */
   const onSaveFailed = (setTab: (tab: RuleTab) => void) =>
     ({ errorFields }: { errorFields: { name: (string | number)[]; errors: string[] }[] }) => {
       if (errorFields.length === 0) return;
@@ -385,13 +228,12 @@ export default function Rules() {
       message.error(errorFields[0].errors[0] || t('ruleFormInvalid'));
     };
 
-  /** Copy: open the create modal pre-filled with the rule's values, but with
-   *  a "-copy" name suffix and no listen_port (auto-assign). */
   const handleCopy = (r: ForwardRule) => {
     createForm.setFieldsValue({
       name: `${r.name}-copy`,
       listen_port: null,
       protocol: r.protocol,
+      sni: r.sni ?? '',
       device_group_in: r.device_group_in,
       target_addr: r.target_addr,
       target_port: r.target_port,
@@ -399,11 +241,8 @@ export default function Rules() {
       load_balance_strategy: r.load_balance_strategy ?? 'first',
       upload_limit_mbps: r.upload_limit_mbps ?? 0,
       download_limit_mbps: r.download_limit_mbps ?? 0,
-      // v1.2.0: max_connections / auto_restart_minutes are NOT carried over —
-      // they're edit-only (the create path can't store them), so the copy starts
-      // uncapped and the user sets them via Edit if wanted.
-      // v1.2.15: PROXY protocol is part of how the rule talks to its target,
-      // and the create path stores it, so a copy keeps it.
+      max_connections: r.max_connections ?? 0,
+      auto_restart_minutes: r.auto_restart_minutes ?? 0,
       proxy_protocol_send: r.proxy_protocol_send ?? 'off',
       proxy_protocol_accept: r.proxy_protocol_accept ?? false,
       proxy_protocol_trusted: r.proxy_protocol_trusted ?? '',
@@ -412,24 +251,17 @@ export default function Rules() {
     setCreateOpen(true);
   };
 
-  /** After an export: success, or a warning naming how many rules had no
-   *  enabled target and so were left out of the file. */
   const notifyExported = (exported: ForwardRule[]) => {
     const skipped = countUnexportable(exported);
     if (skipped > 0) message.warning(t('exportedSkipped').replace('{count}', String(skipped)));
     else message.success(t('exported'));
   };
 
-  /** Export all rules as JSON download. */
   const handleExportAll = () => {
     downloadText(`relaypanel-rules-${new Date().toISOString().slice(0, 10)}.json`, buildExportJSON(rules));
     notifyExported(rules);
   };
 
-  /** v1.2.12: export the rules the current filter shows — one inbound group
-   *  (one machine, where each machine has its own group) and/or a search. The
-   *  file names no group and import asks for one, so this is also how a new
-   *  machine gets an old one's rules: export here, import into its group. */
   const handleExportFiltered = () => {
     if (visibleRules.length === 0) return;
     const label = selectedGroup === null
@@ -442,7 +274,6 @@ export default function Rules() {
     notifyExported(visibleRules);
   };
 
-  /** Export only the currently-selected rules as JSON download. */
   const handleExportSelected = () => {
     const selected = rules.filter(r => selectedRowKeys.includes(r.id));
     if (selected.length === 0) return;
@@ -450,15 +281,13 @@ export default function Rules() {
     notifyExported(selected);
   };
 
-const IMPORT_DEFAULTS = {
-  protocol: 'tcp_udp' as const,
-  public_transport: 'raw' as const,
-  forward_mode: 'direct' as const,
-  route_mode: 'direct' as const,
-  load_balance_strategy: 'first' as const,
-  upload_limit_mbps: 0,
-  download_limit_mbps: 0,
-};
+  const IMPORT_DEFAULTS = {
+    protocol: 'tcp_udp' as const,
+    forward_mode: 'direct' as const,
+    load_balance_strategy: 'first' as const,
+    upload_limit_mbps: 0,
+    download_limit_mbps: 0,
+  };
   const handleImport = async () => {
     if (!importGroupId) {
       message.error(t('selectInboundGroup'));
@@ -481,8 +310,6 @@ const IMPORT_DEFAULTS = {
       if (err) { results.push(`❌ ${label}: ${err}`); continue; }
       const entry = asValidatedEntry(e);
       const targets = entry.dest.map(d => {
-        // validateImportEntry already rejected any unparseable dest above, so
-        // parseDest is non-null here; fall back to a safe default defensively.
         const p = parseDest(d) ?? { host: '', port: 0 };
         return { host: p.host, port: p.port, enabled: true };
       });
@@ -492,15 +319,12 @@ const IMPORT_DEFAULTS = {
           name: entry.name,
           listen_port: entry.listen_port,
           ...IMPORT_DEFAULTS,
-          // The file's protocol when it has one; older exports have none.
           ...(entry.protocol ? { protocol: entry.protocol } : {}),
+          ...(entry.sni ? { sni: entry.sni } : {}),
           device_group_in: importGroupId,
           target_addr: first.host,
           target_port: first.port,
           targets,
-          // v1.0.6: attribute to the target user when an admin imports via the
-          // user-management entry (/rules?owner_uid=X); else owner = caller.
-          owner_uid: filterOwnerUid ?? undefined,
         });
         if (res.code === 0) results.push(`✅ ${entry.name}:${entry.listen_port}`);
         else results.push(`❌ ${entry.name}: ${res.message}`);
@@ -508,10 +332,11 @@ const IMPORT_DEFAULTS = {
     }
     if (results.length === 0) { message.error(t('importInvalidFormat')); return; }
     setImportResults(results);
-    load(); // refresh rules in background
+    load();
   };
   const handleUpdate = async (values: {
     name?: string; listen_port?: number; protocol?: string;
+    sni?: string;
     device_group_in?: number;
     target_addr?: string; target_port?: number; targets?: RuleTargetInput[];
     load_balance_strategy?: string;
@@ -528,6 +353,14 @@ const IMPORT_DEFAULTS = {
     if (values.name !== undefined && values.name !== editing.name) payload.name = values.name;
     if (values.listen_port !== undefined && values.listen_port !== editing.listen_port) payload.listen_port = values.listen_port;
     if (values.protocol !== undefined && values.protocol !== editing.protocol) payload.protocol = values.protocol;
+    const effectiveProto = values.protocol ?? editing.protocol;
+    if (values.sni !== undefined) {
+      const nextSni = effectiveProto === 'tcp' ? (values.sni.trim() || '') : '';
+      const prevSni = editing.sni ?? '';
+      if (nextSni !== prevSni) {
+        payload.sni = nextSni || null;
+      }
+    }
     if (values.device_group_in !== undefined && values.device_group_in !== editing.device_group_in) payload.device_group_in = values.device_group_in;
     const newTargets = formTargets(values);
     const oldTargets = ruleTargets(editing);
@@ -550,16 +383,12 @@ const IMPORT_DEFAULTS = {
       payload.upload_limit_mbps = newUp;
       payload.download_limit_mbps = newDown;
     }
-    // v1.2.0: send both together when either changed. The API defaults an
-    // omitted one to the rule's current value, so sending a single field is
-    // safe — but sending the pair keeps the request self-describing.
     const newMaxConn = values.max_connections ?? 0;
     const newAutoRestart = values.auto_restart_minutes ?? 0;
     if (newMaxConn !== (editing.max_connections ?? 0) || newAutoRestart !== (editing.auto_restart_minutes ?? 0)) {
       payload.max_connections = newMaxConn;
       payload.auto_restart_minutes = newAutoRestart;
     }
-    // v1.2.15: only what changed; the API keeps an omitted field as it is.
     if (values.proxy_protocol_send !== undefined && values.proxy_protocol_send !== (editing.proxy_protocol_send ?? 'off')) {
       payload.proxy_protocol_send = values.proxy_protocol_send;
     }
@@ -814,8 +643,9 @@ const IMPORT_DEFAULTS = {
     {
       title: t('protocol'), dataIndex: 'protocol', key: 'protocol',
       render: (p: string, r: ForwardRule) => (
-        <Space size={4}>
+        <Space size={4} wrap>
           {protoTags(p)}
+          {r.sni && <Tag color="magenta">SNI: {r.sni}</Tag>}
           {r.proxy_protocol_send && r.proxy_protocol_send !== 'off' && (
             <Tooltip title={t('ppSendHint')}>
               <Tag color="geekblue">{t('ppTagSend').replace('{v}', r.proxy_protocol_send)}</Tag>
@@ -827,11 +657,6 @@ const IMPORT_DEFAULTS = {
             </Tooltip>
           )}
           {r.paused && <Tag color="red">{t('paused')}</Tag>}
-          {!r.paused && ruleOverQuota(r) && (
-            <Tooltip title={t('quotaExhaustedHint')}>
-              <Tag color="orange">{t('quotaExhausted')}</Tag>
-            </Tooltip>
-          )}
         </Space>
       ),
     },
@@ -856,18 +681,6 @@ const IMPORT_DEFAULTS = {
         );
       },
     },
-    {
-      // v0.4.14 PR3: owner is the rule's OWN uid — NOT the inbound group's uid.
-      // An admin can create a rule on behalf of a user, and a regular user can
-      // attach to an admin-owned shared group, so the rule owner and the group
-      // owner often differ. Resolve the username from the rule's uid; fall back
-      // to "#uid" when the user list isn't available.
-      title: t('owner'), key: 'owner', width: 100,
-      // v1.2.15: never broken mid-name — the sort arrows on two other columns
-      // left this one narrow enough to split "admin" across three lines.
-      render: (_: unknown, r: ForwardRule) =>
-        <Text style={{ whiteSpace: 'nowrap' }}>{userMap.get(r.uid) ?? `#${r.uid}`}</Text>,
-    },
     // v1.2.15: sortable, across every page, so the heaviest rules can be found.
     {
       title: t('traffic'), dataIndex: 'traffic_used', key: 'traffic_used',
@@ -875,20 +688,7 @@ const IMPORT_DEFAULTS = {
       render: (v: number) => <span style={{ whiteSpace: 'nowrap' }}>{formatBytes(v)}</span>,
     },
     {
-      // v1.2.14: no fixed width, and the buttons wrap, as on the users page.
-      // Six buttons on one line in a 260px column overflowed it: the table
-      // grew past a 1440px window, the owner column was squeezed to one
-      // letter per line, and delete went off screen. Now the column gets a
-      // full line where there is room and folds the buttons, three to a line,
-      // only where the window is narrow. The minimum is the wider English
-      // half (Diagnose, Restart, Delete: 244px) — less folds it to three lines.
       title: t('action'), key: 'action',
-      // v1.2.7: every action carries an accessible name that names its RULE.
-      // The visible text alone ("编辑") is identical on every row, so tabbing
-      // this table with a screen reader announced the same word once per rule
-      // with nothing to distinguish them — and "delete" is not a button you
-      // want to press on faith. The visible label stays short; only the
-      // accessible name is qualified.
       render: (_: unknown, r: ForwardRule) => (
         <Space size="small" wrap style={{ minWidth: 250 }}>
           <Button
@@ -931,18 +731,10 @@ const IMPORT_DEFAULTS = {
       ),
     },
   ];
-  // v0.4.10: hide the owner column for regular users — they only ever own
-  // their own rules, and /admin/users is never fetched for them (so userMap
-  // is empty and the column would show "-" everywhere).
-  const columns = isAdmin ? allColumns : allColumns.filter(c => c.key !== 'owner');
+  const columns = allColumns;
 
   const inGroups = groups.filter(g => g.group_type === 'in');
-  // v0.4.12 PR1: inbound group selection. Admins pick from their OWN 'in'
-  // groups. Regular users pick ONLY from admin-owned shared 'in' groups
-  // (/groups/shared) — never their own historical groups, which the backend
-  // also rejects. This keeps the UI and the API invariant in lock-step.
-  const sharedInGroups = sharedGroups.filter(g => g.group_type === 'in');
-  const allInGroups = isAdmin ? inGroups : sharedInGroups;
+  const allInGroups = inGroups;
   const protocolOptions = [
     { value: 'tcp_udp', label: t('tcpUdp') },
     { value: 'tcp', label: 'TCP' },
@@ -962,9 +754,6 @@ const IMPORT_DEFAULTS = {
 
   const hostForForm = (gid?: number) => {
     if (!gid) return '';
-    // v1.0.7: a regular user doesn't own the admin device groups, so `groups`
-    // is empty for them — resolve the connect host from the merged groupInfo
-    // (which also folds in their authorized shared groups) instead.
     return splitHosts(groupInfo.get(gid)?.connect_host).join(', ');
   };
   const renderHostHint = (gid?: number) => {
@@ -978,18 +767,7 @@ const IMPORT_DEFAULTS = {
   };
 
   /** v1.2.0: connection cap + scheduled restart. Shared by the create and edit
-   *  forms so the two can't drift (the rate-limit block above predates this and
-   *  is still duplicated).
-   *
-   *  Both fields are 0 = off. The cap's `extra` says the count is PER NODE,
-   *  because that isn't guessable: a rule on 3 nodes admits 3x the number typed
-   *  here.
-   *
-   *  The cap is disabled for a UDP-ONLY rule. It is enforced at accept(), which
-   *  UDP doesn't have — the panel would happily store the number and ship it to
-   *  the node, where nothing would ever read it. Showing an editable field that
-   *  silently does nothing is worse than showing a disabled one that says why.
-   *  A tcp_udp rule keeps it: the cap governs its TCP half. */
+   *  forms so the two can't drift. */
   const renderConnectionControls = (proto?: string) => {
     const udpOnly = proto === 'udp';
     return (
@@ -1008,8 +786,6 @@ const IMPORT_DEFAULTS = {
         extra={t('autoRestartHint').replace('{min}', String(MIN_AUTO_RESTART_MINUTES))}
         initialValue={0}
         rules={[{
-          // Mirrors the API's floor. 0 = off is always allowed; anything between
-          // 1 and the floor would drop connections faster than clients reconnect.
           validator: (_, value) => {
             const v = Number(value ?? 0);
             if (v === 0 || v >= MIN_AUTO_RESTART_MINUTES) return Promise.resolve();
@@ -1025,10 +801,6 @@ const IMPORT_DEFAULTS = {
     );
   };
 
-  // Load-balance strategy field. The per-strategy explanation used to sit in an
-  // always-open Alert below the select, which is a lot of standing text for
-  // something you read once. It now hangs off a "?" on the label — hover to
-  // read, out of the way otherwise. Same pattern as the rate-limits label.
   const renderStrategyField = () => (
     <Form.Item
       name="load_balance_strategy"
@@ -1071,9 +843,6 @@ const IMPORT_DEFAULTS = {
                 rules={[{ required: true }]}
                 style={{ marginBottom: 8 }}
               >
-                {/* Wide enough for a full IPv6 literal (up to 39 chars) — 180px
-                    truncated them mid-address. On a phone the dialog is
-                    narrower than that, so it gives way to the screen. */}
                 <TargetHostInput fieldName={field.name} placeholder={t('targetAddressOrDest')} />
               </Form.Item>
               <Form.Item
@@ -1148,8 +917,6 @@ const IMPORT_DEFAULTS = {
             onChange={(e) => { setFilter('q', e.target.value); setSelectedRowKeys([]); }}
             style={{ width: 220 }}
           />
-          {/* v0.4.9: filter by inbound group. Only groups that actually have
-              rules are offered, so the list stays short for large fleets. */}
           <Select
             style={{ minWidth: 180 }}
             allowClear
@@ -1221,28 +988,10 @@ const IMPORT_DEFAULTS = {
           <Dropdown menu={{ items: exportMenuItems }}>
             <Button icon={<DownloadOutlined />}>{t('exportImport')}</Button>
           </Dropdown>
-          <Button type="primary" icon={<PlusOutlined />} disabled={!isAdmin && sharedLoadFailed} onClick={() => { createForm.resetFields(); setCreateTab('basic'); setCreateOpen(true); }}>{t('addRule')}</Button>
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => { createForm.resetFields(); setCreateTab('basic'); setCreateOpen(true); }}>{t('addRule')}</Button>
         </Space>
       </div>
-      {/* v0.4.20: admin viewing another user's rules — show who. */}
-      {filterOwnerUid && (
-        <Alert type="info" showIcon style={{ marginBottom: 12 }}
-          title={t('viewingUserRules').replace('{user}', userMap.get(filterOwnerUid) ?? `#${filterOwnerUid}`)}
-        />
-      )}
-      {/* v0.4.12 PR1: a regular user whose shared-lines fetch failed sees a
-          load-failure notice; rule creation is disabled above so they can't
-          submit against an empty/unknown inbound list. */}
       {listLoadFailed && (
-        <Alert
-          type="error"
-          showIcon
-          style={{ marginBottom: 12 }}
-          title={t('loadFailed')}
-          description={t('loadFailedRetry')}
-        />
-      )}
-      {!isAdmin && sharedLoadFailed && (
         <Alert
           type="error"
           showIcon
@@ -1271,14 +1020,6 @@ const IMPORT_DEFAULTS = {
               label: t('tabBasic'),
               children: (<>
                 <Form.Item name="name" label={t('name')} rules={[{ required: true }]}><Input placeholder="my-rule" /></Form.Item>
-                {/* v0.4.20: owner is determined by the entry point — admins use
-                    /rules?owner_uid=X from the user management page; regular
-                    users always own their own rules. */}
-                {filterOwnerUid && (
-                  <Alert type="info" showIcon style={{ marginBottom: 12 }}
-                    title={t('creatingRuleFor').replace('{user}', userMap.get(filterOwnerUid) ?? `#${filterOwnerUid}`)}
-                  />
-                )}
                 {renderHostHint(createGroupId)}
                 <Form.Item name="listen_port" label={t('listenPort')} extra={t('listenPortHint')}><InputNumber min={1} max={65535} style={{ width: '100%' }} placeholder="auto" /></Form.Item>
                 <Form.Item name="protocol" label={t('protocol')} rules={[{ required: true }]} initialValue="tcp_udp"
@@ -1287,8 +1028,13 @@ const IMPORT_DEFAULTS = {
                     options={protocolOptions}
                   />
                 </Form.Item>
-                {/* v0.4.20: WS/TLS tunnel hidden — public_transport always raw. */}
-                <Form.Item name="public_transport" hidden initialValue="raw"><Input /></Form.Item>
+                <Form.Item
+                  name="sni"
+                  label="SNI 域名分流 (单端口多域名复用)"
+                  extra={createProto === 'tcp' ? '留空为普通独占端口；填写域名（如 region-de01.example.com 或 *.example.com）后可与其他 TCP+SNI 规则共用同一端口（如 443）' : '仅纯 TCP 协议支持 SNI 分流'}
+                >
+                  <Input placeholder="region-de01.example.com 或 *.example.com（留空为独占端口）" disabled={createProto !== 'tcp'} />
+                </Form.Item>
                 {/* v0.4.20: forward_mode always direct. */}
                 <Form.Item name="forward_mode" hidden initialValue="direct"><Input /></Form.Item>
                 <Form.Item name="device_group_in" label={t('inboundGroup')} rules={[{ required: true }]}>
@@ -1312,12 +1058,7 @@ const IMPORT_DEFAULTS = {
                   </Space>
                 </Form.Item>
                 <ProxyProtocolFields proto={createProto} t={t} />
-                {/* v1.2.0: the connection cap / auto-restart controls are
-                    deliberately EDIT-ONLY. The atomic create transaction
-                    (create_rule_with_guard) doesn't carry them, so offering them
-                    here would silently discard whatever the user typed. They are
-                    also settings you tune after watching a rule misbehave, not
-                    ones you can guess up front. */}
+                {renderConnectionControls(createProto)}
               </>),
             },
           ]} />
@@ -1340,8 +1081,13 @@ const IMPORT_DEFAULTS = {
                     options={protocolOptions}
                   />
                 </Form.Item>
-                {/* v0.4.20: WS/TLS tunnel hidden — public_transport always raw. */}
-                <Form.Item name="public_transport" hidden initialValue="raw"><Input /></Form.Item>
+                <Form.Item
+                  name="sni"
+                  label="SNI 域名分流 (单端口多域名复用)"
+                  extra={editProto === 'tcp' ? '留空为普通独占端口；填写域名（如 region-de01.example.com 或 *.example.com）后可与其他 TCP+SNI 规则共用同一端口（如 443）' : '仅纯 TCP 协议支持 SNI 分流'}
+                >
+                  <Input placeholder="region-de01.example.com 或 *.example.com（留空为独占端口）" disabled={editProto !== 'tcp'} />
+                </Form.Item>
                 {/* v0.4.20: forward_mode always direct. */}
                 <Form.Item name="forward_mode" hidden initialValue="direct"><Input /></Form.Item>
                 <Form.Item name="device_group_in" label={t('inboundGroup')}><Select options={allInGroups.map(g => ({ value: g.id, label: g.name }))} /></Form.Item>
@@ -1349,11 +1095,6 @@ const IMPORT_DEFAULTS = {
             },
             {
               key: 'forward',
-              // v1.0.9: force-render so the targets Form.List mounts even while
-              // the Basic tab is active. Without this, editing only a Basic field
-              // (e.g. listen_port) and submitting without opening this tab left
-              // `values.targets` unregistered — handleUpdate then read it as
-              // "targets cleared" and rejected with "add at least one target".
               forceRender: true,
               label: t('tabForward'),
               children: (<>
@@ -1386,8 +1127,7 @@ const IMPORT_DEFAULTS = {
           <>
             <Form.Item label={t('selectInboundGroup')}>
               <Select aria-label={t('selectInboundGroup')} value={importGroupId} onChange={setImportGroupId}
-                options={(isAdmin ? groups.filter(g => g.group_type === 'in') : sharedGroups)
-                  .map(g => ({ value: g.id, label: `${g.name} (#${g.id})` }))}
+                options={allInGroups.map(g => ({ value: g.id, label: `${g.name} (#${g.id})` }))}
                 placeholder={t('selectDeviceGroups')} style={{ width: '100%' }} />
             </Form.Item>
             <Alert type="info" showIcon style={{ marginBottom: 12 }}

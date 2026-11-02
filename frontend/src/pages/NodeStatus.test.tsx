@@ -30,9 +30,6 @@ const adminNode = {
   group_id: 1, group_name: 'admin-grp', node_id: 'n1', online: true,
   cpu: 5, mem: 5, connections: 0, uptime: 100, last_seen: new Date().toISOString(),
 };
-const sharedNode = {
-  group_id: 2, group_name: 'shared-grp', node_id: 's1', online: true, connections: 0,
-};
 // v1.2: /system/version now also returns latest_node_version +
 // node_version_check_failed. Existing tests ignore them (they assert on data
 // source / polling, not the upgrade column), but the shape must match the
@@ -76,22 +73,6 @@ describe('NodeStatus page data source', () => {
     await flush(15000);
     const versionCalls = mockGet.mock.calls.filter((c) => c[0] === '/system/version').length;
     expect(versionCalls).toBe(1);
-  });
-
-  it('regular user reads /nodes/shared, never /nodes or /system/version', async () => {
-    mockUseAuth.mockReturnValue({ isAdmin: false });
-    mockGet.mockImplementation((url: string) => {
-      if (url === '/nodes/shared') return Promise.resolve(ok([sharedNode]));
-      return Promise.reject(new Error(`unexpected ${url}`));
-    });
-
-    render(<NodeStatus />);
-    await flush();
-
-    expect(screen.getByText('shared-grp')).toBeInTheDocument();
-    expect(mockGet).toHaveBeenCalledWith('/nodes/shared');
-    expect(mockGet).not.toHaveBeenCalledWith('/nodes');
-    expect(mockGet).not.toHaveBeenCalledWith('/system/version');
   });
 });
 
@@ -370,25 +351,6 @@ describe('NodeStatus rendered group order is stable across refreshes', () => {
     // must appear first in document order (ipv4-ascending within the group).
     expect(isBefore(docOrderIdx('1.1.1.1'), docOrderIdx('5.5.5.5'))).toBe(true);
     expect(isBefore(docOrderIdx('5.5.5.5'), docOrderIdx('9.9.9.9'))).toBe(true);
-  });
-
-  it('regular user /nodes/shared gets the same stable ordering', async () => {
-    mockUseAuth.mockReturnValue({ isAdmin: false });
-    mockGet.mockImplementation((url: string) => {
-      if (url === '/nodes/shared')
-        return Promise.resolve(
-          ok([
-            mk(2, 'shared-two'),
-            mk(1, 'shared-one'),
-          ]),
-        );
-      return Promise.reject(new Error(`unexpected ${url}`));
-    });
-
-    render(<NodeStatus />);
-    await flush();
-
-    expect(isBefore(docOrderIdx('shared-one'), docOrderIdx('shared-two'))).toBe(true);
   });
 });
 

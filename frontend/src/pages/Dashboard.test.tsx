@@ -41,7 +41,6 @@ afterEach(() => {
  *  missed mock is loud rather than silently swallowed. */
 function mockAll(nodes: NodeStatus[], rules: unknown[] = [{}]) {
   mockGet.mockImplementation((url: string) => {
-    if (url === '/admin/users') return Promise.resolve(ok([{}]));
     if (url === '/rules') return Promise.resolve(ok(rules));
     if (url === '/groups') return Promise.resolve(ok([{}]));
     if (url === '/nodes') return Promise.resolve(ok(nodes));

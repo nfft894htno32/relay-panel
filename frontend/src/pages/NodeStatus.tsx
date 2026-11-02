@@ -16,7 +16,7 @@ import {
 } from '@dnd-kit/sortable';
 import { LineChartOutlined, ArrowUpOutlined, ArrowDownOutlined } from '@ant-design/icons';
 import api from '../api/client';
-import type { ApiEnvelope, NodeStatus, SharedNodeSummary, NodeDisplayRow, NodeLiveRate } from '../api/types';
+import type { ApiEnvelope, NodeStatus, NodeDisplayRow, NodeLiveRate } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { useAuth } from '../auth/useAuth';
 import { useIsMobile } from '../hooks/useIsMobile';
@@ -38,8 +38,6 @@ import { formatBps, formatBytes } from '../utils/format';
 
 type AnyNodeRow = NodeDisplayRow;
 
-/** v1.2.11: how often the page asks for pushed rates. Matches the node's push
- *  interval — polling faster only re-reads the same reading. */
 const LIVE_RATE_POLL_MS = 2000;
 
 const liveKey = (groupId: number, nodeId: string) => `${groupId}:${nodeId}`;
@@ -47,49 +45,24 @@ const liveKey = (groupId: number, nodeId: string) => `${groupId}:${nodeId}`;
 interface VersionInfo {
   current_version: string;
   config_protocol_version?: number;
-  /** v1.2: the latest NODE release (bare, e.g. "1.1.0"), resolved from the
-   *  highest node-v* GitHub release. Nodes compare their version against THIS,
-   *  not the panel version. Empty when no node release exists. */
   latest_node_version?: string;
-  /** v1.2: true when the node-version lookup failed. The UI must show an
-   *  "unknown / check failed" state instead of a green "up to date" or an
-   *  upgrade button. */
   node_version_check_failed?: boolean;
 }
 
-/**
- * v0.4.15 PR3: unified full-width node status board. Both admins and regular
- * users land here after login (via the sidebar). Admin reads /nodes; regular
- * users read /nodes/shared (server-side field filtering — the frontend never
- * hides sensitive fields client-side).
- */
 export default function NodeStatus() {
   const { t } = useI18n();
   const { isAdmin } = useAuth();
   const isMobile = useIsMobile();
 
   const [adminRows, setAdminRows] = useState<NodeStatus[] | null>(null);
-  const [userRows, setUserRows] = useState<SharedNodeSummary[] | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
-  // v1.2: nodes compare against the latest NODE release (latest_node_version),
-  // NOT the panel's current_version. Renamed from currentVersion to make the
-  // semantics obvious at every call site.
   const [latestNodeVersion, setLatestNodeVersion] = useState('');
   const [nodeVersionCheckFailed, setNodeVersionCheckFailed] = useState(false);
   const [panelProtocol, setPanelProtocol] = useState(0);
   const [detailRow, setDetailRow] = useState<AnyNodeRow | null>(null);
-  // Guards against overlapping polls: on a slow network (axios 10s timeout vs
-  // 5s interval) a new tick could otherwise fire before the previous request
-  // returned, stacking requests.
   const inFlightRef = useRef(false);
-  // v1.2.11: latest pushed rate per node, keyed by liveKey(). Replaced wholesale
-  // on each poll, so a node whose feed went quiet drops back to its status
-  // report figure instead of freezing on an old number.
   const [liveRates, setLiveRates] = useState<Map<string, NodeLiveRate>>(() => new Map());
   const liveInFlightRef = useRef(false);
-  // Bumped when a group drag starts saving and again when it ends. A poll that
-  // began before the change would otherwise land afterwards with the old order
-  // and flip the page back for a moment, so its answer is dropped.
   const orderGenRef = useRef(0);
 
   const loadAdmin = async () => {
@@ -108,22 +81,7 @@ export default function NodeStatus() {
     }
   };
 
-  const loadUser = async () => {
-    try {
-      const res = await api.get<unknown, ApiEnvelope<SharedNodeSummary[]>>('/nodes/shared');
-      if (res.code !== 0) {
-        setLoadFailed(true);
-        return;
-      }
-      setLoadFailed(false);
-      setUserRows(res.data || []);
-    } catch {
-      setLoadFailed(true);
-    }
-  };
-
   const loadLiveRates = async () => {
-    // Nobody is looking: skip rather than poll a background tab every 2s.
     if (document.hidden || liveInFlightRef.current) return;
     liveInFlightRef.current = true;
     try {
@@ -134,7 +92,6 @@ export default function NodeStatus() {
       }
       setLiveRates(next);
     } catch {
-      // Fall back to the report's figures rather than showing stale live ones.
       setLiveRates(new Map());
     } finally {
       liveInFlightRef.current = false;
@@ -145,30 +102,21 @@ export default function NodeStatus() {
     try {
       const res = await api.get<unknown, VersionInfo>('/system/version');
       setPanelProtocol(res.config_protocol_version || 0);
-      // v1.2: the node upgrade target is the latest node release, not the
-      // panel version. A failed lookup sets the "check failed" flag so the UI
-      // shows an unknown state instead of a wrong upgrade button.
       setLatestNodeVersion(res.latest_node_version || '');
       setNodeVersionCheckFailed(!!res.node_version_check_failed);
     } catch { /* ignore */ }
   };
 
   const refresh = async () => {
-    // Skip this tick if the previous request is still outstanding.
     if (inFlightRef.current) return;
     inFlightRef.current = true;
     try {
-      await (isAdmin ? loadAdmin() : loadUser());
+      await loadAdmin();
     } finally {
       inFlightRef.current = false;
     }
   };
 
-  // Poll node status every 5s. The version info is NOT polled — it's static
-  // for the lifetime of a panel process, so it's fetched once on mount (admin
-  // only). loadFailed is cleared only on a successful response (inside the
-  // load* fns), so a transient poll failure no longer flashes the error page
-  // back to stale data every 5s.
   useEffect(() => {
     if (isAdmin) loadVersion();
     refresh();
@@ -177,16 +125,13 @@ export default function NodeStatus() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAdmin]);
 
-  // v1.2.11: the live rate runs on its own, faster clock. Everything else on
-  // the page (CPU, memory, disk, cumulative traffic) keeps the 5s refresh and
-  // the node's own ~10s report cadence.
   useEffect(() => {
     loadLiveRates();
     const ti = setInterval(loadLiveRates, LIVE_RATE_POLL_MS);
     return () => clearInterval(ti);
   }, []);
 
-  const baseRows: AnyNodeRow[] | null = isAdmin ? adminRows : userRows;
+  const baseRows: AnyNodeRow[] | null = adminRows;
   // Overlay the pushed rate on online nodes that have one. The group header
   // sums row rates, so it picks the live figures up with no change of its own.
   const rows = useMemo(() => {

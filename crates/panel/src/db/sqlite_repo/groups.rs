@@ -2,7 +2,12 @@ use super::SqliteRepository;
 use crate::db::error::DbError;
 use crate::db::repo::*;
 use async_trait::async_trait;
-use relay_shared::models::{DeviceGroup, SharedGroupSummary};
+use relay_shared::models::DeviceGroup;
+
+const GROUP_COLS: &str =
+    "id, name, group_type, token, uid, connect_host, port_range, fallback_group, config, \
+     capabilities, region, line_type, remark, sni_fallback_addr, sni_loop_bypass_ips, \
+     sort_order, created_at";
 
 // ── GroupRepository ──
 
@@ -10,54 +15,32 @@ use relay_shared::models::{DeviceGroup, SharedGroupSummary};
 impl GroupRepository for SqliteRepository {
     async fn list_groups(&self, scope: &ResourceScope) -> Result<Vec<DeviceGroup>, DbError> {
         let groups: Vec<DeviceGroup> = match scope.owner_id() {
-            None => sqlx::query_as("SELECT * FROM device_groups ORDER BY sort_order, id"),
-            Some(uid) => {
-                sqlx::query_as("SELECT * FROM device_groups WHERE uid = ? ORDER BY sort_order, id")
-                    .bind(uid)
+            None => {
+                sqlx::query_as(&format!(
+                    "SELECT {GROUP_COLS} FROM device_groups ORDER BY sort_order, id"
+                ))
+                .fetch_all(&self.pool)
+                .await?
             }
-        }
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(groups)
-    }
-
-    async fn list_shared_groups(
-        &self,
-        uid: i64,
-        is_admin: bool,
-    ) -> Result<Vec<SharedGroupSummary>, DbError> {
-        // v0.4.11 PR3: admins manage groups directly — no shared infrastructure needed.
-        if is_admin {
-            return Ok(vec![]);
-        }
-        // v0.4.12 PR1: regular users see ALL ADMIN-owned inbound groups,
-        // independent of whether they already have rules. The JOIN to users
-        // enforces admin ownership so a regular user's group is never exposed
-        // as "shared". group_type uses the stable machine value 'in' (the old
-        // LIKE 'inbound%' never matched — group_type is 'in' / 'out' / 'monitor').
-        // v1.0.7: `g.hidden` is SELECTED (not filtered here) so the caller
-        // decides. Only the node-status path (`list_shared_node_summary`) hides
-        // it; the rule dropdown / shop still list hidden groups so existing and
-        // new rules keep working. Admins get [] above and are unaffected.
-        let groups: Vec<SharedGroupSummary> = sqlx::query_as(
-            "SELECT g.id, g.name, g.group_type, g.connect_host, g.capabilities, g.region, g.line_type, g.hidden, g.sort_order \
-             FROM device_groups g \
-             JOIN users u ON u.id = g.uid \
-             WHERE g.uid != ? AND u.admin = 1 AND g.group_type = 'in' \
-             ORDER BY g.sort_order, g.id",
-        )
-        .bind(uid)
-        .fetch_all(&self.pool)
-        .await?;
+            Some(uid) => {
+                sqlx::query_as(&format!(
+                    "SELECT {GROUP_COLS} FROM device_groups WHERE uid = ? ORDER BY sort_order, id"
+                ))
+                .bind(uid)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
         Ok(groups)
     }
 
     async fn find_by_token(&self, token: &str) -> Result<Option<DeviceGroup>, DbError> {
-        let group: Option<DeviceGroup> =
-            sqlx::query_as("SELECT * FROM device_groups WHERE token = ?")
-                .bind(token)
-                .fetch_optional(&self.pool)
-                .await?;
+        let group: Option<DeviceGroup> = sqlx::query_as(&format!(
+            "SELECT {GROUP_COLS} FROM device_groups WHERE token = ?"
+        ))
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(group)
     }
 
@@ -67,13 +50,24 @@ impl GroupRepository for SqliteRepository {
         scope: &ResourceScope,
     ) -> Result<Option<DeviceGroup>, DbError> {
         let group: Option<DeviceGroup> = match scope.owner_id() {
-            None => sqlx::query_as("SELECT * FROM device_groups WHERE id = ?").bind(id),
-            Some(uid) => sqlx::query_as("SELECT * FROM device_groups WHERE id = ? AND uid = ?")
+            None => {
+                sqlx::query_as(&format!(
+                    "SELECT {GROUP_COLS} FROM device_groups WHERE id = ?"
+                ))
                 .bind(id)
-                .bind(uid),
-        }
-        .fetch_optional(&self.pool)
-        .await?;
+                .fetch_optional(&self.pool)
+                .await?
+            }
+            Some(uid) => {
+                sqlx::query_as(&format!(
+                    "SELECT {GROUP_COLS} FROM device_groups WHERE id = ? AND uid = ?"
+                ))
+                .bind(id)
+                .bind(uid)
+                .fetch_optional(&self.pool)
+                .await?
+            }
+        };
         Ok(group)
     }
 
@@ -84,9 +78,11 @@ impl GroupRepository for SqliteRepository {
     ) -> Result<Option<String>, DbError> {
         let row: Option<(String,)> = match scope.owner_id() {
             None => sqlx::query_as("SELECT name FROM device_groups WHERE id = ?").bind(id),
-            Some(uid) => sqlx::query_as("SELECT name FROM device_groups WHERE id = ? AND uid = ?")
-                .bind(id)
-                .bind(uid),
+            Some(uid) => {
+                sqlx::query_as("SELECT name FROM device_groups WHERE id = ? AND uid = ?")
+                    .bind(id)
+                    .bind(uid)
+            }
         }
         .fetch_optional(&self.pool)
         .await?;
@@ -101,12 +97,11 @@ impl GroupRepository for SqliteRepository {
         uid: i64,
         connect_host: &str,
         port_range: &str,
-        rate: f64,
-        hidden: bool,
+        sni_fallback_addr: &str,
+        sni_loop_bypass_ips: &str,
     ) -> Result<(), DbError> {
         sqlx::query(
-            // A new group goes last: one past the largest sort_order in use.
-            "INSERT INTO device_groups (name, group_type, token, uid, connect_host, port_range, rate, hidden, sort_order) \
+            "INSERT INTO device_groups (name, group_type, token, uid, connect_host, port_range, sni_fallback_addr, sni_loop_bypass_ips, sort_order) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM device_groups))",
         )
         .bind(name)
@@ -115,8 +110,8 @@ impl GroupRepository for SqliteRepository {
         .bind(uid)
         .bind(connect_host)
         .bind(port_range)
-        .bind(rate)
-        .bind(hidden)
+        .bind(sni_fallback_addr)
+        .bind(sni_loop_bypass_ips)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -126,13 +121,12 @@ impl GroupRepository for SqliteRepository {
         &self,
         token: &str,
     ) -> Result<Option<DeviceGroup>, DbError> {
-        // INSERT-then-SELECT-by-token pattern: token is freshly generated
-        // (UUID v4), so the SELECT is guaranteed to hit the just-inserted row.
-        let group: Option<DeviceGroup> =
-            sqlx::query_as("SELECT * FROM device_groups WHERE token = ?")
-                .bind(token)
-                .fetch_optional(&self.pool)
-                .await?;
+        let group: Option<DeviceGroup> = sqlx::query_as(&format!(
+            "SELECT {GROUP_COLS} FROM device_groups WHERE token = ?"
+        ))
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(group)
     }
 
@@ -144,11 +138,9 @@ impl GroupRepository for SqliteRepository {
         group_type: Option<&str>,
         connect_host: Option<&str>,
         port_range: Option<&str>,
-        rate: Option<f64>,
-        hidden: Option<bool>,
+        sni_fallback_addr: Option<&str>,
+        sni_loop_bypass_ips: Option<&str>,
     ) -> Result<u64, DbError> {
-        // Token is NOT updatable here (rotation is a separate endpoint). Build
-        // the SET clause from the present fields; binding order matches below.
         let mut sets: Vec<&str> = Vec::new();
         if name.is_some() {
             sets.push("name = ?");
@@ -162,11 +154,11 @@ impl GroupRepository for SqliteRepository {
         if port_range.is_some() {
             sets.push("port_range = ?");
         }
-        if rate.is_some() {
-            sets.push("rate = ?");
+        if sni_fallback_addr.is_some() {
+            sets.push("sni_fallback_addr = ?");
         }
-        if hidden.is_some() {
-            sets.push("hidden = ?");
+        if sni_loop_bypass_ips.is_some() {
+            sets.push("sni_loop_bypass_ips = ?");
         }
 
         if sets.is_empty() {
@@ -193,10 +185,10 @@ impl GroupRepository for SqliteRepository {
         if let Some(v) = port_range {
             q = q.bind(v);
         }
-        if let Some(v) = rate {
+        if let Some(v) = sni_fallback_addr {
             q = q.bind(v);
         }
-        if let Some(v) = hidden {
+        if let Some(v) = sni_loop_bypass_ips {
             q = q.bind(v);
         }
         q = q.bind(id);
@@ -218,10 +210,12 @@ impl GroupRepository for SqliteRepository {
             None => sqlx::query("UPDATE device_groups SET token = ? WHERE id = ?")
                 .bind(new_token)
                 .bind(id),
-            Some(uid) => sqlx::query("UPDATE device_groups SET token = ? WHERE id = ? AND uid = ?")
-                .bind(new_token)
-                .bind(id)
-                .bind(uid),
+            Some(uid) => {
+                sqlx::query("UPDATE device_groups SET token = ? WHERE id = ? AND uid = ?")
+                    .bind(new_token)
+                    .bind(id)
+                    .bind(uid)
+            }
         }
         .execute(&self.pool)
         .await?;
@@ -229,9 +223,6 @@ impl GroupRepository for SqliteRepository {
     }
 
     async fn count_rules_by_group(&self, id: i64) -> Result<i64, DbError> {
-        // v1.2.12: forward_rules has no fallback_group column (that column is
-        // on device_groups). This used to probe for it and silently drop the
-        // condition; the PG copy queried it outright and failed every delete.
         let row: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM forward_rules \
              WHERE device_group_in = ? OR device_group_out = ?",
@@ -265,8 +256,6 @@ impl GroupRepository for SqliteRepository {
 
     async fn reorder_groups(&self, ids: &[i64]) -> Result<(), DbError> {
         let mut tx = self.begin_write().await?;
-        // Current order first, so the groups left out of `ids` can follow the
-        // listed ones in their existing relative order.
         let current: Vec<(i64,)> =
             sqlx::query_as("SELECT id FROM device_groups ORDER BY sort_order, id")
                 .fetch_all(&mut *tx)
@@ -279,37 +268,10 @@ impl GroupRepository for SqliteRepository {
                 .execute(&mut *tx)
                 .await?;
             if r.rows_affected() == 0 {
-                // Unknown id: dropping the transaction rolls everything back.
                 return Err(DbError::NotFound);
             }
         }
         tx.commit().await?;
         Ok(())
-    }
-
-    async fn list_all_inbound_group_ids(&self) -> Result<Vec<i64>, DbError> {
-        let rows: Vec<(i64,)> = sqlx::query_as(
-            "SELECT id FROM device_groups WHERE group_type = 'in' ORDER BY sort_order, id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(|(id,)| id).collect())
-    }
-
-    async fn list_group_names_by_ids(&self, ids: &[i64]) -> Result<Vec<String>, DbError> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders = vec!["?"; ids.len()].join(", ");
-        let sql = format!(
-            "SELECT name FROM device_groups WHERE id IN ({}) ORDER BY sort_order, id",
-            placeholders
-        );
-        let mut q = sqlx::query_as(&sql);
-        for id in ids {
-            q = q.bind(id);
-        }
-        let rows: Vec<(String,)> = q.fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|(name,)| name).collect())
     }
 }

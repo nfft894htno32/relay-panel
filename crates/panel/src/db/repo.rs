@@ -1,51 +1,13 @@
-// v0.4.3: Repository trait layer.
-//
-// Domain-specific traits (UserRepository, RuleRepository, ...) define the data
-// access contract. The aggregate `Repository` trait combines them so handlers
-// take a single `Arc<dyn Repository>` dependency.
-//
-// PR1: only SqliteRepository implements these traits. PR2 will add
-// PgRepository (PostgreSQL) implementing the same traits.
-//
-// Design principles:
-//   - Methods return domain models (User, ForwardRule, ...) — no DB types leak.
-//   - Transactions are encapsulated inside methods (e.g. apply_traffic_batch,
-//     reset_traffic) — no `begin()` / `Tx` leaks to handlers.
-//   - Errors are DbError (unified codes), not raw sqlx::Error.
-//   - Service-layer logic (config assembly, protocol derivation, stale sweep)
-//     stays in the caller, NOT in the repository.
-//
-// dead_code: some trait methods in this module are part of the contract but
-// not yet wired to a handler in PR1 (e.g. increment_user_traffic,
-// delete_rules_by_uid). They're reachable through the trait object and will be
-// used by future callers / PgRepository parity tests; silence the lints rather
-// than delete the contract.
+// Repository trait layer.
 #![allow(dead_code)]
 
 use async_trait::async_trait;
-use relay_shared::models::{
-    DeviceGroup, ForwardRule, ForwardRuleTarget, Order, Plan, SharedGroupSummary, Statistic,
-    TunnelProfile, User,
-};
+use relay_shared::models::{DeviceGroup, ForwardRule, ForwardRuleTarget, Statistic, User};
 use relay_shared::protocol::{RuleTargetRequest, TrafficEntry};
-use serde::Serialize;
 
 use super::error::DbError;
 
-// ── Resource scoping (v0.4.10 multi-user isolation) ──
-
 /// The ownership scope a resource query is restricted to.
-///
-/// `All` = the caller may see/modify every row (administrators). `Owner(uid)`
-/// = only rows whose `uid` column equals `uid`. This is the single type the
-/// Repository layer uses to enforce per-user isolation; the API layer builds it
-/// from the authenticated user (see `AuthUser::resource_scope` in middleware.rs)
-/// and the db layer never imports from the api layer.
-///
-/// `Owner(uid)` is folded into the SQL WHERE clause (e.g.
-/// `WHERE id = ? AND uid = ?`), so a miss — "row doesn't exist" vs "row belongs
-/// to someone else" — is indistinguishable to the caller (both return None →
-/// 404). That closes a resource-id existence oracle.
 #[derive(Debug, Clone, Copy)]
 pub enum ResourceScope {
     All,
@@ -53,8 +15,6 @@ pub enum ResourceScope {
 }
 
 impl ResourceScope {
-    /// `Some(uid)` when scoped to one owner, `None` when unscoped (admin).
-    /// Repository impls use this to pick the scoped vs unscoped SQL branch.
     pub fn owner_id(&self) -> Option<i64> {
         match self {
             ResourceScope::All => None,
@@ -63,8 +23,7 @@ impl ResourceScope {
     }
 }
 
-/// v1.2.15: a rule's PROXY protocol settings as stored (see
-/// `ForwardRule::proxy_protocol_*`). The default is off.
+/// A rule's PROXY protocol settings as stored (see `ForwardRule::proxy_protocol_*`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleProxyProtocol {
     /// "off" | "v1" | "v2"
@@ -84,27 +43,19 @@ impl Default for RuleProxyProtocol {
     }
 }
 
-/// v1.2.12: one rule edit, for [`RuleRepository::update_rule_full`]. `None`
-/// leaves a field as it is; for the nullable columns, `Some(None)` clears it.
+/// One rule edit, for [`RuleRepository::update_rule_full`]. `None` leaves a
+/// field as it is; for nullable columns, `Some(None)` clears it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RuleUpdate<'a> {
     pub name: Option<&'a str>,
     pub listen_port: Option<i32>,
     pub protocol: Option<&'a str>,
-    /// Writes `public_transport`, and `node_transport` / `entry_transport`
-    /// (each defaulting to this value).
-    pub public_transport: Option<&'a str>,
-    pub node_transport: Option<&'a str>,
-    pub entry_transport: Option<&'a str>,
-    pub route_mode: Option<&'a str>,
-    pub ws_path: Option<Option<&'a str>>,
+    pub sni: Option<Option<&'a str>>,
     pub device_group_in: Option<i64>,
     pub device_group_out: Option<Option<i64>>,
     pub forward_mode: Option<&'a str>,
     pub target_addr: Option<&'a str>,
     pub target_port: Option<i32>,
-    /// An explicit pause/resume also clears `auto_paused`: it is a person's
-    /// decision, which a later re-authorization must not undo.
     pub paused: Option<bool>,
     /// Replaces the whole target list.
     pub targets: Option<&'a [RuleTargetRequest]>,
@@ -113,28 +64,17 @@ pub struct RuleUpdate<'a> {
     pub download_limit_mbps: Option<i32>,
     pub max_connections: Option<i32>,
     pub auto_restart_minutes: Option<i32>,
-    pub tunnel_profile_id: Option<Option<i64>>,
-    /// v1.2.15: PROXY protocol. `None` leaves each as it is.
     pub proxy_protocol_send: Option<&'a str>,
     pub proxy_protocol_accept: Option<bool>,
     pub proxy_protocol_trusted: Option<&'a str>,
-    /// Re-check, inside the transaction, that the owner may use the rule's
-    /// inbound group when the edit resumes it or moves it to another group.
-    /// Set for an owner editing their own rule; an admin's edit skips it, as
-    /// the API's own check does.
-    pub check_owner_authorization: bool,
 }
 
 impl RuleUpdate<'_> {
-    /// Whether the edit writes any `forward_rules` column (as opposed to only
-    /// the target list, or nothing).
     pub fn has_columns(&self) -> bool {
         self.name.is_some()
             || self.listen_port.is_some()
             || self.protocol.is_some()
-            || self.public_transport.is_some()
-            || self.route_mode.is_some()
-            || self.ws_path.is_some()
+            || self.sni.is_some()
             || self.device_group_in.is_some()
             || self.device_group_out.is_some()
             || self.forward_mode.is_some()
@@ -146,147 +86,38 @@ impl RuleUpdate<'_> {
             || self.download_limit_mbps.is_some()
             || self.max_connections.is_some()
             || self.auto_restart_minutes.is_some()
-            || self.tunnel_profile_id.is_some()
+            || self.proxy_protocol_send.is_some()
+            || self.proxy_protocol_accept.is_some()
+            || self.proxy_protocol_trusted.is_some()
     }
-}
-
-/// Scope for tunnel-profile reads. Distinct from [`ResourceScope`] because
-/// profile isolation is by usage-context, not ownership:
-/// - `AvailableTemplates`: templates available for rule selection (ws/tls_simple,
-///   builtin + admin-created custom). Used by `GET /tunnel-profiles` so any
-///   logged-in user can select a template for their rules.
-/// - `ManageableCustomTemplates`: custom templates the admin can manage
-///   (is_builtin = false, ws/tls_simple only). Used by `GET /admin/tunnel-profiles`.
-/// - `All`: internal use (config generation, audit, migration).
-///
-/// v0.4.11 PR1: replaced `BuiltinOnly` with context-based scopes. A regular
-/// user may now select any available WS/TLS Simple template (builtin or admin-
-/// created custom), not just builtin ones.
-#[derive(Debug, Clone, Copy)]
-pub enum ProfileScope {
-    /// Internal: all profiles (config generation, audit, migration).
-    All,
-    /// Available for rule selection: ws/tls_simple, builtin + admin custom.
-    AvailableTemplates,
-    /// Manageable custom templates: is_builtin=false, ws/tls_simple only.
-    ManageableCustomTemplates,
 }
 
 // ── User ──
 
 #[async_trait]
 pub trait UserRepository: Send + Sync {
-    /// Login lookup: username must exist AND not be banned.
-    async fn find_by_username_not_banned(&self, username: &str) -> Result<Option<User>, DbError>;
-    /// Register existing check: username exists (regardless of banned).
     async fn find_by_username(&self, username: &str) -> Result<Option<User>, DbError>;
-    /// Load full user by id.
     async fn find_by_id(&self, id: i64) -> Result<Option<User>, DbError>;
-    /// Password hash for change_password.
     async fn find_password_by_id(&self, id: i64) -> Result<Option<String>, DbError>;
-    /// banned flag for auth extractor. Returns None if user doesn't exist.
-    async fn find_banned_by_id(&self, id: i64) -> Result<Option<bool>, DbError>;
-    /// v0.4.10 PR4: the auth state the middleware needs in ONE query —
-    /// (banned, token_version, must_change_password, admin). None = user deleted.
-    /// `admin` is the CURRENT role, so a demoted admin loses privileges at once.
-    /// Replaces three separate lookups per request.
+    /// The auth state the middleware needs in ONE query —
+    /// (token_version, must_change_password, admin). None = user deleted.
     async fn find_auth_state_by_id(
         &self,
         id: i64,
-    ) -> Result<Option<(bool, i64, bool, bool)>, DbError>;
-    /// Check if user is admin (returns None if not found or not admin).
+    ) -> Result<Option<(i64, bool, bool)>, DbError>;
     async fn is_admin(&self, id: i64) -> Result<bool, DbError>;
-    /// Check if user exists by id.
     async fn exists_by_id(&self, id: i64) -> Result<bool, DbError>;
-    /// Insert a new user (register).
-    async fn insert_user(
-        &self,
-        username: &str,
-        password_hash: &str,
-        plan_id: i64,
-    ) -> Result<(), DbError>;
-    /// v0.4.10 PR3: register a user whose quota fields (max_rules,
-    /// traffic_limit, speed_limit, ip_limit) are inherited ATOMICALLY from the
-    /// plan via `INSERT ... SELECT`. This closes the race where a separate
-    /// "validate plan then insert" sequence could see the plan change (or be
-    /// deleted) between the two steps. Returns rows_affected: 0 means the plan
-    /// does not exist (the SELECT matched no row) and no user was created —
-    /// the caller surfaces this as a registration failure. A UNIQUE violation
-    /// on username still surfaces as `DbError::UniqueViolation` (→ 409).
-    async fn insert_user_from_plan(
-        &self,
-        username: &str,
-        password_hash: &str,
-        plan_id: i64,
-    ) -> Result<u64, DbError>;
-    /// Update password.
     async fn update_password(&self, id: i64, new_hash: &str) -> Result<u64, DbError>;
-    /// v0.4.10 PR4: self-service password change. Atomically sets the new hash,
-    /// bumps token_version (revoking all the user's existing sessions including
-    /// the one making this call), and clears must_change_password. Returns rows
-    /// affected (0 = user not found).
     async fn change_own_password(&self, id: i64, new_hash: &str) -> Result<u64, DbError>;
-    /// v0.4.10 PR4: admin password reset. Atomically sets the new hash, bumps
-    /// token_version (revoking the target's sessions), and sets
-    /// must_change_password to the given value (so a temporary password forces
-    /// a change on first use). Returns rows affected (0 = user not found).
     async fn admin_reset_password(
         &self,
         id: i64,
         new_hash: &str,
         must_change_password: bool,
     ) -> Result<u64, DbError>;
-    /// Dynamic field update (balance/max_rules/traffic_limit/banned).
-    /// v0.4.10 PR4: when `banned` is set to `Some(true)`, the same UPDATE also
-    /// bumps token_version so the ban instantly revokes the user's JWTs (the
-    /// per-request banned check already blocks them, but bumping keeps the
-    /// revocation signal uniform with admin-reset / self-change).
-    async fn update_user_fields(
-        &self,
-        id: i64,
-        balance: Option<&str>,
-        max_rules: Option<i32>,
-        traffic_limit: Option<i64>,
-        banned: Option<bool>,
-        suspended: Option<bool>,
-    ) -> Result<u64, DbError>;
-    /// v1.0.7: admin directly sets a user's plan association + expiry WITHOUT
-    /// charging (the "edit user plan" panel uses this for removing a plan — both
-    /// NULL — and for adjusting the expiry). Unconditionally writes both columns;
-    /// the caller composes the pair (e.g. keep plan_id, change expiry). Skips
-    /// admin users (WHERE admin = false). Returns rows affected (0 = not found
-    /// or target is an admin).
-    async fn admin_set_user_plan(
-        &self,
-        id: i64,
-        plan_id: Option<i64>,
-        plan_expire_at: Option<String>,
-    ) -> Result<u64, DbError>;
-    /// v1.0.9: remove a user's plan AND revoke device-group authorization AND
-    /// pause their now-unauthorized rules, all in ONE transaction — the clear
-    /// path used to do these as 4 separate calls, which could half-complete.
-    /// Clears plan_id/plan_expire_at, sets all_device_groups=0, deletes the
-    /// user's user_device_groups rows, and system-pauses (auto_paused=1) every
-    /// active rule. No-op for admins. Returns rows affected on the user row
-    /// (0 = not found or admin).
-    async fn clear_user_plan(&self, user_id: i64) -> Result<u64, DbError>;
-    /// Increment user traffic_used (called inside traffic batch tx).
     async fn increment_user_traffic(&self, id: i64, delta: i64) -> Result<(), DbError>;
-    /// Reset traffic_used to 0 for user AND their rules (atomic).
     async fn reset_traffic(&self, id: i64) -> Result<(), DbError>;
-    /// Delete user (only if not admin). Returns rows affected (0 = not found or admin).
-    async fn delete_non_admin(&self, id: i64) -> Result<u64, DbError>;
-    /// Delete a non-admin user AND all their owned resources (rules,
-    /// tunnel_profiles, device_groups) in ONE transaction. Returns rows affected
-    /// on the users table (0 = not found or admin → nothing deleted, fully rolled
-    /// back). Replaces the old non-transactional cascade that missed
-    /// tunnel_profiles and could leave a half-deleted account.
-    async fn delete_user_cascade(&self, uid: i64) -> Result<u64, DbError>;
-    /// List all users (public projection, no password).
-    async fn list_users_public(&self) -> Result<Vec<crate::api::admin::UserPublic>, DbError>;
-    /// Count users with placeholder admin password (system boot check).
     async fn count_placeholder_admin_password(&self) -> Result<i64, DbError>;
-    /// Replace placeholder admin password with a real hash (system boot).
     async fn replace_placeholder_admin_password(&self, hash: &str) -> Result<(), DbError>;
 }
 
@@ -295,43 +126,37 @@ pub trait UserRepository: Send + Sync {
 #[async_trait]
 pub trait RuleRepository: Send + Sync {
     async fn list_rules(&self, scope: &ResourceScope) -> Result<Vec<ForwardRule>, DbError>;
-    /// Look up a single rule by id within the scope. None = no such rule OR a
-    /// rule that exists but is outside the caller's scope (indistinguishable,
-    /// by design — closes a resource-id existence oracle).
     async fn find_rule_by_id(
         &self,
         rule_id: i64,
         scope: &ResourceScope,
     ) -> Result<Option<ForwardRule>, DbError>;
-    /// List all target rows for a rule (within scope), ordered by position.
     async fn list_rule_targets(
         &self,
         rule_id: i64,
         scope: &ResourceScope,
     ) -> Result<Vec<ForwardRuleTarget>, DbError>;
-    /// List enabled target rows for a rule (within scope), ordered by position.
     async fn list_enabled_rule_targets(
         &self,
         rule_id: i64,
         scope: &ResourceScope,
     ) -> Result<Vec<ForwardRuleTarget>, DbError>;
-    /// Replace all targets for an existing rule (within scope). Positions are
-    /// assigned by input order.
+    async fn list_enabled_targets_for_rules(
+        &self,
+        rule_ids: &[i64],
+    ) -> Result<Vec<ForwardRuleTarget>, DbError>;
     async fn replace_rule_targets(
         &self,
         rule_id: i64,
         scope: &ResourceScope,
         targets: &[RuleTargetRequest],
     ) -> Result<(), DbError>;
-    /// Update a rule's load-balancing strategy (within scope). Returns rows affected.
     async fn set_rule_load_balance_strategy(
         &self,
         rule_id: i64,
         scope: &ResourceScope,
         strategy: &str,
     ) -> Result<u64, DbError>;
-    /// Update a rule's per-rule upload/download Mbps caps (0 = unlimited),
-    /// within scope.
     async fn set_rule_rate_limits(
         &self,
         rule_id: i64,
@@ -339,13 +164,6 @@ pub trait RuleRepository: Send + Sync {
         upload_limit_mbps: i32,
         download_limit_mbps: i32,
     ) -> Result<u64, DbError>;
-    /// v1.2.0: update a rule's connection cap (0 = unlimited) and scheduled
-    /// restart interval in minutes (0 = off), within scope.
-    ///
-    /// Written together because they are one form section and one semantic
-    /// concern — "how this rule sheds load". The caller validates
-    /// `auto_restart_minutes` against `MIN_AUTO_RESTART_MINUTES` first; this
-    /// layer stores what it is given.
     async fn set_rule_connection_controls(
         &self,
         rule_id: i64,
@@ -353,104 +171,13 @@ pub trait RuleRepository: Send + Sync {
         max_connections: i32,
         auto_restart_minutes: i32,
     ) -> Result<u64, DbError>;
-    /// v1.2.0: rules with a scheduled restart enabled (`auto_restart_minutes >
-    /// 0`) that are not paused. Returns (rule_id, device_group_in,
-    /// auto_restart_minutes) — everything the scheduler needs to fan a restart
-    /// out to the rule's nodes, without loading whole rules every tick.
     async fn list_auto_restart_rules(&self) -> Result<Vec<(i64, i64, i32)>, DbError>;
-    /// Bind (or unbind, when profile_id is None) a rule to a tunnel profile,
-    /// within scope.
-    async fn set_rule_tunnel_profile(
-        &self,
-        rule_id: i64,
-        scope: &ResourceScope,
-        profile_id: Option<i64>,
-    ) -> Result<u64, DbError>;
-    /// v0.4.11 PR4: the (listen_port, protocol) pairs already in use on a
-    /// specific inbound group. Used by auto_assign_port to pick a free port
-    /// scoped to the rule's device_group_in — different groups (and different
-    /// users sharing the same group's pool) are evaluated independently.
     async fn list_group_port_protocols(
         &self,
         device_group_in: i64,
     ) -> Result<Vec<(i32, String)>, DbError>;
-    /// v1.2.x: the auto-assign port pool configured on a device group
-    /// (`device_groups.port_range`, e.g. "10000-65535"). `auto_assign_port`
-    /// parses this to bound its search. Returns `None` when the group id
-    /// doesn't exist (the caller falls back to the default pool).
     async fn group_port_range(&self, group_id: i64) -> Result<Option<String>, DbError>;
-    /// Count rules for a user (quota reporting).
     async fn count_by_uid(&self, uid: i64) -> Result<i64, DbError>;
-    /// Get max_rules for a user (quota ceiling; 0 = unlimited).
-    async fn max_rules_for_uid(&self, uid: i64) -> Result<i32, DbError>;
-    /// Insert a rule with quota guard AND port-conflict guard, in ONE
-    /// transaction. The port check is socket-type aware (TCP-bearing rules
-    /// conflict with TCP-bearing, UDP-bearing with UDP-bearing) and scoped to
-    /// device_group_in.
-    ///
-    /// Returns `Ok(1)` on success, `Ok(0)` if the user's max_rules quota is
-    /// exhausted, `Err(DbError::PortConflict)` if the port is already occupied
-    /// on the group by a conflicting socket type, or `Err(DbError::UniqueViolation)`
-    /// as the DB-layer backstop (partial unique index) when a concurrent insert
-    /// won the race.
-    ///
-    /// Concurrency: SQLite uses BEGIN IMMEDIATE (acquire the write lock up
-    /// front); PostgreSQL takes a per-group advisory xact lock plus the
-    /// existing user-row FOR UPDATE quota lock.
-    #[allow(clippy::too_many_arguments)]
-    async fn insert_quota_guarded(
-        &self,
-        name: &str,
-        uid: i64,
-        listen_port: i32,
-        protocol: &str,
-        public_transport: &str,
-        node_transport: &str,
-        route_mode: &str,
-        entry_transport: &str,
-        ws_path: Option<&str>,
-        device_group_in: i64,
-        device_group_out: Option<i64>,
-        forward_mode: &str,
-        target_addr: &str,
-        target_port: i32,
-    ) -> Result<u64, DbError>;
-
-    /// v1.2: create a rule AND write its targets / load-balance strategy /
-    /// rate limits / tunnel profile in ONE transaction, returning the new
-    /// rule's id directly.
-    ///
-    /// This supersedes the old `insert_quota_guarded`-then-`list_rules`-by-
-    /// `listen_port`-lookup dance for `create_rule`. The old lookup keyed only
-    /// on `(owner_uid, listen_port)` and ignored `device_group_in`, so when two
-    /// inbound groups (both legal owners of the same listen_port under the
-    /// per-group partial unique index) reused a port, the lookup returned the
-    /// WRONG rule and the targets/LB/limits were written to it. Returning the
-    /// id from the INSERT itself closes that bug, and putting every write in
-    /// one transaction means a mid-creation failure leaves no half-rule.
-    ///
-    /// Returns:
-    /// - `Ok(Some(id))` — rule created; the id is the freshly inserted row.
-    /// - `Ok(None)` — the owner's max_rules quota is exhausted (the
-    ///   quota-guarded INSERT matched 0 rows); no row was written.
-    /// - `Err(DbError::PortConflict)` — listen_port already occupied on the
-    ///   inbound group by a conflicting socket type.
-    /// - `Err(DbError::UniqueViolation)` — DB-layer backstop (partial unique
-    ///   index) when a concurrent creator won the race.
-    ///
-    /// `load_balance_strategy` is the stable DB string ("first"/"round_robin"/
-    /// "failover"); it is only written when it differs from "first" (mirrors
-    /// the service's existing behaviour, since "first" is the column default).
-    /// `upload_limit_mbps` / `download_limit_mbps` are only written when either
-    /// is non-zero (0 = unlimited = the column default). `tunnel_profile_id` is
-    /// only written when `Some`.
-    ///
-    /// v1.2.12: with `check_owner_authorization`, the owner's device-group
-    /// authorization for `device_group_in` is re-checked inside the write
-    /// transaction (`Err(DbError::GroupNotAuthorized)` when missing). The API
-    /// checks it before, but an authorization revoked in between pauses only
-    /// the rules that already exist — never this one. Admins acting for a user
-    /// pass `false`, as their request skips that check too.
     #[allow(clippy::too_many_arguments)]
     async fn create_rule_full(
         &self,
@@ -458,11 +185,7 @@ pub trait RuleRepository: Send + Sync {
         uid: i64,
         listen_port: i32,
         protocol: &str,
-        public_transport: &str,
-        node_transport: &str,
-        route_mode: &str,
-        entry_transport: &str,
-        ws_path: Option<&str>,
+        sni: Option<&str>,
         device_group_in: i64,
         device_group_out: Option<i64>,
         forward_mode: &str,
@@ -472,40 +195,21 @@ pub trait RuleRepository: Send + Sync {
         load_balance_strategy: &str,
         upload_limit_mbps: i32,
         download_limit_mbps: i32,
-        tunnel_profile_id: Option<i64>,
-        check_owner_authorization: bool,
+        max_connections: i32,
+        auto_restart_minutes: i32,
         proxy_protocol: &RuleProxyProtocol,
-    ) -> Result<Option<i64>, DbError>;
-    /// Find (protocol, public_transport) for effective-combo validation, scoped.
-    async fn find_transport_by_id(
-        &self,
-        id: i64,
-        scope: &ResourceScope,
-    ) -> Result<Option<(String, String)>, DbError>;
-    /// Find device_group_out for update_rule, scoped.
+    ) -> Result<i64, DbError>;
     async fn find_device_group_out_by_id(
         &self,
         id: i64,
         scope: &ResourceScope,
     ) -> Result<Option<Option<i64>>, DbError>;
-    /// v1.2.12: apply a whole rule edit in ONE transaction, scoped: the
-    /// columns, the targets, and (on a resume) the quota and authorization
-    /// checks. Returns 0 when the rule is not in scope, 1 otherwise. Any error
-    /// leaves the rule as it was — an edit used to be written field by field,
-    /// so one that failed half-way had already changed the earlier fields.
-    ///
-    /// Errors: `QuotaExceeded` (resuming past the owner's max_rules),
-    /// `GroupNotAuthorized` (see [`RuleUpdate::check_owner_authorization`]),
-    /// `UniqueViolation` / `PortConflict` (listen port taken).
     async fn update_rule_full(
         &self,
         id: i64,
         scope: &ResourceScope,
         update: &RuleUpdate<'_>,
     ) -> Result<u64, DbError>;
-
-    /// Dynamic update of rule fields, scoped. Returns rows affected. The
-    /// scalar-column subset of [`update_rule_full`](Self::update_rule_full).
     #[allow(clippy::too_many_arguments)]
     async fn update_rule_fields(
         &self,
@@ -514,11 +218,7 @@ pub trait RuleRepository: Send + Sync {
         name: Option<&str>,
         listen_port: Option<i32>,
         protocol: Option<&str>,
-        public_transport: Option<&str>,
-        node_transport: Option<&str>,
-        entry_transport: Option<&str>,
-        route_mode: Option<&str>,
-        ws_path: Option<Option<&str>>,
+        sni: Option<Option<&str>>,
         device_group_in: Option<i64>,
         device_group_out: Option<Option<i64>>,
         forward_mode: Option<&str>,
@@ -530,11 +230,7 @@ pub trait RuleRepository: Send + Sync {
             name,
             listen_port,
             protocol,
-            public_transport,
-            node_transport,
-            entry_transport,
-            route_mode,
-            ws_path,
+            sni,
             device_group_in,
             device_group_out,
             forward_mode,
@@ -548,29 +244,20 @@ pub trait RuleRepository: Send + Sync {
         }
         self.update_rule_full(id, scope, &update).await
     }
-    /// Increment rule traffic (upload, download).
     async fn increment_rule_traffic(
         &self,
         id: i64,
         upload: u64,
         download: u64,
     ) -> Result<(), DbError>;
-    /// Find rule owner (rule_id, uid) for traffic report ownership check.
     async fn find_rule_owner(
         &self,
         rule_id: i64,
         device_group_in: i64,
     ) -> Result<Option<(i64, i64)>, DbError>;
-    /// Delete rule by id, scoped. Returns rows affected.
     async fn delete_rule(&self, id: i64, scope: &ResourceScope) -> Result<u64, DbError>;
-    /// v1.2.15: zero one rule's own traffic counter, scoped. Returns rows
-    /// affected. Only the rule's statistic: the owner's quota
-    /// (`users.traffic_used`) and the traffic history are separate and stay.
     async fn reset_rule_traffic(&self, id: i64, scope: &ResourceScope) -> Result<u64, DbError>;
-    /// Delete all rules for a user (cascade cleanup).
     async fn delete_rules_by_uid(&self, uid: i64) -> Result<u64, DbError>;
-    /// List active rules for config build (the JOIN+filter query).
-    /// This returns raw ForwardRule rows; config assembly is service-layer.
     async fn list_active_for_config(&self, group_id: i64) -> Result<Vec<ForwardRule>, DbError>;
 }
 
@@ -578,24 +265,8 @@ pub trait RuleRepository: Send + Sync {
 
 #[async_trait]
 pub trait GroupRepository: Send + Sync {
-    /// Returns all groups the caller has access to, scoped by ownership.
-    /// Non-admins see only their own groups.
     async fn list_groups(&self, scope: &ResourceScope) -> Result<Vec<DeviceGroup>, DbError>;
-    /// v0.4.12 PR1: returns a summary of ADMIN-owned `group_type = 'in'` groups,
-    /// available for ANY regular user to attach rules to — independent of
-    /// whether the user already has rules. Admins get an empty list (they manage
-    /// groups directly, not via shared infrastructure). Never includes sensitive
-    /// fields (token, uid, config, fallback_group). The companion node-status
-    /// aggregation is done in the handler layer over the `node_status:*` kvs
-    /// keys (there is NO node_status table), so it is NOT a Repository method.
-    async fn list_shared_groups(
-        &self,
-        uid: i64,
-        is_admin: bool,
-    ) -> Result<Vec<SharedGroupSummary>, DbError>;
     async fn find_by_token(&self, token: &str) -> Result<Option<DeviceGroup>, DbError>;
-    /// Look up a group by id within the scope. None = no such group OR a group
-    /// outside the caller's scope (indistinguishable → 404).
     async fn find_by_id(
         &self,
         id: i64,
@@ -615,8 +286,8 @@ pub trait GroupRepository: Send + Sync {
         uid: i64,
         connect_host: &str,
         port_range: &str,
-        rate: f64,
-        hidden: bool,
+        sni_fallback_addr: &str,
+        sni_loop_bypass_ips: &str,
     ) -> Result<(), DbError>;
     async fn find_by_token_after_insert(&self, token: &str)
         -> Result<Option<DeviceGroup>, DbError>;
@@ -629,8 +300,8 @@ pub trait GroupRepository: Send + Sync {
         group_type: Option<&str>,
         connect_host: Option<&str>,
         port_range: Option<&str>,
-        rate: Option<f64>,
-        hidden: Option<bool>,
+        sni_fallback_addr: Option<&str>,
+        sni_loop_bypass_ips: Option<&str>,
     ) -> Result<u64, DbError>;
     async fn update_group_token(
         &self,
@@ -638,32 +309,10 @@ pub trait GroupRepository: Send + Sync {
         scope: &ResourceScope,
         new_token: &str,
     ) -> Result<u64, DbError>;
-    /// v1.0.4: count how many forward_rules reference this group via
-    /// device_group_in or device_group_out (forward_rules has no
-    /// fallback_group column — that one is on device_groups and nothing
-    /// writes it). Used as a pre-delete safety check so the admin sees a clear
-    /// 409 instead of a cryptic FK violation or orphaned references.
     async fn count_rules_by_group(&self, id: i64) -> Result<i64, DbError>;
     async fn delete_group(&self, id: i64, scope: &ResourceScope) -> Result<u64, DbError>;
     async fn delete_groups_by_uid(&self, uid: i64) -> Result<u64, DbError>;
-    /// Set the panel-wide display order: the groups in `ids` get sort_order
-    /// 1..=n in that order, and any group not listed follows them, keeping its
-    /// current relative order. One transaction: an unknown id returns
-    /// `DbError::NotFound` and nothing changes. `ids` must have no duplicates
-    /// (the service layer checks).
     async fn reorder_groups(&self, ids: &[i64]) -> Result<(), DbError>;
-    /// v1.0.8: list all inbound device groups (group_type = 'in'). Used by the
-    /// purchase flow to compute the authorized set when grant_all_groups=true
-    /// — in that mode the user gains access to every inbound group, so rules
-    /// bound to inbound groups are NOT paused.
-    async fn list_all_inbound_group_ids(&self) -> Result<Vec<i64>, DbError>;
-    /// v1.0.8: resolve device-group NAMES for the given ids, for display (e.g.
-    /// the account page's "可用线路" and the shop's plan-grant hint). Unlike
-    /// `list_shared_groups`, this is NOT filtered by ownership/authorization —
-    /// callers already know the ids are safe to show to the caller (their own
-    /// authorized set, or a plan's grant set). Returned in the panel's group
-    /// display order (`sort_order`, then id), not in `ids` order.
-    async fn list_group_names_by_ids(&self, ids: &[i64]) -> Result<Vec<String>, DbError>;
 }
 
 /// The ids in `current` (already in display order) that `listed` leaves out,
@@ -677,196 +326,18 @@ pub(crate) fn unlisted_ids(current: &[(i64,)], listed: &[i64]) -> Vec<i64> {
         .collect()
 }
 
-// ── v1.0.7: per-user device-group authorization ──
-// Replaces the v1.0.4 user-permission-group layer (user → named group →
-// device-group allowlist) with a direct user ↔ device_group link plus a
-// per-user `all_device_groups` flag. Admins are always treated as all-allowed.
-
-#[async_trait]
-pub trait DeviceGroupAuthRepository: Send + Sync {
-    /// List the device-group IDs explicitly assigned to this user (the raw
-    /// `user_device_groups` rows). Does NOT expand `all_device_groups`; use
-    /// `authorized_device_group_ids` for the effective set. For the admin UI.
-    async fn list_user_device_groups(&self, user_id: i64) -> Result<Vec<i64>, DbError>;
-    /// Replace a user's explicit device-group assignments (clear + re-insert).
-    async fn set_user_device_groups(
-        &self,
-        user_id: i64,
-        device_group_ids: &[i64],
-    ) -> Result<(), DbError>;
-    /// Set the per-user `all_device_groups` flag. Returns rows affected
-    /// (0 = user not found).
-    async fn set_user_all_device_groups(&self, user_id: i64, all: bool) -> Result<u64, DbError>;
-    /// Effective set of inbound ('in') device-group IDs the user may use:
-    /// admins and `all_device_groups` users get ALL 'in' groups; everyone else
-    /// gets only their explicit assignments. Empty = cannot forward.
-    async fn authorized_device_group_ids(&self, user_id: i64) -> Result<Vec<i64>, DbError>;
-    /// v1.0.4: pause all of `user_id`'s rules whose device_group_in is NOT in
-    /// `allowed_group_ids` (the user lost authorization for that group). Rules
-    /// are paused, never deleted, so an admin can re-authorize and resume them.
-    /// An empty `allowed_group_ids` pauses ALL the user's rules. Returns the
-    /// number of rules newly paused (0 = nothing to do, skip node broadcast).
-    async fn pause_rules_outside_groups(
-        &self,
-        user_id: i64,
-        allowed_group_ids: &[i64],
-    ) -> Result<u64, DbError>;
-    /// v1.2.12: apply an admin's authorization change as ONE transaction —
-    /// the optional `all_device_groups` flag, the optional explicit group set,
-    /// then pausing the user's rules outside the resulting effective set.
-    /// Done as separate calls, a failure part-way could leave a revoked group's
-    /// rules running. Returns the number of rules newly paused.
-    async fn update_user_authorization(
-        &self,
-        user_id: i64,
-        all_device_groups: Option<bool>,
-        device_group_ids: Option<&[i64]>,
-    ) -> Result<u64, DbError>;
-    /// Whether the user is subject to device-group restriction — i.e. a
-    /// non-admin without `all_device_groups`. The rule API uses this to decide
-    /// whether to enforce the allowlist. Admins / all-device-groups users → false.
-    async fn is_user_restricted(&self, user_id: i64) -> Result<bool, DbError>;
-}
-
-// ── Tunnel Profile ──
-
-#[async_trait]
-pub trait TunnelProfileRepository: Send + Sync {
-    async fn list_profiles(&self, scope: &ProfileScope) -> Result<Vec<TunnelProfile>, DbError>;
-    async fn find_builtin_flag_by_id(
-        &self,
-        id: i64,
-        scope: &ResourceScope,
-    ) -> Result<Option<bool>, DbError>;
-    async fn find_by_name(&self, name: &str) -> Result<Option<TunnelProfile>, DbError>;
-    /// Look up a full profile row by id, scoped by builtin-ness (NOT ownership —
-    /// see [`ProfileScope`]). `None` = no such profile OR outside scope
-    /// (indistinguishable, so a caller can't tell "exists but foreign" from
-    /// "doesn't exist").
-    ///
-    /// v0.4.10 fix: the scope was previously `ResourceScope` (owner-based), but
-    /// tunnel-profile isolation is by builtin-ness per the v0.4.10 roadmap §5:
-    /// a regular user may bind ONLY builtin profiles, an admin may bind any.
-    /// The scoping decision is made by the CALLER based on the RULE OWNER's
-    /// role (not the operator's), so an admin creating a rule on behalf of a
-    /// regular user is still restricted to builtin profiles for that rule.
-    /// Internal consistency checks (e.g. protocol-vs-bound-profile validation)
-    /// and node-config builds use `ProfileScope::All` since they must resolve
-    /// the real binding without leaking existence to the user.
-    async fn find_profile_by_id(
-        &self,
-        id: i64,
-        scope: &ProfileScope,
-    ) -> Result<Option<TunnelProfile>, DbError>;
-    /// Count rules currently bound to this profile (for delete-protection),
-    /// scoped.
-    async fn count_rules_by_profile(
-        &self,
-        profile_id: i64,
-        scope: &ResourceScope,
-    ) -> Result<i64, DbError>;
-    /// List the stored protocols of rules bound to this profile (for
-    /// transport-change validation: a new transport must be compatible with
-    /// every referencing rule's protocol), scoped.
-    async fn list_rule_protocols_by_profile(
-        &self,
-        profile_id: i64,
-        scope: &ResourceScope,
-    ) -> Result<Vec<String>, DbError>;
-    #[allow(clippy::too_many_arguments)]
-    async fn insert_profile(
-        &self,
-        name: &str,
-        transport: &str,
-        tls_mode: &str,
-        ws_path: &str,
-        host_header: &str,
-        sni: &str,
-        uid: i64,
-    ) -> Result<(), DbError>;
-    #[allow(clippy::too_many_arguments)]
-    async fn update_profile_fields(
-        &self,
-        id: i64,
-        scope: &ResourceScope,
-        name: Option<&str>,
-        transport: Option<&str>,
-        tls_mode: Option<&str>,
-        ws_path: Option<&str>,
-        host_header: Option<&str>,
-        sni: Option<&str>,
-    ) -> Result<u64, DbError>;
-    async fn delete_profile(&self, id: i64, scope: &ResourceScope) -> Result<u64, DbError>;
-}
-
 // ── Traffic (atomic batch) ──
 
-/// Outcome of a traffic batch.
-///
-/// SECURITY (v0.4.9): the per-entry result deliberately does NOT distinguish
-/// "rule doesn't exist" from "rule belongs to another group". A node holding a
-/// valid group token could otherwise enumerate rule_ids and tell, from the
-/// response, whether a given id exists in another group (a rule-id existence
-/// oracle). Both cases now produce `Unavailable`, which the caller maps to a
-/// single uniform 403 with a generic message. The specific reason (missing vs
-/// foreign) is logged server-side only.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrafficEntryResult {
-    /// The batch was applied successfully.
     Ok,
-    /// At least one entry referenced a rule that is NOT available to this node
-    /// — either it does not exist, or it belongs to a different group. The
-    /// whole batch is rolled back; the caller returns a uniform 403. The
-    /// real rule_id / reason are logged, never returned to the node.
     Unavailable,
-    /// At least one entry would overflow an i64 traffic counter (per-rule
-    /// cumulative, per-user cumulative, or existing value + delta). The whole
-    /// batch is rolled back; the caller returns a uniform 400.
     Overflow,
-    /// v1.2.12: this batch id was already applied — the node re-sent a batch
-    /// whose acknowledgement it never received. Nothing is written; the caller
-    /// acknowledges it again so the node can move on.
     AlreadyApplied,
 }
 
 #[async_trait]
 pub trait TrafficRepository: Send + Sync {
-    /// Apply a batch of traffic entries atomically in ONE transaction.
-    ///
-    /// Contract (v0.4.9 hardened):
-    ///   - Ownership is checked with a SINGLE query
-    ///     `SELECT id, uid FROM forward_rules WHERE id = ? AND device_group_in = ?`.
-    ///     A miss (rule missing OR foreign) → `Unavailable`; the whole batch is
-    ///     rolled back. There is NO second "does this id exist elsewhere?"
-    ///     query — that was the rule-id existence oracle.
-    ///   - Duplicate rule_ids in one batch are AGGREGATED first (summed), so
-    ///     the per-rule overflow check sees the batch's true cumulative delta.
-    ///   - Overflow is checked with checked arithmetic for: each rule's
-    ///     (existing traffic_used + batch delta) and each user's
-    ///     (existing traffic_used + sum of their rules' deltas). Any overflow →
-    ///     `Overflow`, whole batch rolled back.
-    ///   - upload/download arrive as u64 but are converted to i64 with an
-    ///     overflow guard (values > i64::MAX are rejected before any write).
-    ///   - On any rejection the transaction is rolled back — NO partial update
-    ///     of rules or users.
-    ///
-    /// Returns `Ok(vec![result])` even on the rejected paths (the single
-    /// result element tells the caller which rejection happened); `Err` only
-    /// for a genuine DB failure.
-    ///
-    /// v1.2.12: with a `batch_id`, the batch is applied at most once per
-    /// group. The id is recorded in the same transaction as the traffic, and
-    /// checked BEFORE the rules are: a re-sent batch that was already applied
-    /// returns `AlreadyApplied` and writes nothing, even if one of its rules
-    /// has since been deleted (rejecting it would make the node re-send the
-    /// other rules' bytes under a new id). A rejected batch leaves no record,
-    /// so the node can send its bytes again.
-    ///
-    /// `acked_batch_id` is the node's previous batch, which it saw
-    /// acknowledged and will never send again: its record is marked confirmed
-    /// in the same transaction. Not deleted — a copy the node already gave up
-    /// on may still arrive — but swept sooner (see `prune_traffic_batches`).
-    /// Ignored without a `batch_id`, and when it names this batch itself.
     async fn apply_traffic_batch_with_id(
         &self,
         group_id: i64,
@@ -875,8 +346,6 @@ pub trait TrafficRepository: Send + Sync {
         entries: &[TrafficEntry],
     ) -> Result<Vec<TrafficEntryResult>, DbError>;
 
-    /// A batch without an id (nodes before v1.2.6 send none): applied as is,
-    /// with no re-send protection.
     async fn apply_traffic_batch(
         &self,
         group_id: i64,
@@ -886,26 +355,12 @@ pub trait TrafficRepository: Send + Sync {
             .await
     }
 
-    /// v1.2.12: forget applied batch ids — confirmed before `confirmed_before`,
-    /// or recorded before `recorded_before` whether confirmed or not (both
-    /// `YYYY-MM-DD HH:MM:SS` UTC). Returns rows deleted.
     async fn prune_traffic_batches(
         &self,
         confirmed_before: &str,
         recorded_before: &str,
     ) -> Result<u64, DbError>;
 
-    // ── v1.2.0: hourly traffic history ──
-
-    /// Aggregated history buckets, oldest first.
-    ///
-    /// `since` is an inclusive 'YYYY-MM-DD HH:00:00' UTC lower bound. `daily`
-    /// collapses hour rows into per-day buckets ('YYYY-MM-DD') — a 30-day
-    /// hourly series is 720 points of noise, so 7d/30d views aggregate by day.
-    ///
-    /// `uid = None` means all users (admin); `rule_id = None` means all rules.
-    /// The API layer is responsible for forcing `uid = Some(caller)` on
-    /// non-admins — this layer trusts its arguments.
     async fn query_traffic_history(
         &self,
         uid: Option<i64>,
@@ -914,39 +369,20 @@ pub trait TrafficRepository: Send + Sync {
         daily: bool,
     ) -> Result<Vec<TrafficHistoryBucket>, DbError>;
 
-    /// Delete rows with `hour_ts < cutoff`. Returns rows deleted. Called by
-    /// the retention sweeper; the table has no FK so this is the ONLY way rows
-    /// die.
     async fn prune_traffic_history(&self, cutoff: &str) -> Result<u64, DbError>;
 
-    /// v1.2.4: fold one status report into the node's hourly metrics bucket.
-    ///
-    /// Called on every report (~10s), so it must be a single UPSERT: sums and
-    /// the sample count accumulate, the maxima take whichever is larger. The
-    /// average is derived at read time from sum/samples so it stays exact
-    /// instead of drifting through repeated incremental updates.
     async fn record_node_metrics(&self, m: &NodeMetricSample) -> Result<(), DbError>;
 
-    /// Hourly (or daily, when `daily`) metric series per node since `since`.
-    /// Admin-only data — this layer trusts its arguments.
     async fn query_node_metrics(
         &self,
         since: &str,
         daily: bool,
     ) -> Result<Vec<NodeMetricBucket>, DbError>;
 
-    /// Delete rows with `hour_ts < cutoff`. Returns rows deleted. Same
-    /// contract as prune_traffic_history — no FK, so this is the only way
-    /// rows die.
     async fn prune_node_metrics(&self, cutoff: &str) -> Result<u64, DbError>;
 
-    /// v1.2.4: append one audit entry. Best-effort at the call site — see
-    /// service::audit for why a failure here must not undo the operation that
-    /// was just performed.
     async fn record_audit(&self, e: &NewAuditEntry) -> Result<(), DbError>;
 
-    /// Most recent entries first. `action` filters to one action when given.
-    /// Admin-only data — this layer trusts its arguments.
     async fn query_audit_log(
         &self,
         action: Option<&str>,
@@ -954,32 +390,24 @@ pub trait TrafficRepository: Send + Sync {
         offset: i64,
     ) -> Result<Vec<AuditEntry>, DbError>;
 
-    /// Total matching rows, for pagination.
     async fn count_audit_log(&self, action: Option<&str>) -> Result<i64, DbError>;
 
-    /// Delete entries older than `cutoff`. The retention sweeper is the only
-    /// thing that removes them.
     async fn prune_audit_log(&self, cutoff: &str) -> Result<u64, DbError>;
 }
 
-/// v1.2.4: one site announcement.
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct Announcement {
     pub id: i64,
     pub title: String,
     pub content: String,
-    /// "info" | "success" | "warning" | "error".
     pub kind: String,
     pub pinned: bool,
     pub published_at: String,
-    /// None = never auto-hides.
     pub expires_at: Option<String>,
     pub author_id: Option<i64>,
-    /// Snapshot of who posted it — survives deletion of that admin account.
     pub author_name: String,
 }
 
-/// The writable half, for create and update.
 #[derive(Debug, Clone)]
 pub struct NewAnnouncement {
     pub title: String,
@@ -992,19 +420,12 @@ pub struct NewAnnouncement {
     pub author_name: String,
 }
 
-// ── Announcements (v1.2.4) ──
+// ── Announcements ──
 
 #[async_trait]
 pub trait AnnouncementRepository: Send + Sync {
-    /// The notice the banner shows, or None.
-    ///
-    /// Pinned first, then newest, with expired rows excluded. `now` is passed
-    /// in rather than read here so one clock decides and tests can pin it.
     async fn active_announcement(&self, now: &str) -> Result<Option<Announcement>, DbError>;
 
-    /// History, newest first. `include_expired` is what separates the user's
-    /// archive (true — reading old notices is the point) from callers that
-    /// only want live ones.
     async fn list_announcements(
         &self,
         include_expired: bool,
@@ -1019,39 +440,24 @@ pub trait AnnouncementRepository: Send + Sync {
 
     async fn create_announcement(&self, a: &NewAnnouncement) -> Result<i64, DbError>;
 
-    /// Returns rows affected: 0 = no such id.
     async fn update_announcement(&self, id: i64, a: &NewAnnouncement) -> Result<u64, DbError>;
 
     async fn delete_announcement(&self, id: i64) -> Result<u64, DbError>;
 
-    /// Highest announcement id, or 0 when there are none.
-    ///
-    /// Drives the header bell's unread dot: the client stores the id it last
-    /// looked at and compares. Deliberately the id and not a timestamp —
-    /// editing an old notice must not re-notify everyone, and only a new row
-    /// raises the maximum.
     async fn latest_announcement_id(&self) -> Result<i64, DbError>;
 }
 
-/// An audit entry being written.
-///
-/// `detail` MUST NOT contain secrets. Record that a token was rotated, never
-/// the token; that notification settings changed, never the credentials.
 #[derive(Debug, Clone)]
 pub struct NewAuditEntry {
     pub ts: String,
-    /// None for actions with no authenticated actor (system/scheduler).
     pub actor_id: Option<i64>,
-    /// Snapshot of the actor's username — survives deletion of the account.
     pub actor_name: String,
     pub action: String,
     pub target_type: String,
-    /// TEXT because targets are not uniformly numeric (rule id vs node id).
     pub target_id: String,
     pub detail: String,
 }
 
-/// An audit entry being read back.
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct AuditEntry {
     pub id: i64,
@@ -1064,27 +470,21 @@ pub struct AuditEntry {
     pub detail: String,
 }
 
-/// One status report, reduced to the fields the history keeps.
 #[derive(Debug, Clone)]
 pub struct NodeMetricSample {
     pub node_id: String,
     pub group_id: i64,
-    /// 'YYYY-MM-DD HH:00:00' UTC — the bucket this sample lands in.
     pub hour_ts: String,
     pub cpu: f64,
     pub mem: f64,
     pub connections: i64,
 }
 
-/// One point of the node-metric series, per (bucket, node).
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct NodeMetricBucket {
-    /// 'YYYY-MM-DD HH:00:00' (hourly) or 'YYYY-MM-DD' (daily), UTC.
     pub bucket: String,
     pub node_id: String,
     pub group_id: i64,
-    /// The group's name at query time, or "#id" once the group is deleted —
-    /// resolved in SQL so the chart legend needs no second round trip.
     pub group_name: String,
     pub cpu_avg: f64,
     pub cpu_max: f64,
@@ -1094,22 +494,13 @@ pub struct NodeMetricBucket {
     pub conn_max: i64,
 }
 
-/// One point of the traffic-history series, per (bucket, line).
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow, serde::Serialize)]
 pub struct TrafficHistoryBucket {
-    /// 'YYYY-MM-DD HH:00:00' (hourly) or 'YYYY-MM-DD' (daily), UTC.
     pub bucket: String,
-    /// v1.2.0: the inbound device group (line) this slice belongs to. 0 =
-    /// unknown — pre-column history whose rule has since been deleted, so the
-    /// attribution is unrecoverable.
     pub group_id: i64,
-    /// The group's name at query time, or "#id" once the group is deleted.
-    /// Resolved in SQL so the chart legend needs no second round trip.
     pub group_name: String,
     pub real_upload: i64,
     pub real_download: i64,
-    /// What was actually charged against quota in this bucket — the chart's
-    /// primary series, so it can never disagree with the quota numbers.
     pub billed_total: i64,
 }
 
@@ -1136,342 +527,16 @@ pub trait StatisticsRepository: Send + Sync {
     ) -> Result<Vec<Statistic>, DbError>;
 }
 
-// ── Plan ──
-
-#[async_trait]
-pub trait PlanRepository: Send + Sync {
-    async fn list_plans(&self) -> Result<Vec<Plan>, DbError>;
-    /// v1.0.8: plans visible to regular users for self-purchase (hidden = 0).
-    async fn list_visible_plans(&self) -> Result<Vec<Plan>, DbError>;
-    /// Look up a plan's name by id. None = no such plan. Used by /user/me to
-    /// project the user's plan_id into a human-readable plan_name without
-    /// exposing other plan columns.
-    async fn find_plan_name_by_id(&self, id: i64) -> Result<Option<String>, DbError>;
-    /// v1.0.8: fetch a full plan row by id (for purchase validation). None =
-    /// no such plan (or hidden, when buying — gated by the caller).
-    async fn find_plan_by_id(&self, id: i64) -> Result<Option<Plan>, DbError>;
-    /// v1.0.8: create a plan. Returns the new row's id.
-    #[allow(clippy::too_many_arguments)]
-    async fn insert_plan(
-        &self,
-        name: &str,
-        max_rules: i32,
-        traffic: i64,
-        price: &str,
-        plan_type: &str,
-        duration_days: i32,
-        hidden: bool,
-        reset_traffic: bool,
-        description: &str,
-        grant_all_groups: bool,
-    ) -> Result<i64, DbError>;
-    /// v1.0.9: insert a plan AND its device-group grant set in ONE transaction,
-    /// so a failure mid-way can't leave a plan row with no grants (the two-call
-    /// insert_plan + set_plan_device_groups sequence could). Returns the new id.
-    #[allow(clippy::too_many_arguments)]
-    async fn create_plan_with_groups(
-        &self,
-        name: &str,
-        max_rules: i32,
-        traffic: i64,
-        price: &str,
-        plan_type: &str,
-        duration_days: i32,
-        hidden: bool,
-        reset_traffic: bool,
-        description: &str,
-        grant_all_groups: bool,
-        device_group_ids: &[i64],
-    ) -> Result<i64, DbError>;
-    /// v1.0.8: update a plan's mutable fields. Returns rows affected (0 = not
-    /// found). speed_limit/ip_limit are intentionally NOT updatable here
-    /// (placeholders, never enforced) to keep the API surface minimal.
-    #[allow(clippy::too_many_arguments)]
-    async fn update_plan_fields(
-        &self,
-        id: i64,
-        name: Option<&str>,
-        max_rules: Option<i32>,
-        traffic: Option<i64>,
-        price: Option<&str>,
-        plan_type: Option<&str>,
-        duration_days: Option<i32>,
-        hidden: Option<bool>,
-        reset_traffic: Option<bool>,
-        description: Option<&str>,
-        grant_all_groups: Option<bool>,
-    ) -> Result<u64, DbError>;
-    /// v1.0.8: delete a plan. Returns rows affected (0 = not found).
-    async fn delete_plan(&self, id: i64) -> Result<u64, DbError>;
-    /// v1.0.8: count users whose plan_id points at this plan. Used as a
-    /// pre-delete safety check (count > 0 → 409).
-    async fn count_users_on_plan(&self, plan_id: i64) -> Result<i64, DbError>;
-
-    /// v1.0.9: list the device-group ids this plan grants on purchase.
-    async fn list_plan_device_groups(&self, plan_id: i64) -> Result<Vec<i64>, DbError>;
-    /// v1.0.9: REPLACE the plan's grant set (delete-then-insert, deduped). Used
-    /// by the admin create/update plan handlers.
-    async fn set_plan_device_groups(
-        &self,
-        plan_id: i64,
-        device_group_ids: &[i64],
-    ) -> Result<(), DbError>;
-
-    /// v1.0.8: atomically purchase a plan in ONE transaction (防双花):
-    ///   - lock + read the user's balance
-    ///   - refuse if balance < price_cents (returns `BuyPlanError::InsufficientBalance`)
-    ///   - balance -= price_cents, traffic_limit += traffic_to_add
-    ///   - max_rules = plan_max_rules, plan_id = plan_id
-    ///   - reset traffic_used to 0 when `reset_traffic`
-    ///   - plan_expire_at = max(now, current expiry) + duration_days (NULL when duration_days=0)
-    ///   - insert an orders row (snapshots plan_name + price)
-    ///   - v1.0.9: grant device groups in the SAME tx. v1.0.8: purchase REPLACES
-    ///     authorization — when `grant_all_groups` set all_device_groups=1 (and
-    ///     clear explicit rows); else reset all_device_groups=0 and replace
-    ///     user_device_groups with the plan's `device_group_ids`. Rules bound to
-    ///     groups outside `new_authorized_group_ids` are paused in the same tx.
-    /// All on the same tx handle so a concurrent purchase can't double-spend.
-    /// `price_cents` / `traffic_to_add` / `plan_max_rules` / `duration_days` are
-    /// resolved by the caller from the plan row (and re-checked hidden=0 there),
-    /// so this method trusts them and only owns the atomic money + bookkeeping.
-    #[allow(clippy::too_many_arguments)]
-    async fn buy_plan(
-        &self,
-        user_id: i64,
-        plan_id: i64,
-        plan_name: &str,
-        price_cents: i64,
-        traffic_to_add: i64,
-        plan_max_rules: i32,
-        duration_days: i32,
-        reset_traffic: bool,
-        grant_all_groups: bool,
-        device_group_ids: &[i64],
-        // v1.0.8: the NEW authorized group set AFTER purchase. Used inside the
-        // transaction to pause rules outside this set (replacement semantics).
-        // Computed by the caller: all inbound groups if grant_all_groups, else
-        // device_group_ids (the plan's grants).
-        new_authorized_group_ids: &[i64],
-    ) -> Result<(), BuyPlanError>;
-}
-
-/// v1.2.0: redeem codes (balance top-up). Its own trait rather than more
-/// methods on `PlanRepository` — a code isn't a plan, and the existing repo
-/// layer is already split by concern.
-#[async_trait]
-pub trait RedeemRepository: Send + Sync {
-    /// Insert a generated batch in ONE transaction. Returns how many rows
-    /// landed. A duplicate `code` (astronomically unlikely, but possible) is
-    /// skipped rather than failing the whole batch — an admin asking for 100
-    /// codes would rather get 99 than an error.
-    async fn create_redeem_codes(&self, codes: &[NewRedeemCode]) -> Result<u64, DbError>;
-
-    /// Redeem `code` for `user_id`, crediting the balance ATOMICALLY.
-    ///
-    /// The whole thing is one transaction, and the code is claimed with a
-    /// CONDITIONAL update (`WHERE status = 'unused'`) whose affected-row count
-    /// is checked. That combination is what makes a double-redeem impossible:
-    /// two concurrent requests for the same code both try the update, exactly
-    /// one sees `rows_affected == 1`, and the loser's transaction rolls back
-    /// without touching the balance.
-    ///
-    /// `now` is passed in (not read from the clock here) so expiry is evaluated
-    /// against the same instant the caller used, and so tests can pin it.
-    ///
-    /// Returns the credited amount and the user's NEW balance, both canonical
-    /// strings, for the success message.
-    async fn redeem_code(
-        &self,
-        code: &str,
-        user_id: i64,
-        now: &str,
-    ) -> Result<(String, String), RedeemCodeError>;
-
-    /// v1.2.4: the codes a given user redeemed, newest first.
-    ///
-    /// Separate from `list_redeem_codes` rather than another filter on it: this
-    /// one is reachable by a NON-admin (their own account page), so the uid
-    /// filter must be structural, not one more optional field that a future
-    /// caller could forget to set.
-    async fn list_redeem_codes_by_user(
-        &self,
-        user_id: i64,
-    ) -> Result<Vec<relay_shared::models::RedeemCode>, DbError>;
-
-    /// List codes for the admin UI, newest first.
-    async fn list_redeem_codes(
-        &self,
-        filter: &RedeemCodeFilter,
-    ) -> Result<Vec<relay_shared::models::RedeemCode>, DbError>;
-
-    /// Count codes matching a filter (for pagination + batch summaries).
-    async fn count_redeem_codes(&self, filter: &RedeemCodeFilter) -> Result<i64, DbError>;
-
-    /// Void an UNUSED code so it can never be redeemed. Returns rows affected;
-    /// 0 means it was already used or voided. A used code is never voidable —
-    /// the money already moved, and rewriting that row would falsify the audit
-    /// trail.
-    async fn void_redeem_code(&self, id: i64) -> Result<u64, DbError>;
-
-    /// Delete codes that were never used. Returns rows deleted.
-    ///
-    /// Deliberately refuses to delete `used` rows: they are the record of money
-    /// entering the system. Cleaning up a mis-generated batch is legitimate;
-    /// erasing a redemption is not.
-    async fn delete_unused_redeem_codes(&self, ids: &[i64]) -> Result<u64, DbError>;
-}
-
-/// v1.0.8: errors from the atomic purchase transaction.
-#[derive(Debug)]
-pub enum BuyPlanError {
-    /// User balance < plan price. Caller → 400.
-    InsufficientBalance,
-    /// DB error. Caller → 500.
-    Database(DbError),
-}
-
-impl From<DbError> for BuyPlanError {
-    fn from(e: DbError) -> Self {
-        BuyPlanError::Database(e)
-    }
-}
-
-/// v1.2.0: outcome of redeeming a top-up code.
-#[derive(Debug)]
-pub enum RedeemCodeError {
-    /// No such code, already used, or voided. ONE variant on purpose — see
-    /// `models::RedeemError::NotRedeemable`: distinguishing "doesn't exist"
-    /// from "already used" tells a stranger which guesses were real codes.
-    NotRedeemable,
-    /// Exists and unused, but past `expires_at`.
-    Expired,
-    /// Crediting would exceed `money::MAX_BALANCE_CENTS`.
-    BalanceOverflow,
-    /// DB error. Caller → 500.
-    Database(DbError),
-}
-
-impl From<DbError> for RedeemCodeError {
-    fn from(e: DbError) -> Self {
-        RedeemCodeError::Database(e)
-    }
-}
-
-impl From<sqlx::Error> for RedeemCodeError {
-    fn from(e: sqlx::Error) -> Self {
-        RedeemCodeError::Database(DbError::from(e))
-    }
-}
-
-/// v1.2.0: one code to insert in a generation batch. `code` is the STORED form
-/// (no dashes, upper-case); `amount` is a canonical balance string.
-#[derive(Debug, Clone)]
-pub struct NewRedeemCode {
-    pub code: String,
-    pub amount: String,
-    pub expires_at: Option<String>,
-    pub batch_id: String,
-    pub remark: String,
-}
-
-/// v1.2.0: filter for listing codes in the admin UI.
-#[derive(Debug, Clone, Default)]
-pub struct RedeemCodeFilter {
-    /// "unused" | "used" | "void"; None = all.
-    pub status: Option<String>,
-    pub batch_id: Option<String>,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-impl From<sqlx::Error> for BuyPlanError {
-    fn from(e: sqlx::Error) -> Self {
-        BuyPlanError::Database(DbError::from(e))
-    }
-}
-
-// ── App settings (registration config) ──
-
-/// The registration settings row (always id=1 in app_settings).
-/// v0.4.21 PR2: added allowed_plan_ids for multi-plan registration support.
-#[derive(Debug, Clone, Serialize)]
-pub struct RegistrationSettings {
-    pub registration_enabled: bool,
-    pub default_registration_plan_id: i64,
-    pub allowed_plan_ids: Vec<i64>,
-}
-
-/// v0.4.10 PR3: registration settings stored in the `app_settings` single-row
-/// table (NOT env vars, NOT kvs). The env var REGISTRATION_ENABLED only seeds
-/// the row once on first boot via [`insert_settings_if_absent`]; after that
-/// the admin owns the value via PUT /admin/settings/registration and the env
-/// var is never consulted again.
-#[async_trait]
-pub trait SettingsRepository: Send + Sync {
-    /// Read the registration settings row. `None` = the row hasn't been seeded
-    /// yet (fresh DB before main.rs's first insert_settings_if_absent pass).
-    async fn get_registration_settings(&self) -> Result<Option<RegistrationSettings>, DbError>;
-    /// Atomically insert the settings row ONLY if it does not already exist.
-    /// If a row is present this is a no-op (the env-var seed value is NOT
-    /// applied over an admin-configured row). This is the sole path by which
-    /// REGISTRATION_ENABLED enters the database.
-    async fn insert_settings_if_absent(
-        &self,
-        enabled: bool,
-        default_plan_id: i64,
-        allowed_plan_ids: &[i64],
-    ) -> Result<(), DbError>;
-    /// Atomic upsert (INSERT ... ON CONFLICT DO UPDATE). Used by the admin
-    /// PUT endpoint: creates the row if missing, overwrites if present, with
-    /// no observable intermediate state under concurrent admin requests.
-    async fn set_registration_settings(
-        &self,
-        enabled: bool,
-        default_plan_id: i64,
-        allowed_plan_ids: &[i64],
-    ) -> Result<(), DbError>;
-}
-
 // ── Aggregate ──
 
-/// v1.0.8: purchase-order history.
-#[async_trait]
-pub trait OrderRepository: Send + Sync {
-    /// List a user's orders, newest first.
-    async fn list_orders_by_user(&self, user_id: i64) -> Result<Vec<Order>, DbError>;
-    /// v1.2.4: every user's orders, newest first, for the admin view.
-    ///
-    /// Paginated rather than returning the lot: this table only grows, and the
-    /// per-user list it sits beside is naturally small enough not to need it.
-    async fn list_all_orders(&self, limit: i64, offset: i64) -> Result<Vec<Order>, DbError>;
-    async fn count_all_orders(&self) -> Result<i64, DbError>;
-    /// Insert an order row (snapshots plan_name + price). Used inside the
-    /// purchase transaction.
-    async fn insert_order(
-        &self,
-        user_id: i64,
-        plan_id: Option<i64>,
-        plan_name: &str,
-        price: &str,
-    ) -> Result<(), DbError>;
-}
-
-/// The aggregate repository trait. Handlers depend on `Arc<dyn Repository>`
-/// and get access to all domain-specific methods.
 #[async_trait]
 pub trait Repository:
     UserRepository
     + RuleRepository
     + GroupRepository
-    + DeviceGroupAuthRepository
-    + TunnelProfileRepository
     + TrafficRepository
     + KvsRepository
     + StatisticsRepository
-    + PlanRepository
-    + SettingsRepository
-    + OrderRepository
-    + RedeemRepository
     + AnnouncementRepository
     + Send
     + Sync

@@ -110,7 +110,7 @@ fi
 #               28 = too slow / timed out)
 info() { echo "[INFO] $*"; }
 warn() { echo "[WARN] $*"; }
-REPO="MoeShinX/relay-panel"
+REPO="nfft894htno32/relay-panel"
 PROXY=""
 eval "$(grep -E '^(GH_PREFIXES=|TRUSTED_MIRRORS=|PREFERRED_MIRROR=|MAX_BINARY_BYTES=|MAX_SMALL_BYTES=|GH_LABELS=|EXPECTED_SHA256=)' "$INSTALLER")"
 
@@ -169,9 +169,9 @@ urls() { tr '\n' ' ' < "$CURL_LOG" | sed 's/ $//'; }
 
 ELF=$'\x7fELF fake program bytes'
 SHA="$(printf 'ab%.0s' $(seq 1 32))"
-API="https://api.github.com/repos/MoeShinX/relay-panel/releases?per_page=30"
-RAW="https://raw.githubusercontent.com/MoeShinX/relay-panel/main/crates/node/Cargo.toml"
-BIN="https://github.com/MoeShinX/relay-panel/releases/download/node-v1.2.9/relay-node-linux-amd64"
+API="https://api.github.com/repos/nfft894htno32/relay-panel/releases?per_page=30"
+RAW="https://raw.githubusercontent.com/nfft894htno32/relay-panel/main/crates/node/Cargo.toml"
+BIN="https://github.com/nfft894htno32/relay-panel/releases/download/node-v1.2.9/relay-node-linux-amd64"
 D="https://down.relaypanel.dev/"; G="https://gh-proxy.com/"; F="https://ghfast.top/"
 
 # the list itself
@@ -412,7 +412,7 @@ GENUINE_SHA="$(sha256sum "$GENUINE" | awk '{ print $1 }')"
 TAMPERED_SHA="$(sha256sum "$TAMPERED" | awk '{ print $1 }')"
 printf '%s  relay-node-linux-amd64\n' "$GENUINE_SHA" > "$TMP/genuine.sha256"
 printf '%s  relay-node-linux-amd64\n' "$TAMPERED_SHA" > "$TMP/tampered.sha256"
-BIN="https://github.com/MoeShinX/relay-panel/releases/download/node-v1.2.9/relay-node-linux-amd64"
+BIN="https://github.com/nfft894htno32/relay-panel/releases/download/node-v1.2.9/relay-node-linux-amd64"
 
 # routes: lines of "<url>TAB<action>"; anything not listed -> curl exit 7
 set_routes() { : > "$FAKE_ROUTES"; local u a; while [ $# -ge 2 ]; do printf '%s\t%s\n' "$1" "$2" >> "$FAKE_ROUTES"; shift 2; done; }

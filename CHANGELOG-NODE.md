@@ -13,6 +13,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-03
+
+Ships alongside panel 1.3.0. Adds native TLS ClientHello SNI multiplexing and automatic anti-loop fallback.
+
+### Added
+
+- **Native multi-SNI routing on shared TCP ports**: Inspects inbound TLS ClientHello handshakes to route traffic by SNI hostname (exact and wildcard matching) while preserving zero-copy splice() forwarding, per-rule rate limiting, connection caps, traffic accounting, and Proxy Protocol headers.
+- **Automatic anti-loop detection & fallback (127.0.0.1:10443)**: Connections from loopback, the node's own public IPs, any rule target IP on the shared port, or configured sni_loop_bypass_ips — as well as non-TLS or unmatched SNI traffic — are automatically forwarded to sni_fallback_addr.
+
+### Fixed
+
+- **WebSocket control channel stays connected on config_changed**: Applying a pushed config update no longer disconnects and reconnects the WebSocket session or resets live rate sampling.
+- **Preserved local config cache on 401/403**: Poller no longer overwrites config-cache.json if the panel rejects authentication.
+
 ## [1.2.11] - 2026-11-02
 
 Runs against any current panel (still protocol version 4). Upgrade only if you

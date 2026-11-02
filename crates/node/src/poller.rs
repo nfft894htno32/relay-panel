@@ -27,13 +27,29 @@ pub enum FetchResult {
     Transient,
 }
 
+use std::sync::OnceLock;
+
+/// Shared HTTP client for panel API calls (`poller`, `reporter`, `diagnose`).
+/// Reusing one client preserves the TLS root store and HTTP keep-alive pool.
+pub fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .tcp_keepalive(std::time::Duration::from_secs(60))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
 pub async fn fetch_config(config: &NodeConfig) -> FetchResult {
     let url = format!("{}/api/v1/node/config", config.panel_url);
-    let client = reqwest::Client::new();
+    let client = http_client();
 
     let resp = match client
         .get(&url)
         .header("Authorization", format!("Bearer {}", config.token))
+        .header("X-Node-Token", &config.token)
         // v0.4.0: send our config-protocol version so the panel can refuse to
         // send config we can't deserialize (keeps old nodes on their cached
         // config instead of crashing on unknown fields/enum variants).
@@ -63,6 +79,13 @@ pub async fn fetch_config(config: &NodeConfig) -> FetchResult {
             CONFIG_PROTOCOL_VERSION
         );
         return FetchResult::ProtocolMismatch;
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        tracing::error!(
+            status = %status,
+            "fetch_config: node token rejected by panel (401/403); keeping cached config and running listeners"
+        );
+        return FetchResult::Transient;
     }
     if !status.is_success() {
         tracing::warn!(status = %status, "fetch_config: non-2xx response; keeping cached config");

@@ -1,68 +1,15 @@
-//! Rule + shared rule/group/profile validation service.
-//!
-//! Houses the pure, DB-agnostic validators shared by the rule, group and
-//! profile handlers (protocol/transport rules, target normalization, port
-//! auto-assignment) plus the `create_rule` / `update_rule` business flows.
-//! Extracted from `api/admin` so the validation lives behind the `Repository`
-//! trait and is unit-testable without the HTTP layer.
+//! Rule + shared rule/group validation service.
 
 use crate::db::error::DbError;
-use crate::db::repo::{GroupRepository, ProfileScope, Repository, ResourceScope, RuleUpdate};
+use crate::db::repo::{GroupRepository, Repository, ResourceScope, RuleUpdate};
 use relay_shared::protocol::{
-    CreateRuleRequest, GroupType, Protocol, ProxyProtocolVersion, PublicTransport,
-    RuleTargetRequest, UpdateRuleRequest,
+    CreateRuleRequest, GroupType, Protocol, ProxyProtocolVersion, RuleTargetRequest,
+    UpdateRuleRequest,
 };
 
-/// v0.4.20: forward_mode is locked to "direct" at the API boundary
-/// (create_rule / update_rule reject group/chain). This validator is retained
-/// for potential future re-enablement and for config-generation compatibility.
 #[allow(dead_code)]
 pub fn validate_forward_mode(mode: &str) -> bool {
     matches!(mode, "group" | "direct")
-}
-
-/// Is `transport` accepted by the admin API in the current release?
-///
-/// WS/TLS ingress was retired in node v1.0.8. Reject it before persisting
-/// a rule that the node cannot serve. Legacy records remain readable.
-///
-/// Single source of truth for "what public_transport values may a rule store" —
-/// both create_rule and update_rule call this so they can't drift.
-pub fn is_public_transport_accepted(transport: PublicTransport) -> bool {
-    matches!(transport, PublicTransport::Raw)
-}
-
-const RETIRED_TRANSPORT_ERROR: &str =
-    "public_transport: WS/TLS ingress is retired; use 'raw' and clear tunnel_profile_id";
-
-/// Validate the protocol × public_transport combination for v0.4.0.
-///
-/// Two symmetric constraints (a rule must satisfy BOTH):
-///   (a) any UDP-bearing protocol (udp OR tcp_udp) ⇒ transport must be Raw
-///       (WS/WSS are TCP-only).
-///   (b) WS/WSS transport ⇒ protocol must be TCP (WS carries TCP only).
-///
-/// Pure function (no DB) so create_rule and update_rule can both resolve their
-/// EFFECTIVE protocol/transport strings and call this. Returns Some(error_msg)
-/// when the combination is invalid.
-///
-/// `protocol` / `transport` are the stable DB strings ("tcp"|"udp"|"tcp_udp" and
-/// "raw"|"ws"|"wss"|"tls_simple"). Unknown values are not rejected here —
-/// they're handled by their own field validation.
-pub fn validate_protocol_transport(protocol: &str, transport: &str) -> Option<&'static str> {
-    // WS and TLS Simple are TCP-only transports.
-    if (transport == "ws" || transport == "tls_simple") && protocol != "tcp" {
-        return Some(
-            "This transport (ws/tls_simple) currently carries TCP forwarding only; \
-             UDP / TCP+UDP are not supported.",
-        );
-    }
-    // any UDP-bearing protocol (udp OR tcp_udp) ⇒ transport must be Raw.
-    let is_udp_bearing = matches!(protocol, "udp" | "tcp_udp");
-    if is_udp_bearing && transport != "raw" {
-        return Some("UDP rules only support 'raw' transport");
-    }
-    None
 }
 
 /// Map Protocol enum to stable DB string.
@@ -86,127 +33,57 @@ pub fn is_plausible_target_host(host: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
 }
 
-/// Parse a host the way glibc `inet_aton` does, so the shorthand forms that
-/// `getaddrinfo` accepts (`127.1`, `2130706433`, `0x7f000001`, `0177.0.0.1`,
-/// `017700000001`) are recognised. 1 to 4 dot-separated parts, each decimal,
-/// `0x` hexadecimal or `0`-prefixed octal; the last part fills all remaining
-/// bytes. Anything else (a normal domain, an empty part, too many parts, an
-/// out-of-range part) is `None`.
-fn parse_inet_aton(host: &str) -> Option<std::net::Ipv4Addr> {
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() > 4 {
-        return None;
-    }
-    let mut vals = Vec::with_capacity(parts.len());
-    for p in &parts {
-        if p.is_empty() {
-            return None;
-        }
-        let v = if let Some(hex) = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")) {
-            if hex.is_empty() {
-                0
-            } else {
-                u64::from_str_radix(hex, 16).ok()?
-            }
-        } else if p.len() > 1 && p.starts_with('0') {
-            u64::from_str_radix(&p[1..], 8).ok()?
-        } else {
-            if !p.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            p.parse::<u64>().ok()?
-        };
-        vals.push(v);
-    }
-    let (last, head) = vals.split_last()?;
-    if head.iter().any(|&v| v > 255) {
-        return None;
-    }
-    let last_max: u64 = 1u64 << (8 * (5 - parts.len() as u32));
-    if *last >= last_max {
-        return None;
-    }
-    let mut addr: u64 = *last;
-    for (i, &v) in head.iter().enumerate() {
-        addr |= v << (8 * (3 - i as u32));
-    }
-    Some(std::net::Ipv4Addr::from(addr as u32))
-}
-
-fn is_local_ipv4(ip: std::net::Ipv4Addr) -> bool {
-    let o = ip.octets();
-    o[0] == 127 || o[0] == 0 || (o[0] == 169 && o[1] == 254)
-}
-
-/// True when a rule target host points at this machine itself: loopback,
-/// unspecified or link-local (including the cloud metadata address), as an IP
-/// literal in any spelling `getaddrinfo` accepts or as a `localhost` name.
-/// RFC 1918 and CGNAT addresses are NOT local. A domain that merely resolves
-/// to such an address cannot be recognised here.
-pub fn is_local_target_host(host: &str) -> bool {
-    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    if h.is_empty() {
+fn is_valid_domain_label(label: &str) -> bool {
+    if label.is_empty() || label.len() > 63 {
         return false;
     }
-    if h == "localhost" || h.ends_with(".localhost") {
-        return true;
+    if label.starts_with('-') || label.ends_with('-') {
+        return false;
     }
-    if let Ok(v6) = h.parse::<std::net::Ipv6Addr>() {
-        // fe80::/10 link-local; `to_ipv4` covers both ::ffff:a.b.c.d (mapped)
-        // and ::a.b.c.d (compatible) forms.
-        if v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80 {
-            return true;
-        }
-        return v6.to_ipv4().is_some_and(is_local_ipv4);
-    }
-    parse_inet_aton(&h).is_some_and(is_local_ipv4)
+    label
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// Rule owners who are not admins may not forward to the machine itself.
-/// Returns `Ok(Some(message))` when `hosts` contains a local address and the
-/// owner is not an admin; `Ok(None)` when the targets are fine.
-async fn check_local_targets_for_owner<'a>(
-    db: &dyn Repository,
-    owner_uid: i64,
-    hosts: impl Iterator<Item = &'a str>,
-) -> Result<Option<String>, DbError> {
-    let Some(bad) = hosts.into_iter().find(|h| is_local_target_host(h)) else {
+/// Validate and normalize an optional SNI domain (exact hostname or `*.example.com`).
+/// Returns `Ok(None)` when `raw` is `None` or empty after trimming.
+pub fn normalize_sni(raw: Option<&str>, protocol: &str) -> Result<Option<String>, String> {
+    let Some(s) = raw else {
         return Ok(None);
     };
-    if db.is_admin(owner_uid).await? {
+    let trimmed = s.trim().trim_end_matches('.').to_ascii_lowercase();
+    if trimmed.is_empty() {
         return Ok(None);
     }
-    Ok(Some(format!(
-        "普通用户的规则不能转发到本机回环或链路本地地址：{}（管理员的规则不受此限制）",
-        bad.trim()
-    )))
-}
+    if protocol != "tcp" {
+        return Err("SNI 分流域名仅支持 TCP 协议规则".to_string());
+    }
+    if trimmed.len() > 253 {
+        return Err("SNI 域名长度不能超过 253 个字符".to_string());
+    }
 
-/// A rule owned by a non-admin must listen inside its inbound group's port
-/// range, the same pool auto-assignment draws from (a group left at the
-/// `1-65535` sentinel means 10000-65535 here too, never system ports).
-/// Returns `Ok(Some(message))` when `port` is outside it; admins are not
-/// restricted.
-async fn check_listen_port_for_owner(
-    db: &dyn Repository,
-    owner_uid: i64,
-    device_group_in: i64,
-    port: u16,
-) -> Result<Option<String>, DbError> {
-    if db.is_admin(owner_uid).await? {
-        return Ok(None);
+    let domain_part = if let Some(rest) = trimmed.strip_prefix("*.") {
+        if rest.is_empty() || !rest.contains('.') {
+            return Err("通配符 SNI 域名格式无效（示例：*.example.com）".to_string());
+        }
+        rest
+    } else {
+        if trimmed.contains('*') {
+            return Err("通配符 SNI 仅支持最左侧 *.example.com 形式".to_string());
+        }
+        trimmed.as_str()
+    };
+
+    if domain_part.parse::<std::net::IpAddr>().is_ok() {
+        return Err("SNI 必须是域名，不能填写纯 IP 地址".to_string());
     }
-    let raw = db
-        .group_port_range(device_group_in)
-        .await?
-        .unwrap_or_default();
-    let (lo, hi) = resolve_auto_port_range(&raw);
-    if (lo..=hi).contains(&port) {
-        return Ok(None);
+
+    let labels: Vec<&str> = domain_part.split('.').collect();
+    if labels.len() < 2 || !labels.iter().all(|l| is_valid_domain_label(l)) {
+        return Err(format!("SNI 域名格式无效: {trimmed}"));
     }
-    Ok(Some(format!(
-        "listen_port: 该设备分组只允许使用 {lo}-{hi} 范围内的端口（管理员的规则不受此限制）"
-    )))
+
+    Ok(Some(trimmed))
 }
 
 pub fn normalize_rule_targets(
@@ -255,23 +132,9 @@ pub fn group_type_to_str(gt: &GroupType) -> &'static str {
     }
 }
 
-/// The default auto-assign pool used when a group's `port_range` is unset, is
-/// the "全可转发" sentinel `1-65535`, or is unparseable. Deliberately excludes
-/// system ports (<10000) — matching the historical hardcoded behavior — so a
-/// brand-new / never-customized group never auto-assigns 22/80/443 etc.
 const DEFAULT_AUTO_PORT_LO: u16 = 10000;
 const DEFAULT_AUTO_PORT_HI: u16 = 65535;
 
-/// Resolve a group's stored `port_range` string into the inclusive `[lo, hi]`
-/// pool that auto-assignment draws from.
-///
-/// * empty / `"1-65535"` (the schema default, i.e. "全可转发" — nobody narrowed
-///   it) / unparseable → the default 10000-65535 pool (never system ports);
-/// * an explicit `"start-end"` with `1 <= start <= end <= 65535` → used
-///   verbatim, INCLUDING sub-10000 ports when the admin asked for them
-///   (`"5000-65535"` really does hand out 5000-9999 — an explicit choice wins
-///   over the default-avoidance). Only the exact `1-65535` string is treated as
-///   the sentinel, so `2-65535` or `1-65534` are honored as narrowings.
 pub fn resolve_auto_port_range(raw: &str) -> (u16, u16) {
     const DEFAULT: (u16, u16) = (DEFAULT_AUTO_PORT_LO, DEFAULT_AUTO_PORT_HI);
     let s = raw.trim();
@@ -290,9 +153,6 @@ pub fn resolve_auto_port_range(raw: &str) -> (u16, u16) {
     (start as u16, end as u16)
 }
 
-/// A cheap, dependency-free pseudo-random offset in `[0, span)`, seeded from the
-/// wall clock so successive auto-assignments on the same group spread across the
-/// pool instead of clustering at its low end. `span` is always `>= 1`.
 fn pseudo_random_offset(span: u32) -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -302,33 +162,14 @@ fn pseudo_random_offset(span: u32) -> u32 {
     nanos % span
 }
 
-/// Auto-assign a free listen port from the rule's inbound group's configured
-/// `port_range`, scoped to that group and socket type.
-///
-/// v1.2.x: the search pool is the group's `port_range` (resolved via
-/// [`resolve_auto_port_range`]) instead of a hardcoded 10000-65535. When the
-/// pool is exhausted this returns an error naming the real range so the panel
-/// can tell the operator the range is full — it never silently spills outside
-/// the configured range.
-///
-/// v0.4.11 PR4: port occupancy is per (device_group_in, port, socket type).
-/// We only need to avoid ports already used ON THIS GROUP that conflict with
-/// the candidate's socket type: a TCP-bearing candidate (tcp / tcp_udp) avoids
-/// this group's tcp / tcp_udp ports, and a UDP-bearing candidate (udp /
-/// tcp_udp) avoids its udp / tcp_udp ports. A pure-TCP candidate may reuse a
-/// port held by a pure-UDP rule, and vice versa. Different groups have
-/// independent pools.
 pub async fn auto_assign_port(
     db: &dyn Repository,
     device_group_in: i64,
     protocol: &str,
 ) -> Result<u16, String> {
-    let needs_tcp = matches!(protocol, "tcp" | "tcp_udp");
-    let needs_udp = matches!(protocol, "udp" | "tcp_udp");
+    let needs_tcp = matches!(protocol, "tcp" | "tcp_udp" | "both");
+    let needs_udp = matches!(protocol, "udp" | "tcp_udp" | "both");
 
-    // The pool to draw from = this group's configured port_range, with the
-    // unset / "1-65535" sentinel mapped to the safe 10000-65535 default. A
-    // missing group (None) also falls back to the default pool.
     let range_raw = db
         .group_port_range(device_group_in)
         .await
@@ -336,19 +177,16 @@ pub async fn auto_assign_port(
         .unwrap_or_default();
     let (lo, hi) = resolve_auto_port_range(&range_raw);
 
-    // (port, protocol) pairs already in use on this group.
     let group_ports: Vec<(i32, String)> = db
         .list_group_port_protocols(device_group_in)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Build the occupied set: only ports whose socket type overlaps the
-    // candidate's.
     let used: std::collections::HashSet<u16> = group_ports
         .into_iter()
         .filter_map(|(p, proto)| {
-            let occupies_tcp = matches!(proto.as_str(), "tcp" | "tcp_udp");
-            let occupies_udp = matches!(proto.as_str(), "udp" | "tcp_udp");
+            let occupies_tcp = matches!(proto.as_str(), "tcp" | "tcp_udp" | "both");
+            let occupies_udp = matches!(proto.as_str(), "udp" | "tcp_udp" | "both");
             let conflicts = (needs_tcp && occupies_tcp) || (needs_udp && occupies_udp);
             if conflicts {
                 u16::try_from(p).ok()
@@ -358,22 +196,14 @@ pub async fn auto_assign_port(
         })
         .collect();
 
-    // Ring scan over [lo, hi] starting from a pseudo-random offset: visits every
-    // port in the pool exactly once, returning the first that doesn't conflict.
-    // The random start spreads assignments across the range rather than always
-    // taking the lowest free port. If every port is taken, the range is full.
     let span = (hi as u32) - (lo as u32) + 1;
     let start_offset = pseudo_random_offset(span);
     for i in 0..span {
-        // lo + offset <= hi <= 65535, so the u16 cast never truncates.
         let candidate = (lo as u32 + (start_offset + i) % span) as u16;
         if !used.contains(&candidate) {
             return Ok(candidate);
         }
     }
-    // Actionable, user-facing: this surfaces as a 400 (CreateRuleError::BadRequest)
-    // so the operator knows to widen the group's port range or free a rule —
-    // NOT a generic 500 "数据库错误".
     Err(format!(
         "设备组端口范围 {}-{} 已全部占用,请扩大该组端口范围或删除已有规则后重试",
         lo, hi
@@ -384,9 +214,6 @@ pub async fn auto_assign_port(
 pub enum CreateRuleError {
     BadRequest(String),
     PortConflict(u16),
-    /// v1.2.12: the owner is not authorized for the rule's inbound group —
-    /// found inside the write transaction (see `create_rule_full`).
-    Forbidden,
     Database(DbError),
 }
 
@@ -395,27 +222,17 @@ pub enum UpdateRuleError {
     BadRequest(String),
     NotFound,
     PortConflict,
-    /// v1.2.12: see `CreateRuleError::Forbidden`; carries the message.
-    Forbidden(&'static str),
-    Internal(String),
     Database(DbError),
 }
 
-async fn validate_admin_owned_inbound_group(
+async fn validate_inbound_group(
     db: &dyn Repository,
     gid: i64,
     context: &str,
 ) -> Result<(), CreateRuleError> {
     match GroupRepository::find_by_id(db, gid, &ResourceScope::All).await {
         Ok(Some(g)) => {
-            let owner_is_admin = match db.is_admin(g.uid).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!("{}: group_in is_admin failed: {}", context, e);
-                    return Err(CreateRuleError::Database(e));
-                }
-            };
-            if g.group_type != "in" || !owner_is_admin {
+            if g.group_type != "in" {
                 return Err(CreateRuleError::BadRequest(
                     "device_group_in not found".into(),
                 ));
@@ -432,36 +249,9 @@ async fn validate_admin_owned_inbound_group(
     }
 }
 
-async fn validate_owner_outbound_group(
-    db: &dyn Repository,
-    gid_out: i64,
-    owner_scope: &ResourceScope,
-    context: &str,
-) -> Result<(), CreateRuleError> {
-    match GroupRepository::find_by_id(db, gid_out, owner_scope).await {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(CreateRuleError::BadRequest(
-            "device_group_out does not belong to the rule owner".into(),
-        )),
-        Err(e) => {
-            tracing::error!("{}: group_out find_by_id failed: {}", context, e);
-            Err(CreateRuleError::Database(e))
-        }
-    }
-}
-
-/// v1.2.15: check a rule's PROXY protocol settings and normalize them for
-/// storage. Off needs no checks. On, it must be a TCP rule on the raw
-/// transport, every trusted source must be an IP or CIDR, and — when
-/// `check_nodes` — every node in the inbound group must run node-v1.2.9+:
-/// an older node would ignore the setting, sending no header to a target
-/// that expects one (or passing the previous hop's header on as data), and
-/// every connection through it would break.
-#[allow(clippy::too_many_arguments)]
 pub async fn validate_proxy_protocol(
     db: &dyn Repository,
     protocol: &str,
-    node_transport: &str,
     device_group_in: i64,
     send: ProxyProtocolVersion,
     accept: bool,
@@ -474,11 +264,6 @@ pub async fn validate_proxy_protocol(
     if protocol == "udp" {
         return Err(CreateRuleError::BadRequest(
             "PROXY protocol 只用于 TCP，UDP 规则不能开启".into(),
-        ));
-    }
-    if node_transport != "raw" {
-        return Err(CreateRuleError::BadRequest(
-            "PROXY protocol 只支持直连（raw）传输".into(),
         ));
     }
     let mut sources = Vec::new();
@@ -515,9 +300,6 @@ pub async fn validate_proxy_protocol(
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
                     .unwrap_or_else(|| key.trim_start_matches(&prefix).chars().take(8).collect());
-                // Offline rows count too (the node may come back still old),
-                // and they are never swept, so a retired node keeps blocking
-                // this until it is deleted — say which ones those are.
                 if crate::api::stats::status_is_online(&value, now) {
                     old.push(format!("{} ({})", label, version.unwrap_or("?")));
                 } else {
@@ -560,45 +342,14 @@ fn is_ip_or_cidr(s: &str) -> bool {
 pub async fn create_rule(
     db: &dyn Repository,
     caller_user_id: i64,
-    caller_admin: bool,
     req: &CreateRuleRequest,
 ) -> Result<(), CreateRuleError> {
-    // v0.4.10: resolve the rule's owner. An admin may specify owner_uid to
-    // create on behalf of another user; a non-admin's owner_uid is IGNORED and
-    // the rule is attributed to themselves (defense against forgery).
-    let owner_uid = if caller_admin {
-        req.owner_uid.unwrap_or(caller_user_id)
-    } else {
-        caller_user_id
-    };
-
-    // If the admin is creating on behalf of another user, validate that user
-    // exists and is not banned (a banned/deleted owner can't own new rules).
-    if owner_uid != caller_user_id {
-        match db.find_banned_by_id(owner_uid).await {
-            Ok(Some(false)) => {}
-            Ok(Some(true)) => return Err(CreateRuleError::BadRequest("owner is banned".into())),
-            Ok(None) => return Err(CreateRuleError::BadRequest("owner does not exist".into())),
-            Err(e) => {
-                tracing::error!("create_rule: owner find_banned_by_id failed: {}", e);
-                return Err(CreateRuleError::Database(e));
-            }
-        }
-    }
-
-    // The scope for validating referenced groups = the FINAL owner.
-    let owner_scope = ResourceScope::Owner(owner_uid);
-
     if req.listen_port == Some(0) {
         return Err(CreateRuleError::BadRequest(
             "listen_port: must be between 1 and 65535".into(),
         ));
     }
 
-    // v0.4.20: only direct forward_mode is supported. Group/chain forwarding
-    // is no longer exposed in the UI and is rejected at the API boundary.
-    // Existing rules with group forwarding still generate valid config, but
-    // new rules must use direct.
     if req.forward_mode != "direct" {
         return Err(CreateRuleError::BadRequest(
             "forward_mode: only 'direct' is supported; group/chain forwarding is no longer available"
@@ -612,139 +363,33 @@ pub async fn create_rule(
         ));
     }
 
-    // v0.4.12 PR1: device_group_in MUST be an inbound group (`group_type='in'`)
-    // owned by an ADMIN.
-    validate_admin_owned_inbound_group(db, req.device_group_in, "create_rule").await?;
+    validate_inbound_group(db, req.device_group_in, "create_rule").await?;
 
-    // Only validate device_group_out ownership (outbound is user-specific).
-    if let Some(gid_out) = req.device_group_out {
-        validate_owner_outbound_group(db, gid_out, &owner_scope, "create_rule").await?;
-    }
-
-    if !is_public_transport_accepted(req.public_transport) {
-        return Err(CreateRuleError::BadRequest(RETIRED_TRANSPORT_ERROR.into()));
-    }
-
-    if let Some(msg) = validate_protocol_transport(
-        protocol_to_str(&req.protocol),
-        req.public_transport.to_db_str(),
-    ) {
-        return Err(CreateRuleError::BadRequest(msg.into()));
-    }
+    let protocol_str = protocol_to_str(&req.protocol);
+    let sni = normalize_sni(req.sni.as_deref(), protocol_str)
+        .map_err(CreateRuleError::BadRequest)?;
 
     let targets = normalize_rule_targets(req.targets.clone(), &req.target_addr, req.target_port)
         .map_err(|msg| CreateRuleError::BadRequest(msg.into()))?;
     let primary_target = &targets[0];
 
-    // A non-admin owner (including a regular user an admin creates for) may
-    // not point a rule at this machine itself. Judged by the FINAL owner.
-    match check_local_targets_for_owner(db, owner_uid, targets.iter().map(|t| t.host.as_str()))
-        .await
-    {
-        Ok(None) => {}
-        Ok(Some(msg)) => return Err(CreateRuleError::BadRequest(msg)),
-        Err(e) => {
-            tracing::error!("create_rule: owner is_admin failed: {}", e);
-            return Err(CreateRuleError::Database(e));
-        }
-    }
-
-    // A non-admin owner types a listen port only inside the group's range
-    // (an unset port is auto-assigned from that same range).
-    if let Some(port) = req.listen_port {
-        match check_listen_port_for_owner(db, owner_uid, req.device_group_in, port).await {
-            Ok(None) => {}
-            Ok(Some(msg)) => return Err(CreateRuleError::BadRequest(msg)),
-            Err(e) => {
-                tracing::error!("create_rule: listen port range check failed: {}", e);
-                return Err(CreateRuleError::Database(e));
-            }
-        }
-    }
-
-    // v0.4.11 PR1: strong validation for transport/profile binding:
-    // - Raw: tunnel_profile_id must be NULL
-    // - WS: must bind a ws transport template
-    // - TLS Simple: must bind a tls_simple transport template
-    let public_transport = &req.public_transport;
-    if let Some(pid) = req.tunnel_profile_id {
-        if public_transport == &PublicTransport::Raw {
-            return Err(CreateRuleError::BadRequest(
-                "tunnel_profile_id must be null for Raw transport".into(),
-            ));
-        }
-        match db
-            .find_profile_by_id(pid, &ProfileScope::AvailableTemplates)
-            .await
-        {
-            Ok(None) => {
-                return Err(CreateRuleError::BadRequest(
-                    "tunnel_profile_id: no such profile".into(),
-                ));
-            }
-            Ok(Some(profile)) => {
-                let expected_transport = match public_transport {
-                    PublicTransport::Ws => "ws",
-                    PublicTransport::TlsSimple => "tls_simple",
-                    PublicTransport::Raw => {
-                        return Err(CreateRuleError::BadRequest(
-                            "tunnel_profile_id must be null for Raw transport".into(),
-                        ));
-                    }
-                };
-                if profile.transport != expected_transport {
-                    return Err(CreateRuleError::BadRequest(format!(
-                        "tunnel_profile_id: profile transport '{}' does not match '{}' transport",
-                        profile.transport, expected_transport
-                    )));
-                }
-                if let Some(msg) = validate_protocol_transport(
-                    protocol_to_str(&req.protocol),
-                    profile.transport.as_str(),
-                ) {
-                    return Err(CreateRuleError::BadRequest(msg.into()));
-                }
-            }
-            Err(e) => {
-                tracing::error!("create_rule: find_profile_by_id failed: {}", e);
-                return Err(CreateRuleError::Database(e));
-            }
-        }
-    } else {
-        if public_transport == &PublicTransport::Ws {
-            return Err(CreateRuleError::BadRequest(
-                "tunnel_profile_id is required for WebSocket transport".into(),
-            ));
-        }
-        if public_transport == &PublicTransport::TlsSimple {
-            return Err(CreateRuleError::BadRequest(
-                "tunnel_profile_id is required for TLS Simple transport".into(),
-            ));
-        }
-    }
-
-    let protocol_str = protocol_to_str(&req.protocol);
-    let public_str = req.public_transport.to_db_str();
-    let node_str = req.public_transport.derive_node_transport().to_db_str();
-    let route_str = req.route_mode.to_db_str();
-    let ws_path: Option<String> = if req.public_transport == PublicTransport::Ws {
-        req.ws_path
-            .as_ref()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-    } else {
-        None
-    };
-
     let lb_db = req.load_balance_strategy.to_db_str();
     let up_mbps = req.upload_limit_mbps.unwrap_or(0).max(0);
     let down_mbps = req.download_limit_mbps.unwrap_or(0).max(0);
+    let max_connections = req.max_connections.unwrap_or(0).max(0);
+    let auto_restart_minutes = req.auto_restart_minutes.unwrap_or(0).max(0);
+    if auto_restart_minutes != 0
+        && auto_restart_minutes < relay_shared::models::MIN_AUTO_RESTART_MINUTES
+    {
+        return Err(CreateRuleError::BadRequest(format!(
+            "自动重启间隔最小 {} 分钟（0 = 关闭）",
+            relay_shared::models::MIN_AUTO_RESTART_MINUTES
+        )));
+    }
 
     let proxy_protocol = validate_proxy_protocol(
         db,
         protocol_str,
-        node_str,
         req.device_group_in,
         req.proxy_protocol_send,
         req.proxy_protocol_accept,
@@ -756,22 +401,11 @@ pub async fn create_rule(
     let mut attempt = 0u32;
     let max_attempts = if req.listen_port.is_some() { 1 } else { 8 };
     let mut last_port: Option<u16> = req.listen_port;
-    // v1.2: create_rule_full does the rule INSERT + targets + LB + rate limits
-    // + tunnel profile in ONE transaction and returns the new rule's id
-    // directly (SQLite last_insert_rowid / PG RETURNING id). This replaces the
-    // old insert_quota_guarded-then-list_rules-by-(owner,listen_port)-lookup,
-    // which wrote the side-tables to the WRONG rule when two inbound groups
-    // reused the same listen_port (the per-group unique index makes that legal
-    // but the lookup ignored device_group_in). Atomicity also guarantees a
-    // mid-create failure leaves no half-rule.
-    let result: Result<Option<i64>, DbError> = loop {
+    let result: Result<i64, DbError> = loop {
         let port = match last_port {
             Some(p) => p,
             None => match auto_assign_port(db, req.device_group_in, protocol_str).await {
                 Ok(p) => p,
-                // A full/unassignable range is a client-fixable condition, not a
-                // DB fault — surface the actionable message as a 400, not a
-                // generic 500 "数据库错误".
                 Err(e) => return Err(CreateRuleError::BadRequest(e)),
             },
         };
@@ -780,14 +414,10 @@ pub async fn create_rule(
         match db
             .create_rule_full(
                 &req.name,
-                owner_uid,
+                caller_user_id,
                 port as i32,
                 protocol_str,
-                public_str,
-                node_str,
-                route_str,
-                public_str,
-                ws_path.as_deref(),
+                sni.as_deref(),
                 req.device_group_in,
                 req.device_group_out,
                 &req.forward_mode,
@@ -797,27 +427,23 @@ pub async fn create_rule(
                 lb_db,
                 up_mbps,
                 down_mbps,
-                req.tunnel_profile_id,
-                // A non-admin creates for themselves and is re-checked inside
-                // the transaction; an admin (for anyone) is not, as the API
-                // does not check it either.
-                !caller_admin,
+                max_connections,
+                auto_restart_minutes,
                 &proxy_protocol,
             )
             .await
         {
-            Ok(opt) => break Ok(opt),
+            Ok(id) => break Ok(id),
             Err(DbError::PortConflict | DbError::UniqueViolation)
-                if req.listen_port.is_none() && attempt + 1 < max_attempts =>
+                if req.listen_port.is_some() =>
+            {
+                break Err(DbError::PortConflict);
+            }
+            Err(DbError::PortConflict | DbError::UniqueViolation)
+                if attempt + 1 < max_attempts =>
             {
                 attempt += 1;
                 last_port = None;
-                tracing::debug!(
-                    "create_rule: listen_port {} taken on group {}; retry {}",
-                    port,
-                    req.device_group_in,
-                    attempt
-                );
                 continue;
             }
             Err(e) => break Err(e),
@@ -825,20 +451,10 @@ pub async fn create_rule(
     };
 
     match result {
-        Ok(None) => {
-            // Quota exhausted: the guarded INSERT matched 0 rows.
-            let current_count: i64 = db.count_by_uid(owner_uid).await.unwrap_or(0);
-            let max_rules: i32 = db.max_rules_for_uid(owner_uid).await.unwrap_or(0);
-            Err(CreateRuleError::BadRequest(format!(
-                "Rule limit reached: you have {} rules, max is {}",
-                current_count, max_rules
-            )))
-        }
-        Ok(Some(_)) => Ok(()),
+        Ok(_) => Ok(()),
         Err(DbError::PortConflict | DbError::UniqueViolation) => {
             Err(CreateRuleError::PortConflict(last_port.unwrap_or(0)))
         }
-        Err(DbError::GroupNotAuthorized) => Err(CreateRuleError::Forbidden),
         Err(e) => {
             tracing::error!("create_rule: create_rule_full failed: {}", e);
             Err(CreateRuleError::Database(e))
@@ -850,9 +466,6 @@ fn map_create_rule_validation_error(err: CreateRuleError) -> UpdateRuleError {
     match err {
         CreateRuleError::BadRequest(msg) => UpdateRuleError::BadRequest(msg),
         CreateRuleError::PortConflict(_) => UpdateRuleError::PortConflict,
-        CreateRuleError::Forbidden => {
-            UpdateRuleError::Forbidden("device_group_in is not in your allowed device groups")
-        }
         CreateRuleError::Database(e) => UpdateRuleError::Database(e),
     }
 }
@@ -869,7 +482,6 @@ pub async fn update_rule(
         ));
     }
 
-    // v0.4.20: only direct forward_mode is supported.
     if let Some(ref mode) = req.forward_mode {
         if mode != "direct" {
             return Err(UpdateRuleError::BadRequest(
@@ -885,13 +497,6 @@ pub async fn update_rule(
         ));
     }
 
-    if let Some(ref transport) = req.public_transport {
-        if !is_public_transport_accepted(*transport) {
-            return Err(UpdateRuleError::BadRequest(RETIRED_TRANSPORT_ERROR.into()));
-        }
-    }
-
-    // Load the existing rule once and reuse it for stored protocol/profile/owner.
     let existing = match db.find_rule_by_id(id, scope).await {
         Ok(Some(r)) => r,
         Ok(None) => return Err(UpdateRuleError::NotFound),
@@ -900,42 +505,36 @@ pub async fn update_rule(
             return Err(UpdateRuleError::Database(e));
         }
     };
-    let owner_scope = ResourceScope::Owner(existing.uid);
 
     if let Some(gid_in) = req.device_group_in {
-        validate_admin_owned_inbound_group(db, gid_in, "update_rule")
-            .await
-            .map_err(map_create_rule_validation_error)?;
-    }
-    if let Some(gid_out) = req.device_group_out {
-        validate_owner_outbound_group(db, gid_out, &owner_scope, "update_rule")
+        validate_inbound_group(db, gid_in, "update_rule")
             .await
             .map_err(map_create_rule_validation_error)?;
     }
 
-    // Effective protocol×transport cross-check.
-    let stored: Option<(String, String)> = match db.find_transport_by_id(id, scope).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("update_rule {}: find_transport_by_id failed: {}", id, e);
-            return Err(UpdateRuleError::Database(e));
-        }
-    };
     let effective_protocol = req
         .protocol
         .as_ref()
         .map(protocol_to_str)
-        .map(str::to_string)
-        .or_else(|| stored.as_ref().map(|(p, _)| p.clone()));
-    let effective_transport = req
-        .public_transport
-        .map(|t| t.to_db_str().to_string())
-        .or_else(|| stored.as_ref().map(|(_, t)| t.clone()));
-    if let (Some(proto), Some(transport)) = (effective_protocol, effective_transport) {
-        if let Some(msg) = validate_protocol_transport(&proto, &transport) {
-            return Err(UpdateRuleError::BadRequest(msg.into()));
+        .unwrap_or(existing.protocol.as_str());
+
+    let normalized_sni: Option<Option<String>> = match &req.sni {
+        Some(opt) => {
+            let norm = normalize_sni(opt.as_deref(), effective_protocol)
+                .map_err(UpdateRuleError::BadRequest)?;
+            Some(norm)
         }
-    }
+        None => {
+            if let Some(ref existing_sni) = existing.sni {
+                if effective_protocol != "tcp" && !existing_sni.trim().is_empty() {
+                    return Err(UpdateRuleError::BadRequest(
+                        "SNI 分流域名仅支持 TCP 协议规则，请先清空 SNI 再切换协议".into(),
+                    ));
+                }
+            }
+            None
+        }
+    };
 
     let switching_to_direct =
         req.forward_mode.as_deref() == Some("direct") && req.device_group_out.is_none();
@@ -948,9 +547,7 @@ pub async fn update_rule(
     let has_field = req.name.is_some()
         || req.listen_port.is_some()
         || req.protocol.is_some()
-        || req.public_transport.is_some()
-        || req.route_mode.is_some()
-        || req.ws_path.is_some()
+        || req.sni.is_some()
         || req.device_group_in.is_some()
         || req.device_group_out.is_some()
         || req.forward_mode.is_some()
@@ -962,7 +559,6 @@ pub async fn update_rule(
         || req.download_limit_mbps.is_some()
         || req.max_connections.is_some()
         || req.auto_restart_minutes.is_some()
-        || req.tunnel_profile_id.is_some()
         || req.paused.is_some()
         || req.proxy_protocol_send.is_some()
         || req.proxy_protocol_accept.is_some()
@@ -982,188 +578,6 @@ pub async fn update_rule(
         None
     };
 
-    // Only an edit that changes the targets is checked, so existing rules keep
-    // working. A rule's owner cannot be changed by an edit, so the owner is
-    // the stored one (an admin editing a user's rule is still judged by the
-    // rule's owner, not the caller).
-    if normalized_targets.is_some() || req.target_addr.is_some() {
-        let hosts = normalized_targets
-            .iter()
-            .flatten()
-            .map(|t| t.host.as_str())
-            .chain(req.target_addr.as_deref());
-        match check_local_targets_for_owner(db, existing.uid, hosts).await {
-            Ok(None) => {}
-            Ok(Some(msg)) => return Err(UpdateRuleError::BadRequest(msg)),
-            Err(e) => {
-                tracing::error!("update_rule {}: owner is_admin failed: {}", id, e);
-                return Err(UpdateRuleError::Database(e));
-            }
-        }
-    }
-
-    // Likewise only an edit that moves the rule's port or its inbound group is
-    // checked; a rule left as it is keeps working wherever it listens now.
-    if req.listen_port.is_some() || req.device_group_in.is_some() {
-        let eff_port = req
-            .listen_port
-            .map(i32::from)
-            .or(Some(existing.listen_port))
-            .and_then(|p| u16::try_from(p).ok());
-        let eff_group = req.device_group_in.unwrap_or(existing.device_group_in);
-        if let Some(port) = eff_port {
-            match check_listen_port_for_owner(db, existing.uid, eff_group, port).await {
-                Ok(None) => {}
-                Ok(Some(msg)) => return Err(UpdateRuleError::BadRequest(msg)),
-                Err(e) => {
-                    tracing::error!("update_rule {}: listen port range check failed: {}", id, e);
-                    return Err(UpdateRuleError::Database(e));
-                }
-            }
-        }
-    }
-
-    let existing_transport = match existing.public_transport.as_str() {
-        "raw" => PublicTransport::Raw,
-        "ws" => PublicTransport::Ws,
-        "tls_simple" => PublicTransport::TlsSimple,
-        _ => {
-            tracing::error!(
-                "update_rule {}: unknown existing public_transport '{}'",
-                id,
-                existing.public_transport
-            );
-            return Err(UpdateRuleError::Internal(
-                "internal error: unknown transport".into(),
-            ));
-        }
-    };
-    let effective_transport = req
-        .public_transport
-        .as_ref()
-        .copied()
-        .unwrap_or(existing_transport);
-    // A resume may omit public_transport and inherit a retired value. Keep
-    // pausing/renaming legacy rules possible, and allow an explicit raw conversion.
-    if req.paused == Some(false) && !is_public_transport_accepted(effective_transport) {
-        return Err(UpdateRuleError::BadRequest(RETIRED_TRANSPORT_ERROR.into()));
-    }
-    let effective_pid = match req.tunnel_profile_id {
-        Some(pid_opt) => pid_opt,
-        None => existing.tunnel_profile_id,
-    };
-
-    match (effective_transport, effective_pid) {
-        (PublicTransport::Raw, Some(_)) => {
-            return Err(UpdateRuleError::BadRequest(
-                "tunnel_profile_id must be null for Raw transport".into(),
-            ));
-        }
-        (PublicTransport::Ws, None) | (PublicTransport::TlsSimple, None) => {
-            let transport_name = match effective_transport {
-                PublicTransport::Ws => "WebSocket",
-                PublicTransport::TlsSimple => "TLS Simple",
-                PublicTransport::Raw => unreachable!(),
-            };
-            return Err(UpdateRuleError::BadRequest(format!(
-                "tunnel_profile_id is required for {} transport",
-                transport_name
-            )));
-        }
-        (PublicTransport::Ws | PublicTransport::TlsSimple, Some(pid)) => {
-            let expected_transport = match effective_transport {
-                PublicTransport::Ws => "ws",
-                PublicTransport::TlsSimple => "tls_simple",
-                PublicTransport::Raw => unreachable!(),
-            };
-            match db
-                .find_profile_by_id(pid, &ProfileScope::AvailableTemplates)
-                .await
-            {
-                Ok(None) => {
-                    return Err(UpdateRuleError::BadRequest(
-                        "tunnel_profile_id: no such profile".into(),
-                    ));
-                }
-                Ok(Some(profile)) => {
-                    if profile.transport != expected_transport {
-                        return Err(UpdateRuleError::BadRequest(format!(
-                            "tunnel_profile_id: profile transport '{}' does not match '{}' transport",
-                            profile.transport, expected_transport
-                        )));
-                    }
-                    let proto_to_check = match req.protocol.as_ref() {
-                        Some(p) => protocol_to_str(p),
-                        None => existing.protocol.as_str(),
-                    };
-                    if let Some(msg) =
-                        validate_protocol_transport(proto_to_check, profile.transport.as_str())
-                    {
-                        return Err(UpdateRuleError::BadRequest(msg.into()));
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("update_rule {}: find_profile_by_id failed: {}", id, e);
-                    return Err(UpdateRuleError::Database(e));
-                }
-            }
-        }
-        (PublicTransport::Raw, None) => {}
-    }
-
-    if let Some(new_proto) = req.protocol.as_ref() {
-        let effective_pid = match req.tunnel_profile_id {
-            Some(pid_opt) => pid_opt,
-            None => existing.tunnel_profile_id,
-        };
-        if let Some(pid) = effective_pid {
-            match db.find_profile_by_id(pid, &ProfileScope::All).await {
-                Ok(Some(profile)) => {
-                    if validate_protocol_transport(
-                        protocol_to_str(new_proto),
-                        profile.transport.as_str(),
-                    )
-                    .is_some()
-                    {
-                        return Err(UpdateRuleError::BadRequest(
-                            "the existing tunnel profile is incompatible with the requested protocol"
-                                .into(),
-                        ));
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::error!("update_rule {}: find_profile_by_id failed: {}", id, e);
-                    return Err(UpdateRuleError::Database(e));
-                }
-            }
-        }
-    }
-
-    let (public, node, entry) = match req.public_transport {
-        Some(v) => {
-            let p = v.to_db_str();
-            let n = v.derive_node_transport().to_db_str();
-            (Some(p), Some(n), Some(p))
-        }
-        None => (None, None, None),
-    };
-    let ws_path: Option<Option<&str>> = req.ws_path.as_ref().map(|v| {
-        v.as_ref()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| s as &str)
-    });
-
-    // v1.2.0 connection controls. 0 = off; any other restart interval must
-    // clear the floor: a 1-minute restart loop would drop connections faster
-    // than clients reconnect, turning the safety valve into the outage.
-    //
-    // v1.2.12: checked here, with every other check, BEFORE anything is
-    // written. It used to run after the name, targets and limits had already
-    // been saved, so a rejected edit still changed the rule. An omitted field
-    // is not written at all (it keeps the rule's value), so only a value sent
-    // in this request is checked.
     let max_connections = req.max_connections.map(|v| v.max(0));
     let auto_restart_minutes = req.auto_restart_minutes.map(|v| v.max(0));
     if let Some(minutes) = auto_restart_minutes {
@@ -1175,32 +589,13 @@ pub async fn update_rule(
         }
     }
 
-    // v1.2.12: the whole edit is ONE transaction (`update_rule_full`): it
-    // lands completely or not at all. Rate limits are per direction: an
-    // omitted direction keeps its limit — it used to be written as 0 (no
-    // limit), so an API client setting only the upload cap switched the
-    // download cap off.
-    // v1.2.15: PROXY protocol, checked against what the rule will be after
-    // this edit (a protocol, transport or group change can make a setting
-    // that was fine invalid). The node gate runs when the setting is turned
-    // on or changed, or the rule moves to another group.
     let pp_touched = req.proxy_protocol_send.is_some()
         || req.proxy_protocol_accept.is_some()
         || req.proxy_protocol_trusted.is_some();
     let proxy_protocol = if pp_touched
         || req.protocol.is_some()
-        || req.public_transport.is_some()
         || req.device_group_in.is_some()
     {
-        let eff_protocol = req
-            .protocol
-            .as_ref()
-            .map(protocol_to_str)
-            .unwrap_or(existing.protocol.as_str());
-        let eff_transport = req
-            .public_transport
-            .map(|t| t.derive_node_transport().to_db_str())
-            .unwrap_or(existing.node_transport.as_str());
         let eff_group = req.device_group_in.unwrap_or(existing.device_group_in);
         let eff_send = req
             .proxy_protocol_send
@@ -1214,8 +609,7 @@ pub async fn update_rule(
             .unwrap_or(existing.proxy_protocol_trusted.as_str());
         let checked = validate_proxy_protocol(
             db,
-            eff_protocol,
-            eff_transport,
+            effective_protocol,
             eff_group,
             eff_send,
             eff_accept,
@@ -1229,15 +623,12 @@ pub async fn update_rule(
         None
     };
 
+    let sni_ref: Option<Option<&str>> = normalized_sni.as_ref().map(|o| o.as_deref());
     let update = RuleUpdate {
         name: req.name.as_deref(),
         listen_port: req.listen_port.map(|p| p as i32),
         protocol: req.protocol.as_ref().map(protocol_to_str),
-        public_transport: public,
-        node_transport: node,
-        entry_transport: entry,
-        route_mode: req.route_mode.as_ref().map(|r| r.to_db_str()),
-        ws_path,
+        sni: sni_ref,
         device_group_in: req.device_group_in,
         device_group_out: device_group_out_arg,
         forward_mode: req.forward_mode.as_deref(),
@@ -1253,27 +644,12 @@ pub async fn update_rule(
         proxy_protocol_send: proxy_protocol.as_ref().map(|p| p.send.as_str()),
         proxy_protocol_accept: proxy_protocol.as_ref().map(|p| p.accept),
         proxy_protocol_trusted: proxy_protocol.as_ref().map(|p| p.trusted.as_str()),
-        tunnel_profile_id: req.tunnel_profile_id,
-        // An owner editing their own rule (an Owner scope) is re-checked
-        // against their device-group authorization inside the transaction;
-        // an admin's edit is not, as the API does not check it either.
-        check_owner_authorization: scope.owner_id().is_some(),
     };
 
     match db.update_rule_full(id, scope, &update).await {
         Ok(0) => Err(UpdateRuleError::NotFound),
         Ok(_) => Ok(()),
         Err(DbError::UniqueViolation | DbError::PortConflict) => Err(UpdateRuleError::PortConflict),
-        Err(DbError::QuotaExceeded) => Err(UpdateRuleError::BadRequest(
-            "当前套餐的启用规则数量已达上限".to_string(),
-        )),
-        Err(DbError::GroupNotAuthorized) => Err(UpdateRuleError::Forbidden(
-            if req.device_group_in.is_some() {
-                "device_group_in is not in your allowed device groups"
-            } else {
-                "无法启动未被授权设备分组下的规则"
-            },
-        )),
         Err(e) => {
             tracing::error!("update_rule {}: update_rule_full failed: {}", id, e);
             Err(UpdateRuleError::Database(e))
@@ -1287,93 +663,75 @@ mod tests {
     use crate::db::repo::RuleRepository;
 
     #[test]
-    fn local_target_host_covers_every_spelling() {
-        for h in [
-            "127.0.0.1",
-            "127.255.255.254",
-            "0.0.0.0",
-            "0.1.2.3",
-            "169.254.169.254",
-            "169.254.0.1",
-            "localhost",
-            "LOCALHOST",
-            "localhost.",
-            "foo.localhost",
-            "Foo.LocalHost.",
-            "::1",
-            "::",
-            "fe80::1",
-            "febf::1",
-            "::ffff:127.0.0.1",
-            "::ffff:169.254.169.254",
-            "::ffff:0.0.0.0",
-            "::127.0.0.1",
-            "127.1",
-            "127.0.1",
-            "2130706433",
-            "0x7f000001",
-            "0X7F.1",
-            "0177.0.0.1",
-            "017700000001",
-            "0",
-            "0x0",
-            "2851995649",
-            "0xa9fea9fe",
-            " 127.0.0.1 ",
-        ] {
-            assert!(is_local_target_host(h), "{h} must count as a local address");
-        }
+    fn normalize_sni_validates_exact_and_wildcard_domains() {
+        assert_eq!(normalize_sni(None, "tcp").unwrap(), None);
+        assert_eq!(normalize_sni(Some("   "), "tcp").unwrap(), None);
+        assert_eq!(
+            normalize_sni(Some("Sub.Example.COM."), "tcp").unwrap(),
+            Some("sub.example.com".to_string())
+        );
+        assert_eq!(
+            normalize_sni(Some("*.Example.com"), "tcp").unwrap(),
+            Some("*.example.com".to_string())
+        );
+        assert!(normalize_sni(Some("a.example.com"), "udp").is_err());
+        assert!(normalize_sni(Some("1.2.3.4"), "tcp").is_err());
+        assert!(normalize_sni(Some("*.com"), "tcp").is_err());
+        assert!(normalize_sni(Some("a.*.example.com"), "tcp").is_err());
+        assert!(normalize_sni(Some("-bad.example.com"), "tcp").is_err());
     }
 
     #[test]
-    fn local_target_host_leaves_ordinary_hosts_alone() {
-        for h in [
-            "example.com",
-            "127.example.com",
-            "localhost.example.com",
-            "mylocalhost",
-            "notlocalhost",
-            "1.2.3.4",
-            "8.8.8.8",
-            "10.0.0.1",
-            "172.16.0.1",
-            "192.168.1.1",
-            "100.64.0.1",
-            "169.253.1.1",
-            "128.0.0.1",
-            "2001:db8::1",
-            "fec0::1",
-            "::ffff:10.0.0.1",
-            "::ffff:8.8.8.8",
-            "1.2.3.4.5",
-            "256.1.1.1",
-            "1.2.3.256",
-            "08.0.0.1",
-            "0xzz.1",
-            "4294967296",
-            "",
-            "a.b.c.d",
-        ] {
-            assert!(
-                !is_local_target_host(h),
-                "{h:?} must not count as a local address"
-            );
-        }
+    fn target_normalization_rules() {
+        let out = normalize_rule_targets(None, "1.2.3.4", 80).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].host, "1.2.3.4");
+        assert_eq!(out[0].port, 80);
+
+        assert!(normalize_rule_targets(Some(vec![]), "1.2.3.4", 80).is_err());
+
+        let many: Vec<RuleTargetRequest> = (0..33)
+            .map(|_| RuleTargetRequest {
+                host: "1.2.3.4".into(),
+                port: 80,
+                enabled: true,
+            })
+            .collect();
+        assert!(normalize_rule_targets(Some(many), "x", 1).is_err());
+
+        let disabled = vec![RuleTargetRequest {
+            host: "1.2.3.4".into(),
+            port: 80,
+            enabled: false,
+        }];
+        assert!(normalize_rule_targets(Some(disabled), "x", 1).is_err());
+
+        let bad = vec![RuleTargetRequest {
+            host: "http://x".into(),
+            port: 80,
+            enabled: true,
+        }];
+        assert!(normalize_rule_targets(Some(bad), "x", 1).is_err());
     }
 
     #[test]
-    fn profile_update_distinguishes_omitted_null_and_id() {
-        for (json, expected) in [
-            (serde_json::json!({}), None),
-            (serde_json::json!({"tunnel_profile_id": null}), Some(None)),
-            (serde_json::json!({"tunnel_profile_id": 7}), Some(Some(7))),
-        ] {
-            let req: UpdateRuleRequest = serde_json::from_value(json).unwrap();
-            assert_eq!(req.tunnel_profile_id, expected);
-        }
+    fn resolve_auto_port_range_sentinel_and_default() {
+        let def = (DEFAULT_AUTO_PORT_LO, DEFAULT_AUTO_PORT_HI);
+        assert_eq!(resolve_auto_port_range("1-65535"), def);
+        assert_eq!(resolve_auto_port_range(""), def);
+        assert_eq!(resolve_auto_port_range("   "), def);
+        assert_eq!(resolve_auto_port_range("garbage"), def);
+        assert_eq!(resolve_auto_port_range("65000-100"), def);
     }
 
-    async fn transport_test_db() -> (sqlx::SqlitePool, crate::db::sqlite_repo::SqliteRepository) {
+    #[test]
+    fn resolve_auto_port_range_explicit_is_honored() {
+        assert_eq!(resolve_auto_port_range("65000-65100"), (65000, 65100));
+        assert_eq!(resolve_auto_port_range("5000-65535"), (5000, 65535));
+        assert_eq!(resolve_auto_port_range("  5000 - 6000  "), (5000, 6000));
+    }
+
+    async fn test_db() -> (sqlx::SqlitePool, crate::db::sqlite_repo::SqliteRepository) {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -1387,446 +745,82 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (1, 'entry', 'in', 'unused', 1)")
-            .execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (1, 'entry', 'in', 'unused', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let repo = crate::db::sqlite_repo::SqliteRepository::new(pool.clone());
         (pool, repo)
     }
 
     #[tokio::test]
-    async fn retired_transports_cannot_create_rules() {
-        let (pool, repo) = transport_test_db().await;
-        for transport in ["ws", "tls_simple"] {
-            sqlx::query(
-                "INSERT INTO tunnel_profiles (id, name, transport, uid) VALUES (1, 'legacy', ?, 1)",
-            )
-            .bind(transport)
-            .execute(&pool)
-            .await
-            .unwrap();
-            let req: CreateRuleRequest = serde_json::from_value(serde_json::json!({
-                "name": "unsupported", "listen_port": 24001, "protocol": "tcp",
-                "device_group_in": 1, "forward_mode": "direct",
-                "public_transport": transport, "tunnel_profile_id": 1,
-                "target_addr": "127.0.0.1", "target_port": 80
-            }))
-            .unwrap();
-            assert!(matches!(create_rule(&repo, 1, true, &req).await,
-                Err(CreateRuleError::BadRequest(msg)) if msg.contains("retired")));
-            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forward_rules")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-            assert_eq!(count, 0, "rejected requests must not write a rule");
-            sqlx::query("DELETE FROM tunnel_profiles")
-                .execute(&pool)
-                .await
-                .unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn retired_transports_reject_updates_and_resume_but_allow_cleanup() {
-        let (pool, repo) = transport_test_db().await;
-        let scope = ResourceScope::Owner(1);
-        for transport in [PublicTransport::Ws, PublicTransport::TlsSimple] {
-            sqlx::query(
-                "INSERT INTO tunnel_profiles (id, name, transport, uid) VALUES (1, 'legacy', ?, 1)",
-            )
-            .bind(transport.to_db_str())
-            .execute(&pool)
-            .await
-            .unwrap();
-            sqlx::query("INSERT INTO forward_rules (id, name, uid, listen_port, device_group_in, target_addr, target_port, public_transport, node_transport, tunnel_profile_id, paused) VALUES (1, 'legacy', 1, 24001, 1, '127.0.0.1', 80, ?, ?, 1, 1)")
-                .bind(transport.to_db_str()).bind(transport.to_db_str()).execute(&pool).await.unwrap();
-            for req in [
-                UpdateRuleRequest {
-                    public_transport: Some(transport),
-                    ..Default::default()
-                },
-                UpdateRuleRequest {
-                    paused: Some(false),
-                    ..Default::default()
-                },
-            ] {
-                assert!(matches!(update_rule(&repo, 1, &scope, &req).await,
-                    Err(UpdateRuleError::BadRequest(msg)) if msg.contains("retired")));
-                assert!(
-                    repo.find_rule_by_id(1, &scope)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .paused
-                );
-            }
-            let pause = UpdateRuleRequest {
-                paused: Some(true),
-                name: Some("old rule".into()),
-                ..Default::default()
-            };
-            update_rule(&repo, 1, &scope, &pause).await.unwrap();
-            let convert: UpdateRuleRequest = serde_json::from_value(serde_json::json!({
-                "public_transport": "raw", "tunnel_profile_id": null, "paused": false
-            }))
-            .unwrap();
-            update_rule(&repo, 1, &scope, &convert).await.unwrap();
-            let rule = repo.find_rule_by_id(1, &scope).await.unwrap().unwrap();
-            assert_eq!(rule.public_transport, "raw");
-            assert!(rule.tunnel_profile_id.is_none());
-            assert!(!rule.paused);
-            sqlx::query("DELETE FROM forward_rules")
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("DELETE FROM tunnel_profiles")
-                .execute(&pool)
-                .await
-                .unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn omitted_forward_mode_creates_a_direct_rule() {
-        let (pool, repo) = transport_test_db().await;
-        let req: CreateRuleRequest = serde_json::from_value(serde_json::json!({
-            "name": "direct", "listen_port": 24002, "protocol": "tcp",
-            "device_group_in": 1, "target_addr": "127.0.0.1", "target_port": 80
+    async fn multiple_sni_rules_can_share_port_443_while_duplicate_sni_conflicts() {
+        let (_pool, repo) = test_db().await;
+        let req1: CreateRuleRequest = serde_json::from_value(serde_json::json!({
+            "name": "site-a",
+            "listen_port": 443,
+            "protocol": "tcp",
+            "sni": "a.example.com",
+            "device_group_in": 1,
+            "target_addr": "10.0.0.1",
+            "target_port": 443,
+            "max_connections": 256,
+            "auto_restart_minutes": 60
         }))
         .unwrap();
-        create_rule(&repo, 1, true, &req).await.unwrap();
-        let mode: String = sqlx::query_scalar("SELECT forward_mode FROM forward_rules")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(mode, "direct");
-    }
+        create_rule(&repo, 1, &req1).await.unwrap();
 
-    /// The valid combinations must all pass (return None). These are the ones
-    /// the UI and the node actually support in v0.3.0-alpha.
-    #[test]
-    fn valid_combinations_pass() {
-        // The overwhelmingly common case: raw TCP.
-        assert!(validate_protocol_transport("tcp", "raw").is_none());
-        // raw UDP — the only valid UDP combination.
-        assert!(validate_protocol_transport("udp", "raw").is_none());
-        // raw TCP+UDP — both listeners, raw transport.
-        assert!(validate_protocol_transport("tcp_udp", "raw").is_none());
-        // v0.3.0-alpha headline: WS over TCP.
-        assert!(validate_protocol_transport("tcp", "ws").is_none());
-    }
-
-    /// UDP / TCP+UDP over WS must be rejected (WS carries TCP only in alpha).
-    /// This is the constraint the frontend enforces by disabling the protocol
-    /// picker — the API must reject it independently for direct/import callers.
-    #[test]
-    fn ws_rejects_udp_and_tcp_udp() {
-        assert!(validate_protocol_transport("udp", "ws").is_some());
-        assert!(validate_protocol_transport("tcp_udp", "ws").is_some());
-        // And the error message mentions TCP-only so the caller knows why.
-        let msg = validate_protocol_transport("udp", "ws").unwrap();
-        assert!(
-            msg.contains("TCP forwarding only"),
-            "error should explain TCP-only: got {:?}",
-            msg
-        );
-    }
-
-    /// UDP-bearing protocols (udp OR tcp_udp) are rejected for ANY non-raw
-    /// transport, not just ws. tls_simple would also be caught here (though
-    /// that transport is rejected earlier by is_public_transport_accepted).
-    #[test]
-    fn udp_bearing_requires_raw_transport() {
-        // tcp_udp includes a UDP listener → same rule as pure udp.
-        assert!(validate_protocol_transport("tcp_udp", "ws").is_some());
-        assert!(validate_protocol_transport("tcp_udp", "tls").is_some());
-        assert!(validate_protocol_transport("udp", "wss").is_some());
-        // But tcp_udp + raw is fine (both listeners, raw ingress).
-        assert!(validate_protocol_transport("tcp_udp", "raw").is_none());
-    }
-
-    /// WS over TCP is the ONLY valid ws combination. Make sure the boundary is
-    /// exactly at protocol=tcp — anything else is rejected, tcp passes.
-    #[test]
-    fn ws_accepts_only_tcp() {
-        assert!(validate_protocol_transport("tcp", "ws").is_none());
-        // Every other protocol string with ws is rejected.
-        for proto in ["udp", "tcp_udp", "quic", ""] {
-            assert!(
-                validate_protocol_transport(proto, "ws").is_some(),
-                "ws + {:?} should be rejected",
-                proto,
-            );
-        }
-    }
-
-    /// Target normalization: a missing targets list falls back to the legacy
-    /// host:port; an empty list is rejected; >32 is rejected; all-disabled is
-    /// rejected; a bad host is rejected.
-    #[test]
-    fn target_normalization_rules() {
-        // Fallback to legacy single target.
-        let out = normalize_rule_targets(None, "1.2.3.4", 80).unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].host, "1.2.3.4");
-        assert_eq!(out[0].port, 80);
-
-        // Empty explicit list → rejected.
-        assert!(normalize_rule_targets(Some(vec![]), "1.2.3.4", 80).is_err());
-
-        // >32 targets → rejected.
-        let many: Vec<RuleTargetRequest> = (0..33)
-            .map(|_| RuleTargetRequest {
-                host: "1.2.3.4".into(),
-                port: 80,
-                enabled: true,
-            })
-            .collect();
-        assert!(normalize_rule_targets(Some(many), "x", 1).is_err());
-
-        // All-disabled → rejected.
-        let disabled = vec![RuleTargetRequest {
-            host: "1.2.3.4".into(),
-            port: 80,
-            enabled: false,
-        }];
-        assert!(normalize_rule_targets(Some(disabled), "x", 1).is_err());
-
-        // Bad host (has scheme) → rejected.
-        let bad = vec![RuleTargetRequest {
-            host: "http://x".into(),
-            port: 80,
-            enabled: true,
-        }];
-        assert!(normalize_rule_targets(Some(bad), "x", 1).is_err());
-    }
-
-    /// v1.2.x: the unset / "全可转发" sentinel and any garbage fall back to the
-    /// default 10000-65535 pool, so a never-customized group never auto-assigns
-    /// a system port.
-    #[test]
-    fn resolve_auto_port_range_sentinel_and_default() {
-        let def = (DEFAULT_AUTO_PORT_LO, DEFAULT_AUTO_PORT_HI);
-        assert_eq!(resolve_auto_port_range("1-65535"), def, "全可转发 sentinel");
-        assert_eq!(resolve_auto_port_range(""), def, "empty");
-        assert_eq!(resolve_auto_port_range("   "), def, "whitespace");
-        assert_eq!(resolve_auto_port_range("garbage"), def, "no dash");
-        assert_eq!(resolve_auto_port_range("10000"), def, "single number");
-        assert_eq!(resolve_auto_port_range("abc-def"), def, "non-numeric");
-        assert_eq!(resolve_auto_port_range("65000-100"), def, "start > end");
-        assert_eq!(resolve_auto_port_range("0-100"), def, "start < 1");
-        assert_eq!(resolve_auto_port_range("1-70000"), def, "end > 65535");
-    }
-
-    /// An explicit narrowing is honored verbatim — including sub-10000 ports the
-    /// admin deliberately opted into, and including exact-boundary narrowings
-    /// that are NOT the `1-65535` sentinel.
-    #[test]
-    fn resolve_auto_port_range_explicit_is_honored() {
-        assert_eq!(resolve_auto_port_range("65000-65100"), (65000, 65100));
-        // "5000-65535" is an explicit choice → really hands out 5000-9999.
-        assert_eq!(resolve_auto_port_range("5000-65535"), (5000, 65535));
-        // A one-off narrowing of either bound is NOT the sentinel.
-        assert_eq!(resolve_auto_port_range("2-65535"), (2, 65535));
-        assert_eq!(resolve_auto_port_range("1-65534"), (1, 65534));
-        // Single-port pool.
-        assert_eq!(resolve_auto_port_range("40000-40000"), (40000, 40000));
-        // Surrounding whitespace is trimmed on both the whole string and parts.
-        assert_eq!(resolve_auto_port_range("  5000 - 6000  "), (5000, 6000));
-    }
-
-    /// The ring-scan offset is always inside the pool span, so `lo + offset`
-    /// can never exceed `hi` (guards the u16 cast in auto_assign_port).
-    #[test]
-    fn pseudo_random_offset_within_span() {
-        for span in [1u32, 2, 101, 55536, 65535] {
-            let off = pseudo_random_offset(span);
-            assert!(off < span, "offset {} must be < span {}", off, span);
-        }
-    }
-
-    // ── v1.2.12 (full audit) ──
-
-    /// A rule of user 1 named "before" on group 1, with a 20 Mbps download cap.
-    async fn seed_edit_target(pool: &sqlx::SqlitePool) {
-        sqlx::query(
-            "INSERT INTO forward_rules (id, name, uid, listen_port, device_group_in, \
-             target_addr, target_port, download_limit_mbps) \
-             VALUES (1, 'before', 1, 24010, 1, '127.0.0.1', 80, 20)",
-        )
-        .execute(pool)
-        .await
+        let req2: CreateRuleRequest = serde_json::from_value(serde_json::json!({
+            "name": "site-b",
+            "listen_port": 443,
+            "protocol": "tcp",
+            "sni": "*.b.example.com",
+            "device_group_in": 1,
+            "target_addr": "10.0.0.2",
+            "target_port": 8443
+        }))
         .unwrap();
-    }
+        create_rule(&repo, 1, &req2).await.unwrap();
 
-    /// A rejected edit changes nothing. The restart-interval floor used to be
-    /// checked only after the name (and targets, limits) had been saved.
-    #[tokio::test]
-    async fn a_rejected_edit_changes_nothing() {
-        let (pool, repo) = transport_test_db().await;
-        seed_edit_target(&pool).await;
-        let req = UpdateRuleRequest {
-            name: Some("after".into()),
-            auto_restart_minutes: Some(1),
-            ..Default::default()
-        };
-        assert!(matches!(
-            update_rule(&repo, 1, &ResourceScope::All, &req).await,
-            Err(UpdateRuleError::BadRequest(_))
-        ));
-        let rule = repo
-            .find_rule_by_id(1, &ResourceScope::All)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(rule.name, "before");
-    }
-
-    /// Setting one rate-limit direction keeps the other: it used to be
-    /// written as 0, i.e. no limit.
-    #[tokio::test]
-    async fn an_edit_of_one_rate_limit_keeps_the_other() {
-        let (pool, repo) = transport_test_db().await;
-        seed_edit_target(&pool).await;
-        let req = UpdateRuleRequest {
-            upload_limit_mbps: Some(5),
-            ..Default::default()
-        };
-        update_rule(&repo, 1, &ResourceScope::All, &req)
-            .await
-            .unwrap();
-        let rule = repo
-            .find_rule_by_id(1, &ResourceScope::All)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!((rule.upload_limit_mbps, rule.download_limit_mbps), (5, 20));
-    }
-
-    /// The API checks a restricted user's device-group authorization before
-    /// the write; an admin can revoke it in between. The write re-checks it,
-    /// so the user gets no rule — and no listener — on the revoked group:
-    /// neither a new one, nor a paused one resumed, nor one moved there.
-    #[tokio::test]
-    async fn an_authorization_revoked_after_the_api_check_still_counts() {
-        use crate::db::repo::DeviceGroupAuthRepository;
-        let (pool, repo) = transport_test_db().await;
-        sqlx::query(
-            "INSERT INTO users (id, username, password, admin, all_device_groups) \
-             VALUES (2, 'u2', 'x', 0, 0)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (2, 'other', 'in', 'unused-2', 1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        for (id, port, group) in [(7, 24020, 1), (8, 24021, 2)] {
-            sqlx::query(
-                "INSERT INTO forward_rules (id, name, uid, listen_port, device_group_in, \
-                 target_addr, target_port, paused) VALUES (?, 'r', 2, ?, ?, '127.0.0.1', 80, 1)",
-            )
-            .bind(id)
-            .bind(port)
-            .bind(group)
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
-        // The API's check passed while group 1 was granted; then it was revoked.
-        repo.update_user_authorization(2, None, Some(&[1]))
-            .await
-            .unwrap();
-        repo.update_user_authorization(2, None, Some(&[]))
-            .await
-            .unwrap();
-
-        let create: CreateRuleRequest = serde_json::from_value(serde_json::json!({
-            "name": "late", "listen_port": 24022, "protocol": "tcp",
-            "device_group_in": 1, "target_addr": "10.0.0.5", "target_port": 80
+        // Duplicate SNI on same port must conflict
+        let dup: CreateRuleRequest = serde_json::from_value(serde_json::json!({
+            "name": "site-a-dup",
+            "listen_port": 443,
+            "protocol": "tcp",
+            "sni": "A.Example.com",
+            "device_group_in": 1,
+            "target_addr": "10.0.0.3",
+            "target_port": 443
         }))
         .unwrap();
         assert!(matches!(
-            create_rule(&repo, 2, false, &create).await,
-            Err(CreateRuleError::Forbidden)
-        ));
-        let owner = ResourceScope::Owner(2);
-        let resume = UpdateRuleRequest {
-            paused: Some(false),
-            ..Default::default()
-        };
-        assert!(matches!(
-            update_rule(&repo, 7, &owner, &resume).await,
-            Err(UpdateRuleError::Forbidden(_))
-        ));
-        let move_to_1 = UpdateRuleRequest {
-            device_group_in: Some(1),
-            ..Default::default()
-        };
-        assert!(matches!(
-            update_rule(&repo, 8, &owner, &move_to_1).await,
-            Err(UpdateRuleError::Forbidden(_))
+            create_rule(&repo, 1, &dup).await,
+            Err(CreateRuleError::PortConflict(443))
         ));
 
-        let rules: Vec<(i64, bool, i64)> =
-            sqlx::query_as("SELECT id, paused, device_group_in FROM forward_rules ORDER BY id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert_eq!(rules, vec![(7, true, 1), (8, true, 2)]);
-        let config = crate::service::node_config::build_node_config(&repo, 1)
-            .await
-            .unwrap();
-        assert!(
-            config.listeners.is_empty(),
-            "no listener on the revoked group"
-        );
-
-        // An admin may still act for the user.
-        update_rule(&repo, 7, &ResourceScope::All, &resume)
-            .await
-            .unwrap();
-    }
-    /// Batch "move to another group" is one PUT per rule with only
-    /// `device_group_in`. A listen port is unique per inbound group, so a rule
-    /// whose port is taken in the target group is refused with PortConflict and
-    /// stays where it was; one with a free port moves.
-    #[tokio::test]
-    async fn moving_a_rule_to_a_group_where_its_port_is_taken_is_refused() {
-        let (pool, repo) = transport_test_db().await;
-        sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (2, 'other', 'in', 'unused-2', 1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        // (id, port, group): rule 1 collides with rule 3 on port 24030 in group 2.
-        for (id, port, group) in [(1, 24030, 1), (2, 24031, 1), (3, 24030, 2)] {
-            sqlx::query(
-                "INSERT INTO forward_rules (id, name, uid, listen_port, device_group_in, \
-                 target_addr, target_port, paused) VALUES (?, 'r', 1, ?, ?, '127.0.0.1', 80, 0)",
-            )
-            .bind(id)
-            .bind(port)
-            .bind(group)
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
-        let to_2 = UpdateRuleRequest {
-            device_group_in: Some(2),
-            ..Default::default()
-        };
-        let owner = ResourceScope::Owner(1);
+        // Raw TCP (no SNI) on same port 443 must also conflict with existing SNI rules
+        let raw_tcp: CreateRuleRequest = serde_json::from_value(serde_json::json!({
+            "name": "raw-443",
+            "listen_port": 443,
+            "protocol": "tcp",
+            "device_group_in": 1,
+            "target_addr": "10.0.0.4",
+            "target_port": 443
+        }))
+        .unwrap();
         assert!(matches!(
-            update_rule(&repo, 1, &owner, &to_2).await,
-            Err(UpdateRuleError::PortConflict)
+            create_rule(&repo, 1, &raw_tcp).await,
+            Err(CreateRuleError::PortConflict(443))
         ));
-        update_rule(&repo, 2, &owner, &to_2).await.unwrap();
 
-        let rules: Vec<(i64, i64)> =
-            sqlx::query_as("SELECT id, device_group_in FROM forward_rules ORDER BY id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert_eq!(rules, vec![(1, 1), (2, 2), (3, 2)]);
+        // Verify max_connections and auto_restart_minutes persisted on creation
+        let rules = repo.list_rules(&ResourceScope::All).await.unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].sni.as_deref(), Some("a.example.com"));
+        assert_eq!(rules[0].max_connections, 256);
+        assert_eq!(rules[0].auto_restart_minutes, 60);
+        assert_eq!(rules[1].sni.as_deref(), Some("*.b.example.com"));
     }
 }
