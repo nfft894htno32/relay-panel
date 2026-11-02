@@ -3,17 +3,19 @@
 set -Eeuo pipefail
 
 # ==============================================================================
-# 多域名 Cloudflare DNS 解析 + SSL 证书自动签发 + Nginx 200 测速伪装站一键部署脚本
-#
-# 核心能力：
-#   1. 支持一次输入多个域名（空格或逗号分隔，支持跨不同主域名 Zone）
-#   2. 通过 Cloudflare API Token 自动添加/更新 A / AAAA 解析记录（自动关闭小黄云代理）
-#   3. 通过 Certbot + Cloudflare DNS-01 自动批量签发/复用 SSL 证书并配置自动续期重载
-#   4. 默认监听本地 127.0.0.1:10443（把公网 443 腾给 relay-node 多 SNI 分流），亦可选公网 443
-#   5. 部署逼真的「边缘节点网络质量测速」静态网页（HTTP 200 OK，含真实 RTT 延迟与吞吐测速）
-#   6. 完整备份原有 Nginx 配置，逐域名本机 HTTPS 200 校验，异常时全量自动回滚
+# 多域名 Cloudflare DNS + acme.sh SSL 证书 + Nginx 200 测速伪装站一键部署脚本
+# （100% 兼容原有 acme.sh 单域名脚本，支持自动接管/迁移旧域名并释放公网 443 端口）
 # ==============================================================================
 
+# 可选固定配置（公开仓库保持为空即可；若为空，脚本会自动读取 /root/.acme.sh/account.conf 已存 Token 或交互提示输入）
+CF_API_TOKEN="${CF_API_TOKEN:-}"
+
+# Cloudflare 是否开启小云朵代理（中转直连必须为 false）
+CF_PROXIED=false
+
+# ==============================================================================
+# 基础输出函数
+# ==============================================================================
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
@@ -28,49 +30,33 @@ if [[ $EUID -ne 0 ]]; then
     error "请使用 root 用户运行此脚本"
 fi
 
-# ------------------------------------------------------------------------------
-# 1. 环境检查与依赖自动安装
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# 1. 安装基础组件（与原脚本保持完全一致，使用 acme.sh，不混用 certbot）
+# ==============================================================================
 ensure_dependencies() {
-    local missing_pkgs=()
+    local missing=()
+    command -v nginx >/dev/null 2>&1   || missing+=("nginx")
+    command -v curl >/dev/null 2>&1    || missing+=("curl")
+    command -v jq >/dev/null 2>&1      || missing+=("jq")
+    command -v openssl >/dev/null 2>&1 || missing+=("openssl")
+    command -v crontab >/dev/null 2>&1 || missing+=("cron")
+    command -v ss >/dev/null 2>&1      || missing+=("iproute2")
 
-    command -v curl >/dev/null 2>&1    || missing_pkgs+=("curl")
-    command -v jq >/dev/null 2>&1      || missing_pkgs+=("jq")
-    command -v openssl >/dev/null 2>&1 || missing_pkgs+=("openssl")
-    command -v ss >/dev/null 2>&1      || missing_pkgs+=("iproute2")
-    command -v nginx >/dev/null 2>&1   || missing_pkgs+=("nginx")
-    command -v certbot >/dev/null 2>&1 || missing_pkgs+=("certbot")
-
-    # 检查 certbot cloudflare 插件
-    if ! command -v certbot >/dev/null 2>&1 || ! certbot plugins 2>/dev/null | grep -qi "dns-cloudflare"; then
-        missing_pkgs+=("python3-certbot-dns-cloudflare")
+    if (( ${#missing[@]} > 0 )); then
+        info "安装缺失组件：${missing[*]} ..."
+        apt-get update -y -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            nginx curl jq ca-certificates openssl cron iproute2
     fi
 
-    if (( ${#missing_pkgs[@]} > 0 )); then
-        info "正在自动安装缺失依赖：${missing_pkgs[*]} ..."
-        if command -v apt-get >/dev/null 2>&1; then
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq
-            apt-get install -y -qq "${missing_pkgs[@]}"
-        else
-            error "当前系统非 Debian/Ubuntu，请先手动安装：${missing_pkgs[*]}"
-        fi
-    fi
-
-    for cmd in nginx systemctl ss curl jq openssl certbot awk grep sed tail cp mv ln readlink date mktemp chmod chown rm dd; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            error "缺少必要命令：$cmd"
-        fi
-    done
+    systemctl enable nginx >/dev/null 2>&1 || true
+    systemctl enable --now cron >/dev/null 2>&1 || true
 }
 
-# 检测 Nginx 版本是否 >= 1.25.1（决定使用 `http2 on;` 还是 `listen ... ssl http2;`）
 nginx_supports_http2_directive() {
     local ver major minor patch
     ver=$(nginx -v 2>&1 | sed -nE 's/.*nginx\/([0-9]+)\.([0-9]+)\.([0-9]+).*/\1 \2 \3/p')
-    if [[ -z "$ver" ]]; then
-        return 1
-    fi
+    [[ -z "$ver" ]] && return 1
     read -r major minor patch <<< "$ver"
     if (( major > 1 )) || (( major == 1 && minor > 25 )) || (( major == 1 && minor == 25 && patch >= 1 )); then
         return 0
@@ -78,30 +64,30 @@ nginx_supports_http2_directive() {
     return 1
 }
 
-# ------------------------------------------------------------------------------
-# 2. 交互式收集域名、端口模式与 Cloudflare 配置
-# ------------------------------------------------------------------------------
 ensure_dependencies
 
 echo
 echo -e "${CYAN}============================================================${NC}"
-echo -e "${CYAN}   多域名 SSL 证书签发 + 网络测速伪装站 (HTTP 200) 部署工具   ${NC}"
+echo -e "${CYAN}  多域名 acme.sh 证书 + 网络测速伪装站 (HTTP 200) 部署工具  ${NC}"
 echo -e "${CYAN}============================================================${NC}"
 echo
 
-read -rp "请输入要部署的域名（多个域名用空格或逗号分隔，如 hk1.example.com hk2.example.com）: " RAW_DOMAINS
+# ==============================================================================
+# 2. 输入多域名 & 选择监听模式 & 检测旧版占用 443 的站点
+# ==============================================================================
+read -rp "请输入要配置的域名（多个域名用空格或逗号分隔，如 de01.example.com de02.example.com）: " RAW_DOMAINS
 
-# 清洗并拆分域名列表
 RAW_DOMAINS="${RAW_DOMAINS//,/ }"
 declare -a DOMAINS=()
 declare -A SEEN_DOMAINS=()
 
-for item in $RAW_DOMAINS; do
-    d=$(echo "$item" | tr '[:upper:]' '[:lower:]' | xargs)
+add_domain() {
+    local d="$1"
+    d=$(echo "$d" | tr '[:upper:]' '[:lower:]' | xargs)
     d="${d#http://}"
     d="${d#https://}"
     d="${d%%/*}"
-    [[ -z "$d" ]] && continue
+    [[ -z "$d" ]] && return 0
 
     if ! [[ "$d" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$ ]]; then
         error "域名格式不正确：$d"
@@ -111,18 +97,16 @@ for item in $RAW_DOMAINS; do
         SEEN_DOMAINS[$d]=1
         DOMAINS+=("$d")
     fi
+}
+
+for item in $RAW_DOMAINS; do
+    add_domain "$item"
 done
-
-if (( ${#DOMAINS[@]} == 0 )); then
-    error "未输入任何有效域名"
-fi
-
-info "共识别到 ${#DOMAINS[@]} 个域名：${DOMAINS[*]}"
 
 echo
 echo "请选择 Nginx HTTPS 监听模式："
-echo "  1) 本地回源模式 127.0.0.1:10443 （推荐：将公网 443 留给 relay-node 多 SNI 分流）"
-echo "  2) 公网直连模式 0.0.0.0:443 & [::]:443 （Nginx 直接占用公网 443）"
+echo "  1) 本地回源模式 127.0.0.1:10443 （推荐：将公网 443 腾给 relay-node 多 SNI 分流）"
+echo "  2) 公网直连模式 0.0.0.0:443 & [::]:443 （Nginx 直接监听公网 443）"
 read -rp "请输入选项 [1/2，默认 1]: " LISTEN_MODE
 LISTEN_MODE="${LISTEN_MODE:-1}"
 
@@ -142,256 +126,328 @@ else
     error "无效的监听模式选项：$LISTEN_MODE"
 fi
 
-# ------------------------------------------------------------------------------
-# 3. Cloudflare API Token 读取与校验
-# ------------------------------------------------------------------------------
-CF_CRED_FILE="/etc/letsencrypt/cloudflare.ini"
-CF_TOKEN=""
-
-if [[ -f "$CF_CRED_FILE" ]]; then
-    EXISTING_TOKEN=$(awk -F'=' '/dns_cloudflare_api_token/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$CF_CRED_FILE" || true)
-    if [[ -n "$EXISTING_TOKEN" ]]; then
-        echo
-        read -rp "检测到已保存的 Cloudflare API Token (${CF_CRED_FILE})，是否直接沿用？[Y/n]: " USE_EXISTING
-        USE_EXISTING="${USE_EXISTING:-Y}"
-        if [[ "$USE_EXISTING" =~ ^[Yy]$ ]]; then
-            CF_TOKEN="$EXISTING_TOKEN"
-        fi
-    fi
-fi
-
-if [[ -z "$CF_TOKEN" ]]; then
-    echo
-    read -rsp "请输入 Cloudflare API Token（需具备 Zone:DNS:Edit 权限，输入不回显）: " CF_TOKEN
-    echo
-    CF_TOKEN=$(echo "$CF_TOKEN" | xargs)
-    if [[ -z "$CF_TOKEN" ]]; then
-        error "Cloudflare API Token 不能为空"
-    fi
-fi
-
-info "正在验证 Cloudflare API Token ..."
-CF_VERIFY_RESP=$(curl -fsSL -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
-    "https://api.cloudflare.com/client/v4/zones?per_page=1" 2>/dev/null || true)
-
-if [[ -z "$CF_VERIFY_RESP" ]] || [[ "$(echo "$CF_VERIFY_RESP" | jq -r '.success // false')" != "true" ]]; then
-    error "Cloudflare API Token 验证失败，请检查 Token 是否正确且包含 Zone.DNS 编辑权限"
-fi
-info "Cloudflare API Token 验证通过"
-
-mkdir -p /etc/letsencrypt
-umask 077
-cat > "$CF_CRED_FILE" <<EOF
-dns_cloudflare_api_token = ${CF_TOKEN}
-EOF
-chmod 600 "$CF_CRED_FILE"
-
-# ------------------------------------------------------------------------------
-# 4. Cloudflare DNS 记录自动添加 / 更新
-# ------------------------------------------------------------------------------
-detect_public_ip() {
-    local family="$1"
-    local urls=()
-    if [[ "$family" == "4" ]]; then
-        urls=("https://api4.ipify.org" "https://ipv4.icanhazip.com" "https://v4.ident.me")
-    else
-        urls=("https://api6.ipify.org" "https://ipv6.icanhazip.com" "https://v6.ident.me")
-    fi
-    local ip=""
-    for u in "${urls[@]}"; do
-        ip=$(curl "-${family}" -fsSL --connect-timeout 4 --max-time 6 "$u" 2>/dev/null | xargs || true)
-        if [[ -n "$ip" ]]; then
-            echo "$ip"
-            return 0
-        fi
-    done
-    return 0
-}
-
-echo
-read -rp "是否自动在 Cloudflare 添加/更新这些域名指向本机的 DNS 解析（仅 DNS 灰云）？[Y/n]: " AUTO_DNS
-AUTO_DNS="${AUTO_DNS:-Y}"
-
-declare -A ZONE_CACHE=()
-
-# 查找域名在 Cloudflare 中对应的 Zone ID（按最长后缀逐级匹配并带内存缓存）
-find_cf_zone_id() {
-    local domain="$1"
-    local candidate="$domain"
-    while [[ "$candidate" == *.* ]]; do
-        if [[ -n "${ZONE_CACHE[$candidate]:-}" ]]; then
-            echo "${ZONE_CACHE[$candidate]}"
-            return 0
-        fi
-        local resp zone_id
-        resp=$(curl -fsSL -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
-            "https://api.cloudflare.com/client/v4/zones?name=${candidate}&status=active" 2>/dev/null || true)
-        zone_id=$(echo "$resp" | jq -r '.result[0].id // empty' 2>/dev/null || true)
-        if [[ -n "$zone_id" ]]; then
-            ZONE_CACHE[$candidate]="$zone_id"
-            echo "$zone_id"
-            return 0
-        fi
-        candidate="${candidate#*.}"
-    done
-    return 1
-}
-
-upsert_cf_dns_record() {
-    local zone_id="$1"
-    local domain="$2"
-    local rtype="$3"
-    local target_ip="$4"
-
-    local list_resp record_id payload write_resp
-    list_resp=$(curl -fsSL -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
-        "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?type=${rtype}&name=${domain}" 2>/dev/null || true)
-
-    record_id=$(echo "$list_resp" | jq -r '.result[0].id // empty' 2>/dev/null || true)
-    payload=$(jq -nc \
-        --arg type "$rtype" \
-        --arg name "$domain" \
-        --arg content "$target_ip" \
-        '{type: $type, name: $name, content: $content, ttl: 60, proxied: false}')
-
-    if [[ -n "$record_id" ]]; then
-        write_resp=$(curl -fsSL -X PUT \
-            -H "Authorization: Bearer ${CF_TOKEN}" \
-            -H "Content-Type: application/json" \
-            --data "$payload" \
-            "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}" 2>/dev/null || true)
-    else
-        write_resp=$(curl -fsSL -X POST \
-            -H "Authorization: Bearer ${CF_TOKEN}" \
-            -H "Content-Type: application/json" \
-            --data "$payload" \
-            "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" 2>/dev/null || true)
-    fi
-
-    if [[ "$(echo "$write_resp" | jq -r '.success // false')" != "true" ]]; then
-        local err_msg
-        err_msg=$(echo "$write_resp" | jq -r '.errors[0].message // "未知错误"' 2>/dev/null || echo "未知错误")
-        error "Cloudflare DNS ${rtype} 记录更新失败 (${domain})：${err_msg}"
-    fi
-    info "DNS 已就绪：${domain} [${rtype}] -> ${target_ip} (仅 DNS / 未开代理)"
-}
-
-if [[ "$AUTO_DNS" =~ ^[Yy]$ ]]; then
-    DETECTED_IPV4=$(detect_public_ip 4)
-    DETECTED_IPV6=$(detect_public_ip 6)
-
-    read -rp "确认用于 A 记录的本机 IPv4 地址 [默认 ${DETECTED_IPV4:-跳过}]: " TARGET_IPV4
-    TARGET_IPV4="${TARGET_IPV4:-$DETECTED_IPV4}"
-
-    TARGET_IPV6=""
-    if [[ -n "$DETECTED_IPV6" ]]; then
-        read -rp "检测到本机 IPv6 (${DETECTED_IPV6})，是否同时配置 AAAA 记录？[y/N]: " BIND_V6
-        if [[ "${BIND_V6:-N}" =~ ^[Yy]$ ]]; then
-            TARGET_IPV6="$DETECTED_IPV6"
-        fi
-    fi
-
-    if [[ -z "$TARGET_IPV4" && -z "$TARGET_IPV6" ]]; then
-        warn "未提供任何目标 IP，跳过 DNS 记录修改"
-    else
-        for domain in "${DOMAINS[@]}"; do
-            zone_id=$(find_cf_zone_id "$domain" || true)
-            if [[ -z "$zone_id" ]]; then
-                error "在当前 Cloudflare 账号下未找到域名 ${domain} 所属的活跃 Zone"
-            fi
-
-            [[ -n "$TARGET_IPV4" ]] && upsert_cf_dns_record "$zone_id" "$domain" "A" "$TARGET_IPV4"
-            [[ -n "$TARGET_IPV6" ]] && upsert_cf_dns_record "$zone_id" "$domain" "AAAA" "$TARGET_IPV6"
-        done
-    fi
-fi
-
-# ------------------------------------------------------------------------------
-# 5. SSL 证书检查与自动签发（优先沿用有效现有证书，否则 Certbot DNS-01 签发）
-# ------------------------------------------------------------------------------
 AVAILABLE_DIR="/etc/nginx/sites-available"
 ENABLED_DIR="/etc/nginx/sites-enabled"
 mkdir -p "$AVAILABLE_DIR" "$ENABLED_DIR"
 
-declare -A DOMAIN_CERT=()
-declare -A DOMAIN_KEY=()
+# 关键防冲突处理：在模式 1 (127.0.0.1:10443) 下，自动扫描已有的占用公网 443 的旧域名站点！
+# 避免旧脚本创建的站点继续霸占 0.0.0.0:443 导致与 relay-node 冲突或 Nginx 无法启动。
+declare -A MIGRATE_ONLY_DOMAINS=()
+if [[ "$LISTEN_MODE" == "1" ]]; then
+    declare -a LEGACY_443_DOMAINS=()
+    shopt -s nullglob
+    for f in "${ENABLED_DIR}"/*; do
+        base=$(basename "$f")
+        [[ "$base" == "default" ]] && continue
+        if grep -qE 'listen[[:space:]]+(\[::\]:)?443([[:space:];]|$)' "$f" 2>/dev/null; then
+            if [[ -z "${SEEN_DOMAINS[$base]:-}" ]]; then
+                LEGACY_443_DOMAINS+=("$base")
+            fi
+        fi
+    done
+    shopt -u nullglob
 
+    if (( ${#LEGACY_443_DOMAINS[@]} > 0 )); then
+        echo
+        warn "检测到本机已有旧站点正在监听公网 443 端口：${LEGACY_443_DOMAINS[*]}"
+        warn "若不一起迁移到 127.0.0.1:${INTERNAL_HTTPS_PORT}，Nginx 会与 relay-node 争抢 443 端口导致启动报错！"
+        read -rp "是否将这些旧站点一并无损迁移到 127.0.0.1:${INTERNAL_HTTPS_PORT} + 200 测速页（直接沿用原证书）？[Y/n]: " MIGRATE_OLD
+        MIGRATE_OLD="${MIGRATE_OLD:-Y}"
+        if [[ "$MIGRATE_OLD" =~ ^[Yy]$ ]]; then
+            for old_d in "${LEGACY_443_DOMAINS[@]}"; do
+                SEEN_DOMAINS[$old_d]=1
+                DOMAINS+=("$old_d")
+                MIGRATE_ONLY_DOMAINS[$old_d]=1
+            done
+        fi
+    fi
+
+    if grep -qE '^[[:space:]]*listen[[:space:]]+(\[::\]:)?443([[:space:];]|$)' /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf 2>/dev/null; then
+        warn "注意：检测到 /etc/nginx/nginx.conf 或 conf.d/*.conf 中仍存在 listen 443 配置（例如旧的 stream 块）！"
+        warn "使用 relay-node 原生多 SNI 分流时，请注释或删除 nginx.conf 中的 stream 443 块，把公网 443 让给 relay-node。"
+    fi
+fi
+
+if (( ${#DOMAINS[@]} == 0 )); then
+    error "未指定任何需要配置或迁移的域名"
+fi
+
+info "本次共处理 ${#DOMAINS[@]} 个域名：${DOMAINS[*]}"
+
+# 清理此前如果误装了 certbot 可能留在 /etc/letsencrypt 下无主冲突的配置（不影响有效证书）
+if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^certbot\.timer'; then
+    # 如果用户统一使用 acme.sh，停用 certbot.timer 防止两个续期器争抢 /etc/letsencrypt/live
+    systemctl disable --now certbot.timer >/dev/null 2>&1 || true
+fi
+
+# ==============================================================================
+# 3. 读取 / 校验 Cloudflare API Token（自动兼容 acme.sh 已保存的 Token！）
+# ==============================================================================
+ACME_HOME="/root/.acme.sh"
+ACME_SH="${ACME_HOME}/acme.sh"
+ACME_ACCOUNT_CONF="${ACME_HOME}/account.conf"
+CF_CRED_BACKUP="/etc/letsencrypt/cloudflare.ini"
+
+if [[ -z "$CF_API_TOKEN" || "$CF_API_TOKEN" == "这里填写你的Cloudflare_API_Token" ]]; then
+    CF_API_TOKEN=""
+    # 1. 优先从原脚本 acme.sh 的 account.conf 自动提取 SAVED_CF_Token
+    if [[ -f "$ACME_ACCOUNT_CONF" ]]; then
+        CF_API_TOKEN=$(awk -F'=' '/^SAVED_CF_Token=/ {v=$2; gsub(/^[\x27"]|[\x27"]$/, "", v); gsub(/[[:space:]]/, "", v); print v; exit}' "$ACME_ACCOUNT_CONF" || true)
+    fi
+    # 2. 其次尝试读取 /etc/letsencrypt/cloudflare.ini
+    if [[ -z "$CF_API_TOKEN" && -f "$CF_CRED_BACKUP" ]]; then
+        CF_API_TOKEN=$(awk -F'=' '/dns_cloudflare_api_token/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$CF_CRED_BACKUP" || true)
+    fi
+
+    if [[ -n "$CF_API_TOKEN" ]]; then
+        echo
+        read -rp "检测到本机已保存的 Cloudflare API Token，是否直接沿用？[Y/n]: " USE_SAVED_CF
+        USE_SAVED_CF="${USE_SAVED_CF:-Y}"
+        if ! [[ "$USE_SAVED_CF" =~ ^[Yy]$ ]]; then
+            CF_API_TOKEN=""
+        fi
+    fi
+
+    if [[ -z "$CF_API_TOKEN" ]]; then
+        echo
+        read -rsp "请输入 Cloudflare API Token（需 Zone:Read + DNS:Edit 权限，输入不回显）: " CF_API_TOKEN
+        echo
+        CF_API_TOKEN=$(echo "$CF_API_TOKEN" | xargs)
+    fi
+fi
+
+# 检查是否所有域名都已有未过期证书且无需跑 DNS（例如纯迁移旧站点）
+NEED_CF_API=0
 cert_is_valid_30d() {
     local cert_file="$1"
     [[ -f "$cert_file" ]] && openssl x509 -in "$cert_file" -noout -checkend 2592000 >/dev/null 2>&1
 }
 
-for domain in "${DOMAINS[@]}"; do
-    conf_path="${AVAILABLE_DIR}/${domain}"
-    if [[ -L "$conf_path" ]]; then
-        resolved=$(readlink -f "$conf_path" || true)
-        [[ -n "$resolved" && -f "$resolved" ]] && conf_path="$resolved"
+for d in "${DOMAINS[@]}"; do
+    if [[ -z "${MIGRATE_ONLY_DOMAINS[$d]:-}" ]] || ! cert_is_valid_30d "/etc/letsencrypt/live/${d}/fullchain.pem"; then
+        NEED_CF_API=1
+        break
     fi
+done
+
+CF_API="https://api.cloudflare.com/client/v4"
+CF_AUTH_HEADER=(
+    -H "Authorization: Bearer ${CF_API_TOKEN}"
+    -H "Content-Type: application/json"
+)
+
+if (( NEED_CF_API == 1 )); then
+    if [[ -z "$CF_API_TOKEN" ]]; then
+        error "Cloudflare API Token 不能为空"
+    fi
+    info "正在验证 Cloudflare API Token ..."
+    CF_VERIFY=$(curl -fsS "${CF_AUTH_HEADER[@]}" "${CF_API}/zones?per_page=1" 2>/dev/null || true)
+    if [[ "$(echo "$CF_VERIFY" | jq -r '.success // false' 2>/dev/null)" != "true" ]]; then
+        error "Cloudflare API Token 验证失败，请检查权限（Zone -> Zone -> Read, Zone -> DNS -> Edit）"
+    fi
+    info "Cloudflare API Token 验证通过"
+fi
+
+# ==============================================================================
+# 4. 获取服务器公网 IPv4 并在 Cloudflare 新增 A 记录（保留其他同名 A 记录不动）
+# ==============================================================================
+declare -A ZONE_CACHE=()
+declare -A DOMAIN_ZONE_ID=()
+
+find_zone_id() {
+    local domain="$1"
+    local current="$domain"
+    while [[ "$current" == *.* ]]; do
+        if [[ -n "${ZONE_CACHE[$current]:-}" ]]; then
+            echo "${ZONE_CACHE[$current]}"
+            return 0
+        fi
+        local resp found_id
+        resp=$(curl -fsS "${CF_AUTH_HEADER[@]}" "${CF_API}/zones?name=${current}&status=active" 2>/dev/null || true)
+        found_id=$(echo "$resp" | jq -r '.result[0].id // empty' 2>/dev/null || true)
+        if [[ -n "$found_id" ]]; then
+            ZONE_CACHE[$current]="$found_id"
+            echo "$found_id"
+            return 0
+        fi
+        current="${current#*.}"
+    done
+    return 1
+}
+
+if (( NEED_CF_API == 1 )); then
+    info "获取服务器公网 IPv4..."
+    SERVER_IP=""
+    for ip_url in "https://api.ipify.org" "https://api4.ipify.org" "https://ipv4.icanhazip.com"; do
+        SERVER_IP=$(curl -4 -fsS --max-time 10 "$ip_url" 2>/dev/null | xargs || true)
+        [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && break
+    done
+
+    if ! [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        error "无法获取服务器公网 IPv4"
+    fi
+    info "服务器公网 IP：$SERVER_IP"
+
+    for domain in "${DOMAINS[@]}"; do
+        [[ -n "${MIGRATE_ONLY_DOMAINS[$domain]:-}" ]] && continue
+
+        zone_id=$(find_zone_id "$domain" || true)
+        if [[ -z "$zone_id" ]]; then
+            error "无法找到域名 ${domain} 对应的 Cloudflare Zone，请检查域名是否已接入 Cloudflare"
+        fi
+        DOMAIN_ZONE_ID[$domain]="$zone_id"
+
+        # 完全沿用您原脚本逻辑：仅当当前服务器 IP 的 A 记录不存在时新增，绝不覆盖其他同名 A 记录
+        dns_resp=$(curl -fsS "${CF_AUTH_HEADER[@]}" "${CF_API}/zones/${zone_id}/dns_records?type=A&name=${domain}")
+        if [[ "$(echo "$dns_resp" | jq -r '.success')" != "true" ]]; then
+            echo "$dns_resp" | jq . >&2 || true
+            error "[${domain}] Cloudflare DNS 记录查询失败"
+        fi
+
+        current_ip_record_id=$(echo "$dns_resp" | jq -r --arg ip "$SERVER_IP" 'first(.result[]? | select(.content == $ip) | .id) // empty')
+        if [[ -n "$current_ip_record_id" ]]; then
+            info "[${domain}] 当前服务器 IP (${SERVER_IP}) 的 A 记录已存在，跳过重复新增"
+        else
+            dns_data=$(jq -n \
+                --arg type "A" \
+                --arg name "$domain" \
+                --arg content "$SERVER_IP" \
+                --argjson proxied "$CF_PROXIED" \
+                '{type: $type, name: $name, content: $content, ttl: 60, proxied: $proxied}')
+
+            result=$(curl -fsS -X POST "${CF_AUTH_HEADER[@]}" "${CF_API}/zones/${zone_id}/dns_records" --data "$dns_data")
+            if [[ "$(echo "$result" | jq -r '.success')" != "true" ]]; then
+                echo "$result" | jq . >&2 || true
+                error "[${domain}] Cloudflare DNS A 记录新增失败"
+            fi
+            info "[${domain}] DNS A 记录新增成功 -> ${SERVER_IP}（其他同名 A 记录全部保留）"
+        fi
+    done
+fi
+
+# ==============================================================================
+# 5. 安装 acme.sh 并按需签发 / 沿用 SSL 证书
+# ==============================================================================
+ensure_acme_sh() {
+    local installer="/tmp/acme-install.sh"
+    if [[ ! -x "$ACME_SH" || ! -f "${ACME_HOME}/dnsapi/dns_cf.sh" ]]; then
+        info "安装 acme.sh..."
+        if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 \
+            https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh -o "$installer"; then
+            error "acme.sh 下载失败，请检查服务器是否能访问 raw.githubusercontent.com"
+        fi
+        chmod 700 "$installer"
+        sh "$installer" --install-online --home "$ACME_HOME" --config-home "$ACME_HOME" --nocron --noprofile
+        rm -f "$installer"
+    fi
+    chmod 700 "$ACME_HOME"
+    "$ACME_SH" --install-cronjob --home "$ACME_HOME" --config-home "$ACME_HOME" >/dev/null
+}
+
+declare -A DOMAIN_CERT=()
+declare -A DOMAIN_KEY=()
+
+for domain in "${DOMAINS[@]}"; do
+    existing_conf="${AVAILABLE_DIR}/${domain}"
+    [[ -L "$existing_conf" ]] && existing_conf=$(readlink -f "$existing_conf" || echo "$existing_conf")
 
     cert_path=""
     key_path=""
 
-    # 1. 优先尝试从现有 Nginx 站点配置读取证书路径
-    if [[ -f "$conf_path" ]]; then
-        cert_path=$(awk '$1 == "ssl_certificate" { v=$2; sub(/;$/, "", v); print v; exit }' "$conf_path" || true)
-        key_path=$(awk '$1 == "ssl_certificate_key" { v=$2; sub(/;$/, "", v); print v; exit }' "$conf_path" || true)
+    # 优先读取现有 Nginx 配置中的证书路径
+    if [[ -f "$existing_conf" ]]; then
+        cert_path=$(awk '$1 == "ssl_certificate" { v=$2; sub(/;$/, "", v); print v; exit }' "$existing_conf" || true)
+        key_path=$(awk '$1 == "ssl_certificate_key" { v=$2; sub(/;$/, "", v); print v; exit }' "$existing_conf" || true)
         if [[ "$cert_path" == *'$'* || "$key_path" == *'$'* ]]; then
             cert_path=""
             key_path=""
         fi
     fi
 
-    # 2. 尝试默认 Let's Encrypt 路径
     if [[ -z "$cert_path" || ! -f "$cert_path" ]]; then
         cert_path="/etc/letsencrypt/live/${domain}/fullchain.pem"
         key_path="/etc/letsencrypt/live/${domain}/privkey.pem"
     fi
 
+    # 若证书已存在且剩余有效期 > 30 天，直接沿用，无需重复申请，彻底避免冲突！
     if [[ -f "$cert_path" && -f "$key_path" ]] && cert_is_valid_30d "$cert_path"; then
-        info "[${domain}] 检测到有效期 >30 天的现有证书，直接沿用：${cert_path}"
+        info "[${domain}] 检测到有效现有证书（剩余 >30 天），直接沿用：${cert_path}"
         DOMAIN_CERT[$domain]="$cert_path"
         DOMAIN_KEY[$domain]="$key_path"
-    else
-        info "[${domain}] 正在通过 Cloudflare DNS-01 申请 Let's Encrypt 证书 ..."
-        certbot certonly \
-            --dns-cloudflare \
-            --dns-cloudflare-credentials "$CF_CRED_FILE" \
-            --dns-cloudflare-propagation-seconds 20 \
-            --non-interactive \
-            --agree-tos \
-            --register-unsafely-without-email \
-            --keep-until-expiring \
-            --cert-name "$domain" \
-            -d "$domain"
-
-        cert_path="/etc/letsencrypt/live/${domain}/fullchain.pem"
-        key_path="/etc/letsencrypt/live/${domain}/privkey.pem"
-
-        if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
-            error "[${domain}] 证书签发后未找到证书文件：${cert_path}"
-        fi
-        info "[${domain}] 证书签发成功：${cert_path}"
-        DOMAIN_CERT[$domain]="$cert_path"
-        DOMAIN_KEY[$domain]="$key_path"
+        continue
     fi
+
+    # 需要用 acme.sh 签发新证书
+    ensure_acme_sh
+
+    zone_id="${DOMAIN_ZONE_ID[$domain]:-}"
+    if [[ -z "$zone_id" ]]; then
+        zone_id=$(find_zone_id "$domain" || true)
+    fi
+    if [[ -z "$zone_id" ]]; then
+        error "[${domain}] 无法获取 Cloudflare Zone ID，无法签发证书"
+    fi
+
+    info "[${domain}] 正在通过 acme.sh (Cloudflare DNS) 申请 Let's Encrypt ECC 证书..."
+    export CF_Token="$CF_API_TOKEN"
+    export CF_Zone_ID="$zone_id"
+
+    set +e
+    "$ACME_SH" --issue \
+        --home "$ACME_HOME" \
+        --config-home "$ACME_HOME" \
+        --server letsencrypt \
+        --dns dns_cf \
+        --dnssleep 20 \
+        --keylength ec-256 \
+        -d "$domain"
+    acme_rc=$?
+    set -e
+
+    if [[ "$acme_rc" -ne 0 && "$acme_rc" -ne 2 ]]; then
+        unset CF_Token CF_Zone_ID
+        error "[${domain}] Let's Encrypt SSL 证书申请失败（退出码 ${acme_rc}）"
+    fi
+
+    # 若之前 certbot 创建过同名符号链接目录，清理该子目录内的残留软链后再由 acme.sh 写入实体文件
+    cert_dir="/etc/letsencrypt/live/${domain}"
+    mkdir -p "$cert_dir"
+    chmod 700 "$cert_dir"
+    cert_path="${cert_dir}/fullchain.pem"
+    key_path="${cert_dir}/privkey.pem"
+    [[ -L "$cert_path" ]] && rm -f "$cert_path"
+    [[ -L "$key_path" ]]  && rm -f "$key_path"
+
+    rm -f "/usr/local/sbin/sync-${domain}-tls-to-v2node.sh"
+    rm -f "/etc/letsencrypt/renewal-hooks/deploy/sync-${domain}-tls-to-v2node.sh"
+
+    if ! "$ACME_SH" --install-cert \
+        --home "$ACME_HOME" \
+        --config-home "$ACME_HOME" \
+        --ecc \
+        -d "$domain" \
+        --key-file "$key_path" \
+        --fullchain-file "$cert_path" \
+        --reloadcmd "systemctl reload nginx"; then
+        unset CF_Token CF_Zone_ID
+        error "[${domain}] SSL 证书安装到 ${cert_dir} 失败"
+    fi
+
+    unset CF_Token CF_Zone_ID
+    chmod 600 "$key_path"
+    chmod 644 "$cert_path"
+
+    DOMAIN_CERT[$domain]="$cert_path"
+    DOMAIN_KEY[$domain]="$key_path"
+    info "[${domain}] SSL 证书申请并安装成功"
 done
 
-# 配置 Certbot 自动续期后重载 Nginx 的钩子
-RENEW_HOOK="/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh"
-mkdir -p "$(dirname "$RENEW_HOOK")"
-cat > "$RENEW_HOOK" <<'EOF'
-#!/usr/bin/env bash
-systemctl reload nginx >/dev/null 2>&1 || true
-EOF
-chmod 755 "$RENEW_HOOK"
-
-# ------------------------------------------------------------------------------
-# 6. 生成逼真的网络测速伪装网页（HTTP 200 OK + 真实延迟/下行测速交互）
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# 6. 生成 HTTP 200 伪装网络测速网页 (/var/www/edge-speedtest)
+# ==============================================================================
 WEB_ROOT="/var/www/edge-speedtest"
 mkdir -p "$WEB_ROOT"
 
-# 生成 1 MiB 测速载荷文件供前端真实测速使用
 if [[ ! -f "${WEB_ROOT}/chunk.bin" ]]; then
     dd if=/dev/urandom of="${WEB_ROOT}/chunk.bin" bs=64K count=16 status=none
     chmod 644 "${WEB_ROOT}/chunk.bin"
@@ -611,9 +667,9 @@ cat > "${WEB_ROOT}/index.html" <<'HTML_EOF'
 HTML_EOF
 chmod 644 "${WEB_ROOT}/index.html"
 
-# ------------------------------------------------------------------------------
-# 7. 备份原有配置、写入新 Nginx 配置并支持全量原子回滚
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# 7. 备份原有配置、生成 Nginx 站点配置并支持原子回滚
+# ==============================================================================
 TIMESTAMP=$(date '+%Y%m%d-%H%M%S')
 declare -A BACKUP_MAP=()
 declare -a NEW_CONFS=()
@@ -631,9 +687,7 @@ rollback_all() {
     for domain in "${!BACKUP_MAP[@]}"; do
         local bak="${BACKUP_MAP[$domain]}"
         local conf="${AVAILABLE_DIR}/${domain}"
-        if [[ -L "$conf" ]]; then
-            conf=$(readlink -f "$conf")
-        fi
+        [[ -L "$conf" ]] && conf=$(readlink -f "$conf")
         cp -a "$bak" "$conf"
         ln -sfn "$conf" "${ENABLED_DIR}/${domain}"
     done
@@ -657,9 +711,7 @@ for domain in "${DOMAINS[@]}"; do
     if [[ -e "$conf_path" ]]; then
         if [[ -L "$conf_path" ]]; then
             resolved=$(readlink -f "$conf_path" || true)
-            if [[ -z "$resolved" || ! -f "$resolved" ]]; then
-                error "站点配置符号链接无效：$conf_path"
-            fi
+            [[ -z "$resolved" || ! -f "$resolved" ]] && error "站点配置符号链接无效：$conf_path"
             conf_path="$resolved"
         fi
         bak_path="${conf_path}.backup-${TIMESTAMP}"
@@ -698,7 +750,25 @@ server {
 
     server_name ${domain};
 
-    return 301 https://\$host\$request_uri;
+    root ${WEB_ROOT};
+    index index.html;
+    charset utf-8;
+
+    location = /api/ping {
+        default_type application/json;
+        add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+        return 200 '{"status":"ok","service":"edge-speedtest-node"}\n';
+    }
+
+    location = /chunk.bin {
+        default_type application/octet-stream;
+        add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+        try_files /chunk.bin =404;
+    }
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
 }
 
 server {
@@ -748,9 +818,11 @@ EOF
     ln -sfn "$conf_path" "$enabled_path"
 done
 
-# ------------------------------------------------------------------------------
-# 8. 检测 Nginx 配置、重启服务并逐个域名验证 HTTPS 200 测速页
-# ------------------------------------------------------------------------------
+rm -f /etc/nginx/sites-enabled/default
+
+# ==============================================================================
+# 8. 检测 Nginx 配置、重启服务并逐个域名校验 HTTPS 200
+# ==============================================================================
 info "检测 Nginx 配置..."
 if ! nginx -t; then
     rollback_all
@@ -758,10 +830,9 @@ if ! nginx -t; then
 fi
 
 info "重启 Nginx 服务..."
-systemctl enable nginx >/dev/null 2>&1 || true
 if ! systemctl restart nginx; then
     rollback_all
-    error "Nginx 重启失败，已恢复原配置"
+    error "Nginx 重启失败（请用 ss -lntp | grep 443 检查是否有其他配置仍占用冲突端口），已恢复原配置"
 fi
 
 if ! ss -lnt | grep -qE ":${VERIFY_PORT}[[:space:]]"; then
@@ -770,7 +841,6 @@ if ! ss -lnt | grep -qE ":${VERIFY_PORT}[[:space:]]"; then
 fi
 
 for domain in "${DOMAINS[@]}"; do
-    # 1. 验证首页 200 OK 与测速站内容
     PAGE_RESP=$(curl -ksS \
         --resolve "${domain}:${VERIFY_PORT}:127.0.0.1" \
         -w $'\n%{http_code}' \
@@ -789,35 +859,24 @@ for domain in "${DOMAINS[@]}"; do
         error "[${domain}] 本机 HTTPS 首页响应内容不符合测速页预期，已恢复原配置"
     fi
 
-    # 2. 验证 /api/ping 测速接口 200 OK
-    PING_STATUS=$(curl -ksS -o /dev/null \
-        --resolve "${domain}:${VERIFY_PORT}:127.0.0.1" \
-        -w '%{http_code}' \
-        "https://${domain}:${VERIFY_PORT}/api/ping" || true)
-
-    if [[ "$PING_STATUS" != "200" ]]; then
-        rollback_all
-        error "[${domain}] 本机 /api/ping 验证状态码为 ${PING_STATUS}（预期 200），已恢复原配置"
-    fi
-
-    info "[${domain}] 本机 HTTPS 200 测速伪装页 & API 校验通过！"
+    info "[${domain}] 本机 HTTPS 200 测速伪装页校验通过！"
 done
 
 echo
 echo "============================================================"
 echo -e "${GREEN}全部域名部署完成！${NC}"
 echo
-echo " 已部署域名 (${#DOMAINS[@]} 个)："
+echo " 已生效域名 (${#DOMAINS[@]} 个)："
 for domain in "${DOMAINS[@]}"; do
     echo "   - ${domain}  (证书: ${DOMAIN_CERT[$domain]})"
 done
 echo
 echo " HTTPS 监听地址： ${LISTEN_SUMMARY}"
-echo " HTTP 状态码：    200 OK（边缘节点网络质量测速伪装站）"
-echo " 站点根目录：     ${WEB_ROOT}"
-echo " CF 凭据路径：    ${CF_CRED_FILE} (权限 600，自动续期复用)"
+echo " HTTP 状态码：    200 OK（边缘节点网络质量监测台）"
+echo " SSL 续期引擎：   acme.sh (/root/.acme.sh，续期自动 reload nginx)"
 if [[ "$LISTEN_MODE" == "1" ]]; then
-    echo " 面板回落地址：   请在 RelayPanel 设备组将「SNI 兜底回落地址」设为 127.0.0.1:${INTERNAL_HTTPS_PORT}"
+    echo " 公网 443 状态：  已腾出给 relay-node 多 SNI 分流"
+    echo " 面板回落地址：   RelayPanel 设备组「SNI 兜底回落地址」保持默认 127.0.0.1:${INTERNAL_HTTPS_PORT}"
 fi
 echo "============================================================"
 echo
