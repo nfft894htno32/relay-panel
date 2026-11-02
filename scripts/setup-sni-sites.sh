@@ -447,11 +447,12 @@ done
 # ==============================================================================
 WEB_ROOT="/var/www/edge-speedtest"
 mkdir -p "$WEB_ROOT"
+chmod 755 /var /var/www "$WEB_ROOT"
 
 if [[ ! -f "${WEB_ROOT}/chunk.bin" ]]; then
     dd if=/dev/urandom of="${WEB_ROOT}/chunk.bin" bs=64K count=16 status=none
-    chmod 644 "${WEB_ROOT}/chunk.bin"
 fi
+chmod 644 "${WEB_ROOT}/chunk.bin"
 
 cat > "${WEB_ROOT}/index.html" <<'HTML_EOF'
 <!DOCTYPE html>
