@@ -428,7 +428,7 @@ for domain in "${DOMAINS[@]}"; do
         -d "$domain" \
         --key-file "$key_path" \
         --fullchain-file "$cert_path" \
-        --reloadcmd "systemctl reload nginx"; then
+        --reloadcmd "systemctl is-active --quiet nginx && systemctl reload nginx || true"; then
         unset CF_Token CF_Zone_ID
         error "[${domain}] SSL 证书安装到 ${cert_dir} 失败"
     fi
