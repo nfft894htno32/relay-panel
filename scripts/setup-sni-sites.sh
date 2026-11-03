@@ -130,53 +130,14 @@ AVAILABLE_DIR="/etc/nginx/sites-available"
 ENABLED_DIR="/etc/nginx/sites-enabled"
 mkdir -p "$AVAILABLE_DIR" "$ENABLED_DIR"
 
-# 关键防冲突处理：在模式 1 (127.0.0.1:10443) 下，自动扫描已有的占用公网 443 的旧域名站点！
-# 避免旧脚本创建的站点继续霸占 0.0.0.0:443 导致与 relay-node 冲突或 Nginx 无法启动。
-declare -A MIGRATE_ONLY_DOMAINS=()
-if [[ "$LISTEN_MODE" == "1" ]]; then
-    declare -a LEGACY_443_DOMAINS=()
-    shopt -s nullglob
-    for f in "${ENABLED_DIR}"/*; do
-        base=$(basename "$f")
-        [[ "$base" == "default" ]] && continue
-        if grep -qE 'listen[[:space:]]+(\[::\]:)?443([[:space:];]|$)' "$f" 2>/dev/null; then
-            if [[ -z "${SEEN_DOMAINS[$base]:-}" ]]; then
-                LEGACY_443_DOMAINS+=("$base")
-            fi
-        fi
-    done
-    shopt -u nullglob
-
-    if (( ${#LEGACY_443_DOMAINS[@]} > 0 )); then
-        echo
-        warn "检测到本机已有旧站点正在监听公网 443 端口：${LEGACY_443_DOMAINS[*]}"
-        warn "若不一起迁移到 127.0.0.1:${INTERNAL_HTTPS_PORT}，Nginx 会与 relay-node 争抢 443 端口导致启动报错！"
-        read -rp "是否将这些旧站点一并无损迁移到 127.0.0.1:${INTERNAL_HTTPS_PORT} + 200 测速页（直接沿用原证书）？[Y/n]: " MIGRATE_OLD
-        MIGRATE_OLD="${MIGRATE_OLD:-Y}"
-        if [[ "$MIGRATE_OLD" =~ ^[Yy]$ ]]; then
-            for old_d in "${LEGACY_443_DOMAINS[@]}"; do
-                SEEN_DOMAINS[$old_d]=1
-                DOMAINS+=("$old_d")
-                MIGRATE_ONLY_DOMAINS[$old_d]=1
-            done
-        fi
-    fi
-
-    if grep -qE '^[[:space:]]*listen[[:space:]]+(\[::\]:)?443([[:space:];]|$)' /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf 2>/dev/null; then
-        warn "注意：检测到 /etc/nginx/nginx.conf 或 conf.d/*.conf 中仍存在 listen 443 配置（例如旧的 stream 块）！"
-        warn "使用 relay-node 原生多 SNI 分流时，请注释或删除 nginx.conf 中的 stream 443 块，把公网 443 让给 relay-node。"
-    fi
-fi
-
 if (( ${#DOMAINS[@]} == 0 )); then
-    error "未指定任何需要配置或迁移的域名"
+    error "未输入任何有效域名"
 fi
 
-info "本次共处理 ${#DOMAINS[@]} 个域名：${DOMAINS[*]}"
+info "本次仅部署您指定的 ${#DOMAINS[@]} 个域名（自动忽略并停用未在列表中的旧站点）：${DOMAINS[*]}"
 
-# 清理此前如果误装了 certbot 可能留在 /etc/letsencrypt 下无主冲突的配置（不影响有效证书）
+# 清理此前如果误装了 certbot 可能留在系统里的定时器
 if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^certbot\.timer'; then
-    # 如果用户统一使用 acme.sh，停用 certbot.timer 防止两个续期器争抢 /etc/letsencrypt/live
     systemctl disable --now certbot.timer >/dev/null 2>&1 || true
 fi
 
@@ -216,19 +177,11 @@ if [[ -z "$CF_API_TOKEN" || "$CF_API_TOKEN" == "这里填写你的Cloudflare_API
     fi
 fi
 
-# 检查是否所有域名都已有未过期证书且无需跑 DNS（例如纯迁移旧站点）
-NEED_CF_API=0
+NEED_CF_API=1
 cert_is_valid_30d() {
     local cert_file="$1"
     [[ -f "$cert_file" ]] && openssl x509 -in "$cert_file" -noout -checkend 2592000 >/dev/null 2>&1
 }
-
-for d in "${DOMAINS[@]}"; do
-    if [[ -z "${MIGRATE_ONLY_DOMAINS[$d]:-}" ]] || ! cert_is_valid_30d "/etc/letsencrypt/live/${d}/fullchain.pem"; then
-        NEED_CF_API=1
-        break
-    fi
-done
 
 CF_API="https://api.cloudflare.com/client/v4"
 CF_AUTH_HEADER=(
@@ -289,8 +242,6 @@ if (( NEED_CF_API == 1 )); then
     info "服务器公网 IP：$SERVER_IP"
 
     for domain in "${DOMAINS[@]}"; do
-        [[ -n "${MIGRATE_ONLY_DOMAINS[$domain]:-}" ]] && continue
-
         zone_id=$(find_zone_id "$domain" || true)
         if [[ -z "$zone_id" ]]; then
             error "无法找到域名 ${domain} 对应的 Cloudflare Zone，请检查域名是否已接入 Cloudflare"
@@ -701,6 +652,7 @@ chmod 644 "${WEB_ROOT}/index.html"
 TIMESTAMP=$(date '+%Y%m%d-%H%M%S')
 declare -A BACKUP_MAP=()
 declare -a NEW_CONFS=()
+declare -a REMOVED_ENABLED=()
 declare -a TEMP_FILES=()
 
 cleanup_temps() {
@@ -723,9 +675,26 @@ rollback_all() {
         [[ -z "$domain" ]] && continue
         rm -f "${ENABLED_DIR}/${domain}" "${AVAILABLE_DIR}/${domain}"
     done
+    for old_name in "${REMOVED_ENABLED[@]:-}"; do
+        [[ -z "$old_name" ]] && continue
+        if [[ -e "${AVAILABLE_DIR}/${old_name}" ]]; then
+            ln -sfn "${AVAILABLE_DIR}/${old_name}" "${ENABLED_DIR}/${old_name}"
+        fi
+    done
     nginx -t >/dev/null 2>&1 || true
     systemctl restart nginx >/dev/null 2>&1 || true
 }
+
+# 自动停用不在本次输入域名列表中的先前旧站点（不顾及旧域名，防止旧域名干扰或占用 443）
+shopt -s nullglob
+for enabled_file in "${ENABLED_DIR}"/*; do
+    old_name=$(basename "$enabled_file")
+    if [[ -z "${SEEN_DOMAINS[$old_name]:-}" ]]; then
+        rm -f "$enabled_file"
+        [[ "$old_name" != "default" ]] && REMOVED_ENABLED+=("$old_name") && info "已从 sites-enabled 移除旧站点：${old_name}"
+    fi
+done
+shopt -u nullglob
 
 USE_MODERN_HTTP2=0
 if nginx_supports_http2_directive; then
