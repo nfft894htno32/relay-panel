@@ -10,6 +10,14 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-11-03
+
+Ships alongside `node-v1.3.1`. Fixes one-click panel self-update version pin and compiled panel version string for the per-client-IP rate limiting release.
+
+### Fixed
+
+- **One-click panel update (`马上更新`) & version reporting**: Bumped `RELAYPANEL_PANEL_TAG` / `RELAYPANEL_NODE_TAG` defaults in `docker-compose.release.yaml` and `COMPILED_APP_VERSION` in `crates/panel/src/config.rs` so the Dashboard's one-click updater upgrades from `v1.3.0` cleanly and `/api/v1/health` reports `1.3.2`.
+
 ## [1.3.1] - 2026-11-03
 
 Ships alongside `node-v1.3.1`. Adds native per-client-IP rate limiting alongside rule-total bandwidth caps, plus companion SNI script refinements.
