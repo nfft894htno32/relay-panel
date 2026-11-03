@@ -126,6 +126,10 @@ else
     error "无效的监听模式选项：$LISTEN_MODE"
 fi
 
+echo
+read -rp "是否将本机公网 IP 添加到 Cloudflare DNS A 记录？（入口中转机选 Y；后端落地机选 n 仅签证书不暴露落地 IP）[Y/n]: " UPDATE_DNS_A
+UPDATE_DNS_A="${UPDATE_DNS_A:-Y}"
+
 AVAILABLE_DIR="/etc/nginx/sites-available"
 ENABLED_DIR="/etc/nginx/sites-enabled"
 mkdir -p "$AVAILABLE_DIR" "$ENABLED_DIR"
@@ -229,51 +233,55 @@ find_zone_id() {
 }
 
 if (( NEED_CF_API == 1 )); then
-    info "获取服务器公网 IPv4..."
-    SERVER_IP=""
-    for ip_url in "https://api.ipify.org" "https://api4.ipify.org" "https://ipv4.icanhazip.com"; do
-        SERVER_IP=$(curl -4 -fsS --max-time 10 "$ip_url" 2>/dev/null | xargs || true)
-        [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && break
-    done
+    if [[ "$UPDATE_DNS_A" =~ ^[Yy]$ ]]; then
+        info "获取服务器公网 IPv4..."
+        SERVER_IP=""
+        for ip_url in "https://api.ipify.org" "https://api4.ipify.org" "https://ipv4.icanhazip.com"; do
+            SERVER_IP=$(curl -4 -fsS --max-time 10 "$ip_url" 2>/dev/null | xargs || true)
+            [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && break
+        done
 
-    if ! [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        error "无法获取服务器公网 IPv4"
-    fi
-    info "服务器公网 IP：$SERVER_IP"
-
-    for domain in "${DOMAINS[@]}"; do
-        zone_id=$(find_zone_id "$domain" || true)
-        if [[ -z "$zone_id" ]]; then
-            error "无法找到域名 ${domain} 对应的 Cloudflare Zone，请检查域名是否已接入 Cloudflare"
+        if ! [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            error "无法获取服务器公网 IPv4"
         fi
-        DOMAIN_ZONE_ID[$domain]="$zone_id"
+        info "服务器公网 IP：$SERVER_IP"
 
-        # 完全沿用您原脚本逻辑：仅当当前服务器 IP 的 A 记录不存在时新增，绝不覆盖其他同名 A 记录
-        dns_resp=$(curl -fsS "${CF_AUTH_HEADER[@]}" "${CF_API}/zones/${zone_id}/dns_records?type=A&name=${domain}")
-        if [[ "$(echo "$dns_resp" | jq -r '.success')" != "true" ]]; then
-            echo "$dns_resp" | jq . >&2 || true
-            error "[${domain}] Cloudflare DNS 记录查询失败"
-        fi
-
-        current_ip_record_id=$(echo "$dns_resp" | jq -r --arg ip "$SERVER_IP" 'first(.result[]? | select(.content == $ip) | .id) // empty')
-        if [[ -n "$current_ip_record_id" ]]; then
-            info "[${domain}] 当前服务器 IP (${SERVER_IP}) 的 A 记录已存在，跳过重复新增"
-        else
-            dns_data=$(jq -n \
-                --arg type "A" \
-                --arg name "$domain" \
-                --arg content "$SERVER_IP" \
-                --argjson proxied "$CF_PROXIED" \
-                '{type: $type, name: $name, content: $content, ttl: 60, proxied: $proxied}')
-
-            result=$(curl -fsS -X POST "${CF_AUTH_HEADER[@]}" "${CF_API}/zones/${zone_id}/dns_records" --data "$dns_data")
-            if [[ "$(echo "$result" | jq -r '.success')" != "true" ]]; then
-                echo "$result" | jq . >&2 || true
-                error "[${domain}] Cloudflare DNS A 记录新增失败"
+        for domain in "${DOMAINS[@]}"; do
+            zone_id=$(find_zone_id "$domain" || true)
+            if [[ -z "$zone_id" ]]; then
+                error "无法找到域名 ${domain} 对应的 Cloudflare Zone，请检查域名是否已接入 Cloudflare"
             fi
-            info "[${domain}] DNS A 记录新增成功 -> ${SERVER_IP}（其他同名 A 记录全部保留）"
-        fi
-    done
+            DOMAIN_ZONE_ID[$domain]="$zone_id"
+
+            # 完全沿用您原脚本逻辑：仅当当前服务器 IP 的 A 记录不存在时新增，绝不覆盖其他同名 A 记录
+            dns_resp=$(curl -fsS "${CF_AUTH_HEADER[@]}" "${CF_API}/zones/${zone_id}/dns_records?type=A&name=${domain}")
+            if [[ "$(echo "$dns_resp" | jq -r '.success')" != "true" ]]; then
+                echo "$dns_resp" | jq . >&2 || true
+                error "[${domain}] Cloudflare DNS 记录查询失败"
+            fi
+
+            current_ip_record_id=$(echo "$dns_resp" | jq -r --arg ip "$SERVER_IP" 'first(.result[]? | select(.content == $ip) | .id) // empty')
+            if [[ -n "$current_ip_record_id" ]]; then
+                info "[${domain}] 当前服务器 IP (${SERVER_IP}) 的 A 记录已存在，跳过重复新增"
+            else
+                dns_data=$(jq -n \
+                    --arg type "A" \
+                    --arg name "$domain" \
+                    --arg content "$SERVER_IP" \
+                    --argjson proxied "$CF_PROXIED" \
+                    '{type: $type, name: $name, content: $content, ttl: 60, proxied: $proxied}')
+
+                result=$(curl -fsS -X POST "${CF_AUTH_HEADER[@]}" "${CF_API}/zones/${zone_id}/dns_records" --data "$dns_data")
+                if [[ "$(echo "$result" | jq -r '.success')" != "true" ]]; then
+                    echo "$result" | jq . >&2 || true
+                    error "[${domain}] Cloudflare DNS A 记录新增失败"
+                fi
+                info "[${domain}] DNS A 记录新增成功 -> ${SERVER_IP}（其他同名 A 记录全部保留）"
+            fi
+        done
+    else
+        info "已跳过 Cloudflare DNS A 记录写入（仅使用 DNS TXT 验证签发证书，不暴露本机 IP）"
+    fi
 fi
 
 # ==============================================================================
