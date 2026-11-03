@@ -443,16 +443,15 @@ for domain in "${DOMAINS[@]}"; do
 done
 
 # ==============================================================================
-# 6. 生成 HTTP 200 伪装网络测速网页 (/var/www/edge-speedtest)
+# 6. 生成 HTTP 200 零刷流风险伪装网络监测网页 (/var/www/edge-speedtest)
+#    仅开放 <1KB 的真实 RTT 延迟 / 抖动 / 连续性探测，物理移除大体积测速块，彻底防刷流量
 # ==============================================================================
 WEB_ROOT="/var/www/edge-speedtest"
 mkdir -p "$WEB_ROOT"
 chmod 755 /var /var/www "$WEB_ROOT"
 
-if [[ ! -f "${WEB_ROOT}/chunk.bin" ]]; then
-    dd if=/dev/urandom of="${WEB_ROOT}/chunk.bin" bs=64K count=16 status=none
-fi
-chmod 644 "${WEB_ROOT}/chunk.bin"
+# 确保移除旧版可能留下的测速载荷大文件
+rm -f "${WEB_ROOT}/chunk.bin"
 
 cat > "${WEB_ROOT}/index.html" <<'HTML_EOF'
 <!DOCTYPE html>
@@ -460,7 +459,7 @@ cat > "${WEB_ROOT}/index.html" <<'HTML_EOF'
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Edge Network Quality & Speedtest Node</title>
+<title>Edge Network Quality & Telemetry Node</title>
 <style>
   :root {
     --bg: #0b1020;
@@ -471,6 +470,7 @@ cat > "${WEB_ROOT}/index.html" <<'HTML_EOF'
     --accent: #3b82f6;
     --accent-glow: rgba(59, 130, 246, 0.35);
     --ok: #10b981;
+    --warn: #f59e0b;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -500,6 +500,8 @@ cat > "${WEB_ROOT}/index.html" <<'HTML_EOF'
     border-bottom: 1px solid var(--border);
     padding-bottom: 20px;
     margin-bottom: 28px;
+    gap: 12px;
+    flex-wrap: wrap;
   }
   .title-group h1 { font-size: 20px; font-weight: 600; letter-spacing: 0.3px; }
   .title-group p { font-size: 13px; color: var(--muted); margin-top: 4px; }
@@ -519,7 +521,7 @@ cat > "${WEB_ROOT}/index.html" <<'HTML_EOF'
     display: grid;
     grid-template-columns: repeat(3, 1fr);
     gap: 16px;
-    margin-bottom: 28px;
+    margin-bottom: 24px;
   }
   @media (max-width: 560px) { .metrics { grid-template-columns: 1fr; } }
   .metric-box {
@@ -530,14 +532,14 @@ cat > "${WEB_ROOT}/index.html" <<'HTML_EOF'
     text-align: center;
   }
   .metric-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; }
-  .metric-value { font-size: 30px; font-weight: 700; margin: 8px 0 4px; font-variant-numeric: tabular-nums; }
+  .metric-value { font-size: 28px; font-weight: 700; margin: 8px 0 4px; font-variant-numeric: tabular-nums; }
   .metric-unit { font-size: 12px; color: var(--muted); }
   .progress-wrap {
     height: 8px;
     background: rgba(255, 255, 255, 0.06);
     border-radius: 999px;
     overflow: hidden;
-    margin-bottom: 24px;
+    margin-bottom: 20px;
   }
   .progress-bar {
     height: 100%;
@@ -545,18 +547,35 @@ cat > "${WEB_ROOT}/index.html" <<'HTML_EOF'
     background: linear-gradient(90deg, #3b82f6, #06b6d4);
     transition: width 0.2s ease;
   }
-  .actions { display: flex; justify-content: center; }
+  .notice {
+    display: none;
+    font-size: 13px;
+    color: var(--warn);
+    background: rgba(245, 158, 11, 0.08);
+    border: 1px solid rgba(245, 158, 11, 0.22);
+    border-radius: 10px;
+    padding: 10px 14px;
+    margin-bottom: 20px;
+    text-align: center;
+  }
+  .actions { display: flex; justify-content: center; gap: 12px; flex-wrap: wrap; }
   button {
     background: var(--accent);
     color: #fff;
     border: none;
     border-radius: 12px;
-    padding: 13px 36px;
-    font-size: 15px;
+    padding: 12px 30px;
+    font-size: 14px;
     font-weight: 600;
     cursor: pointer;
     box-shadow: 0 8px 24px var(--accent-glow);
     transition: transform 0.15s ease, opacity 0.15s ease;
+  }
+  button.secondary {
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--border);
+    box-shadow: none;
+    color: var(--muted);
   }
   button:hover:not(:disabled) { transform: translateY(-1px); }
   button:disabled { opacity: 0.55; cursor: not-allowed; }
@@ -595,21 +614,23 @@ cat > "${WEB_ROOT}/index.html" <<'HTML_EOF'
         <div class="metric-unit">ms</div>
       </div>
       <div class="metric-box">
-        <div class="metric-label">下行吞吐 (Download)</div>
-        <div class="metric-value" id="dlVal">--</div>
-        <div class="metric-unit">Mbps</div>
+        <div class="metric-label">探测可达率 (Reachability)</div>
+        <div class="metric-value" id="lossVal">--</div>
+        <div class="metric-unit">%</div>
       </div>
     </div>
 
     <div class="progress-wrap"><div class="progress-bar" id="bar"></div></div>
+    <div class="notice" id="authNotice"></div>
 
     <div class="actions">
-      <button id="startBtn" onclick="runTest()">开始网络测速</button>
+      <button id="startBtn" onclick="runPingTest()">开始延迟与抖动探测</button>
+      <button class="secondary" onclick="promptThroughput()">吞吐压测 (需运维授权)</button>
     </div>
 
     <div class="footer">
       <span id="protoInfo">协议：TLS / HTTP</span>
-      <span id="statusText">就绪 · 点击上方按钮发起边缘链路探测</span>
+      <span id="statusText">就绪 · 公开模式开放轻量级无损延迟探测</span>
     </div>
   </div>
 
@@ -617,47 +638,53 @@ cat > "${WEB_ROOT}/index.html" <<'HTML_EOF'
   document.getElementById('nodeHost').textContent = '接入节点：' + window.location.hostname;
   document.getElementById('protoInfo').textContent = '安全传输：' + window.location.protocol.replace(':', '').toUpperCase();
 
-  async function runTest() {
+  function promptThroughput() {
+    const notice = document.getElementById('authNotice');
+    const token = window.prompt('请输入节点运维压测口令 ( Ops Authorization Token )：');
+    if (token === null) return;
+    notice.style.display = 'block';
+    notice.textContent = '[安全策略拦截] 运维口令校验未通过：当前公共探针仅开放无损 RTT 延迟探测，已拒绝大流量吞吐压测请求。';
+  }
+
+  async function runPingTest() {
     const btn = document.getElementById('startBtn');
     const bar = document.getElementById('bar');
     const status = document.getElementById('statusText');
+    const notice = document.getElementById('authNotice');
+    notice.style.display = 'none';
     btn.disabled = true;
-    bar.style.width = '5%';
+    bar.style.width = '8%';
 
     try {
-      status.textContent = '正在测量边缘节点 RTT 延迟与抖动...';
+      status.textContent = '正在执行边缘节点多轮 HTTP/TLS 握手与 RTT 采样...';
       const samples = [];
-      for (let i = 0; i < 6; i++) {
+      let okCount = 0;
+      const total = 8;
+
+      for (let i = 0; i < total; i++) {
         const t0 = performance.now();
-        await fetch('/api/ping?t=' + Date.now() + '_' + i, { cache: 'no-store' });
+        const res = await fetch('/api/ping?t=' + Date.now() + '_' + i, { cache: 'no-store' });
         const rtt = performance.now() - t0;
-        if (i > 0) samples.push(rtt);
-        bar.style.width = (10 + i * 7) + '%';
+        if (res.ok) {
+          okCount++;
+          if (i > 0) samples.push(rtt);
+        }
+        bar.style.width = Math.round(((i + 1) / total) * 100) + '%';
       }
-      const avgPing = samples.reduce((a, b) => a + b, 0) / samples.length;
-      let jitterSum = 0;
-      for (let i = 1; i < samples.length; i++) jitterSum += Math.abs(samples[i] - samples[i - 1]);
-      const jitter = samples.length > 1 ? jitterSum / (samples.length - 1) : 0;
 
-      document.getElementById('pingVal').textContent = avgPing.toFixed(1);
-      document.getElementById('jitterVal').textContent = jitter.toFixed(1);
+      if (samples.length > 0) {
+        const avgPing = samples.reduce((a, b) => a + b, 0) / samples.length;
+        let jitterSum = 0;
+        for (let i = 1; i < samples.length; i++) jitterSum += Math.abs(samples[i] - samples[i - 1]);
+        const jitter = samples.length > 1 ? jitterSum / (samples.length - 1) : 0;
 
-      status.textContent = '正在执行多块下行吞吐基准测试...';
-      let totalBytes = 0;
-      const tStart = performance.now();
-      const rounds = 6;
-      for (let r = 0; r < rounds; r++) {
-        const res = await fetch('/chunk.bin?r=' + Date.now() + '_' + r, { cache: 'no-store' });
-        const buf = await res.arrayBuffer();
-        totalBytes += buf.byteLength;
-        const elapsedSec = (performance.now() - tStart) / 1000;
-        const mbps = (totalBytes * 8) / (elapsedSec * 1000 * 1000);
-        document.getElementById('dlVal').textContent = mbps.toFixed(1);
-        bar.style.width = (52 + Math.round(((r + 1) / rounds) * 48)) + '%';
+        document.getElementById('pingVal').textContent = avgPing.toFixed(1);
+        document.getElementById('jitterVal').textContent = jitter.toFixed(1);
       }
-      status.textContent = '测速完成 · 链路状态正常';
+      document.getElementById('lossVal').textContent = Math.round((okCount / total) * 100).toString();
+      status.textContent = '探测完成 · 边缘接入链路正常';
     } catch (e) {
-      status.textContent = '测速中断：' + (e && e.message ? e.message : '网络异常');
+      status.textContent = '探测中断：' + (e && e.message ? e.message : '网络异常');
     } finally {
       btn.disabled = false;
     }
@@ -761,12 +788,6 @@ server {
         return 200 '{"status":"ok","service":"edge-speedtest-node"}\n';
     }
 
-    location = /chunk.bin {
-        default_type application/octet-stream;
-        add_header Cache-Control "no-store, no-cache, must-revalidate" always;
-        try_files /chunk.bin =404;
-    }
-
     location / {
         try_files \$uri \$uri/ /index.html;
     }
@@ -795,12 +816,6 @@ ${HTTPS_LISTEN_BLOCK}
         default_type application/json;
         add_header Cache-Control "no-store, no-cache, must-revalidate" always;
         return 200 '{"status":"ok","service":"edge-speedtest-node"}\n';
-    }
-
-    location = /chunk.bin {
-        default_type application/octet-stream;
-        add_header Cache-Control "no-store, no-cache, must-revalidate" always;
-        try_files /chunk.bin =404;
     }
 
     location / {
