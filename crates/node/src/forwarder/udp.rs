@@ -27,7 +27,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use tokio::time;
 
-use super::limiter::RateLimit;
+use super::limiter::{ConnRateLimit, RateLimit};
 use super::outbound::OutboundError;
 use super::selector::TargetSelector;
 use crate::reporter::{ConnectionTracker, TrafficCounter, UDP_SESSION_TIMEOUT};
@@ -162,6 +162,7 @@ fn note_session_refused(port: u16) {
 struct UdpSession {
     /// v1.2.12: carries this session's place under the node-wide cap.
     outbound: Arc<SessionSocket>,
+    client_limit: ConnRateLimit,
     last_active: tokio::time::Instant,
     /// v1.2.12: the session's reply reader waits on the other end. Dropping
     /// this — i.e. the session leaving the map by idle eviction or listener
@@ -284,11 +285,11 @@ pub async fn serve_udp_listener(
         // before any .await).
         let existing = sessions.get_mut(&src).map(|mut s| {
             s.last_active = tokio::time::Instant::now();
-            s.outbound.clone()
+            (s.outbound.clone(), s.client_limit.clone())
         });
 
-        let outbound_sock = if let Some(sock) = existing {
-            sock
+        let (outbound_sock, client_limit) = if let Some(pair) = existing {
+            pair
         } else {
             // v1.2.12: a place under the node-wide cap first, before any
             // socket is opened. Refused: drop the datagram.
@@ -339,19 +340,25 @@ pub async fn serve_udp_listener(
             // same client that won the race while we were connecting: if one did,
             // use the winner and drop ours.
             let now = tokio::time::Instant::now();
-            let (chosen, reader_stop) = match sessions.entry(src) {
+            let new_client_limit = rate_limit.for_client(src.ip());
+            let (chosen, chosen_limit, reader_stop) = match sessions.entry(src) {
                 Entry::Occupied(mut e) => {
                     e.get_mut().last_active = now;
-                    (e.get().outbound.clone(), None)
+                    (
+                        e.get().outbound.clone(),
+                        e.get().client_limit.clone(),
+                        None,
+                    )
                 }
                 Entry::Vacant(e) => {
                     let (stop_tx, stop_rx) = oneshot::channel();
                     e.insert(UdpSession {
                         outbound: outbound.clone(),
+                        client_limit: new_client_limit.clone(),
                         last_active: now,
                         _stop: stop_tx,
                     });
-                    (outbound.clone(), Some(stop_rx))
+                    (outbound.clone(), new_client_limit, Some(stop_rx))
                 }
             };
 
@@ -371,14 +378,14 @@ pub async fn serve_udp_listener(
                     sessions: sessions.clone(),
                     connections: connections.clone(),
                     counter: counter.clone(),
-                    rate_limit: rate_limit.clone(),
+                    rate_limit: chosen_limit.clone(),
                     src,
                     rule_id,
                     port,
                 };
                 tokio::spawn(relay.run(stop));
             }
-            chosen
+            (chosen, chosen_limit)
         };
 
         // Register/refresh this client with the tracker on every datagram that
@@ -390,9 +397,9 @@ pub async fn serve_udp_listener(
         connections.udp_touch(src, rule_id).await;
 
         // Forward client datagram to target via the connected outbound socket.
-        // v0.4.6: throttle client→target (upload) bytes through the shared
-        // per-rule limiter BEFORE sending.
-        rate_limit.acquire_upload(n as u64).await;
+        // v0.4.6 / v1.3.1: throttle client→target (upload) bytes through the
+        // rule + per-client-IP limiter BEFORE sending.
+        client_limit.acquire_upload(n as u64).await;
         if let Err(e) = outbound_sock.send(&buf[..n]).await {
             tracing::debug!("UDP port {}: send to target failed: {}", port, e);
         } else {
@@ -409,7 +416,7 @@ struct ReplyRelay {
     sessions: Arc<Sessions>,
     connections: Arc<ConnectionTracker>,
     counter: Arc<TrafficCounter>,
-    rate_limit: RateLimit,
+    rate_limit: ConnRateLimit,
     src: SocketAddr,
     rule_id: i64,
     port: u16,
@@ -774,7 +781,7 @@ mod tests {
             sessions,
             connections: Arc::new(ConnectionTracker::new()),
             counter: Arc::new(TrafficCounter::new()),
-            rate_limit: RateLimit::new(None, None),
+            rate_limit: ConnRateLimit::unlimited(),
             src: "127.0.0.1:40000".parse().unwrap(),
             rule_id: 1,
             port: 5000,
@@ -785,6 +792,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let s = UdpSession {
             outbound: outbound.clone(),
+            client_limit: ConnRateLimit::unlimited(),
             last_active: tokio::time::Instant::now(),
             _stop: tx,
         };
@@ -840,6 +848,7 @@ mod tests {
             src,
             UdpSession {
                 outbound,
+                client_limit: ConnRateLimit::unlimited(),
                 last_active: tokio::time::Instant::now(),
                 _stop: tx,
             },
@@ -873,8 +882,8 @@ mod tests {
             sessions.clone(),
         );
         // 1000 B/s with a 1 s burst: a 5000-byte reply owes ~4 s of waiting.
-        r.rate_limit = RateLimit::new(None, Some(1000));
         r.src = client.local_addr().unwrap();
+        r.rate_limit = RateLimit::new(None, Some(1000)).for_client(r.src.ip());
         let src = r.src;
         let (s, stop) = session(&outbound);
         sessions.insert(src, s);

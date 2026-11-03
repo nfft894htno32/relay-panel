@@ -1770,6 +1770,8 @@ mod tests {
                 load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                 upload_limit_bps: None,
                 download_limit_bps: None,
+                per_ip_upload_limit_bps: None,
+                per_ip_download_limit_bps: None,
                 max_connections: None,
                 proxy_protocol: Default::default(),
             })

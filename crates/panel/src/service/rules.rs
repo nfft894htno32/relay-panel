@@ -376,6 +376,8 @@ pub async fn create_rule(
     let lb_db = req.load_balance_strategy.to_db_str();
     let up_mbps = req.upload_limit_mbps.unwrap_or(0).max(0);
     let down_mbps = req.download_limit_mbps.unwrap_or(0).max(0);
+    let per_ip_up_mbps = req.per_ip_upload_limit_mbps.unwrap_or(0).max(0);
+    let per_ip_down_mbps = req.per_ip_download_limit_mbps.unwrap_or(0).max(0);
     let max_connections = req.max_connections.unwrap_or(0).max(0);
     let auto_restart_minutes = req.auto_restart_minutes.unwrap_or(0).max(0);
     if auto_restart_minutes != 0
@@ -427,6 +429,8 @@ pub async fn create_rule(
                 lb_db,
                 up_mbps,
                 down_mbps,
+                per_ip_up_mbps,
+                per_ip_down_mbps,
                 max_connections,
                 auto_restart_minutes,
                 &proxy_protocol,
@@ -557,6 +561,8 @@ pub async fn update_rule(
         || req.load_balance_strategy.is_some()
         || req.upload_limit_mbps.is_some()
         || req.download_limit_mbps.is_some()
+        || req.per_ip_upload_limit_mbps.is_some()
+        || req.per_ip_download_limit_mbps.is_some()
         || req.max_connections.is_some()
         || req.auto_restart_minutes.is_some()
         || req.paused.is_some()
@@ -639,6 +645,8 @@ pub async fn update_rule(
         load_balance_strategy: req.load_balance_strategy.map(|s| s.to_db_str()),
         upload_limit_mbps: req.upload_limit_mbps.map(|v| v.max(0)),
         download_limit_mbps: req.download_limit_mbps.map(|v| v.max(0)),
+        per_ip_upload_limit_mbps: req.per_ip_upload_limit_mbps.map(|v| v.max(0)),
+        per_ip_download_limit_mbps: req.per_ip_download_limit_mbps.map(|v| v.max(0)),
         max_connections,
         auto_restart_minutes,
         proxy_protocol_send: proxy_protocol.as_ref().map(|p| p.send.as_str()),

@@ -331,15 +331,16 @@ pub(super) async fn forward_to_rule_targets(
     }
 
     let bytes = counter.handle(rule_id).await;
+    let conn_limit = rate_limit.for_client(real_client.ip());
 
     if !initial_bytes.is_empty() {
-        rate_limit.acquire_upload(initial_bytes.len() as u64).await;
+        conn_limit.acquire_upload(initial_bytes.len() as u64).await;
         outbound.write_all(initial_bytes).await?;
         bytes.add_upload(initial_bytes.len() as u64);
     }
 
     #[cfg(target_os = "linux")]
-    if matches!(rate_limit, RateLimit::Unlimited) {
+    if conn_limit.is_unlimited() {
         let up_sink = bytes.clone();
         let down_sink = bytes.clone();
         if let Err(e) = super::splice::zero_copy_bidirectional(
@@ -360,8 +361,8 @@ pub(super) async fn forward_to_rule_targets(
 
     let counter_up = bytes.clone();
     let counter_down = bytes;
-    let rl_up = rate_limit.clone();
-    let rl_down = rate_limit;
+    let rl_up = conn_limit.clone();
+    let rl_down = conn_limit;
 
     let upload = Box::pin(async move {
         let mut buf = [0u8; 32 * 1024];
@@ -475,7 +476,7 @@ mod tests {
             listener,
             vec![target_addr.to_string()],
             selector,
-            RateLimit::Unlimited,
+            RateLimit::unlimited(),
             counter.clone(),
             connections,
             1,
@@ -516,7 +517,7 @@ mod tests {
     #[tokio::test]
     async fn traffic_is_counted_while_the_connection_is_still_open() {
         // Unlimited: on Linux this is the splice path.
-        assert_counts_before_close(RateLimit::Unlimited, 7).await;
+        assert_counts_before_close(RateLimit::unlimited(), 7).await;
     }
 
     /// The same contract on the OTHER forwarding path.
@@ -545,7 +546,7 @@ mod tests {
             listener,
             vec![target.to_string()],
             Arc::new(TargetSelector::new(LoadBalanceStrategy::First, 1)),
-            RateLimit::Unlimited,
+            RateLimit::unlimited(),
             Arc::new(TrafficCounter::new()),
             Arc::new(ConnectionTracker::new()),
             rule_id,
@@ -785,7 +786,7 @@ mod tests {
             listener,
             vec![target_addr.to_string()],
             Arc::new(TargetSelector::new(LoadBalanceStrategy::First, 1)),
-            RateLimit::Unlimited,
+            RateLimit::unlimited(),
             Arc::new(TrafficCounter::new()),
             Arc::new(ConnectionTracker::new()),
             1,

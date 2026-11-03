@@ -9,7 +9,7 @@ use std::collections::HashMap;
 const RULE_COLS: &str =
     "id, name, uid, paused, listen_port, protocol, device_group_in, device_group_out, \
      forward_mode, NULLIF(sni, '') AS sni, target_addr, target_port, load_balance_strategy, upload_limit_mbps, \
-     download_limit_mbps, max_connections, auto_restart_minutes, proxy_protocol_send, \
+     download_limit_mbps, per_ip_upload_limit_mbps, per_ip_download_limit_mbps, max_connections, auto_restart_minutes, proxy_protocol_send, \
      proxy_protocol_accept, proxy_protocol_trusted, config, traffic_used, status, created_at";
 
 async fn check_port_conflict_sqlite(
@@ -439,6 +439,8 @@ impl RuleRepository for SqliteRepository {
         load_balance_strategy: &str,
         upload_limit_mbps: i32,
         download_limit_mbps: i32,
+        per_ip_upload_limit_mbps: i32,
+        per_ip_download_limit_mbps: i32,
         max_connections: i32,
         auto_restart_minutes: i32,
         proxy_protocol: &RuleProxyProtocol,
@@ -459,9 +461,9 @@ impl RuleRepository for SqliteRepository {
             "INSERT INTO forward_rules \
              (name, uid, listen_port, protocol, sni, device_group_in, device_group_out, \
               forward_mode, target_addr, target_port, load_balance_strategy, \
-              upload_limit_mbps, download_limit_mbps, max_connections, auto_restart_minutes, \
+              upload_limit_mbps, download_limit_mbps, per_ip_upload_limit_mbps, per_ip_download_limit_mbps, max_connections, auto_restart_minutes, \
               proxy_protocol_send, proxy_protocol_accept, proxy_protocol_trusted) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              RETURNING id",
         )
         .bind(name)
@@ -477,6 +479,8 @@ impl RuleRepository for SqliteRepository {
         .bind(load_balance_strategy)
         .bind(upload_limit_mbps)
         .bind(download_limit_mbps)
+        .bind(per_ip_upload_limit_mbps)
+        .bind(per_ip_download_limit_mbps)
         .bind(max_connections)
         .bind(auto_restart_minutes)
         .bind(&proxy_protocol.send)
@@ -628,6 +632,12 @@ impl RuleRepository for SqliteRepository {
             if update.download_limit_mbps.is_some() {
                 sets.push("download_limit_mbps = ?");
             }
+            if update.per_ip_upload_limit_mbps.is_some() {
+                sets.push("per_ip_upload_limit_mbps = ?");
+            }
+            if update.per_ip_download_limit_mbps.is_some() {
+                sets.push("per_ip_download_limit_mbps = ?");
+            }
             if update.max_connections.is_some() {
                 sets.push("max_connections = ?");
             }
@@ -683,6 +693,12 @@ impl RuleRepository for SqliteRepository {
                 q = q.bind(v);
             }
             if let Some(v) = update.download_limit_mbps {
+                q = q.bind(v);
+            }
+            if let Some(v) = update.per_ip_upload_limit_mbps {
+                q = q.bind(v);
+            }
+            if let Some(v) = update.per_ip_download_limit_mbps {
                 q = q.bind(v);
             }
             if let Some(v) = update.max_connections {

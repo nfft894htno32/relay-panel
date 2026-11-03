@@ -50,6 +50,10 @@ pub struct ListenerConfig {
     pub upload_limit_bps: Option<u64>,
     #[serde(default)]
     pub download_limit_bps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_ip_upload_limit_bps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_ip_download_limit_bps: Option<u64>,
     #[serde(default)]
     pub max_connections: Option<u32>,
     #[serde(default, skip_serializing_if = "ProxyProtocolConfig::is_off")]
@@ -154,6 +158,8 @@ pub fn build_listeners_for_rule(
             load_balance_strategy: LoadBalanceStrategy::from_db_str(&rule.load_balance_strategy),
             upload_limit_bps: mbps_to_bps(rule.upload_limit_mbps),
             download_limit_bps: mbps_to_bps(rule.download_limit_mbps),
+            per_ip_upload_limit_bps: mbps_to_bps(rule.per_ip_upload_limit_mbps),
+            per_ip_download_limit_bps: mbps_to_bps(rule.per_ip_download_limit_mbps),
             max_connections: if rule.max_connections > 0 {
                 Some(rule.max_connections as u32)
             } else {
@@ -528,6 +534,10 @@ pub struct CreateRuleRequest {
     pub upload_limit_mbps: Option<i32>,
     #[serde(default)]
     pub download_limit_mbps: Option<i32>,
+    #[serde(default)]
+    pub per_ip_upload_limit_mbps: Option<i32>,
+    #[serde(default)]
+    pub per_ip_download_limit_mbps: Option<i32>,
     /// Cap on concurrent TCP connections PER NODE (0 / omitted = unlimited).
     #[serde(default)]
     pub max_connections: Option<i32>,
@@ -568,6 +578,10 @@ pub struct UpdateRuleRequest {
     pub upload_limit_mbps: Option<i32>,
     #[serde(default)]
     pub download_limit_mbps: Option<i32>,
+    #[serde(default)]
+    pub per_ip_upload_limit_mbps: Option<i32>,
+    #[serde(default)]
+    pub per_ip_download_limit_mbps: Option<i32>,
     #[serde(default)]
     pub paused: Option<bool>,
     #[serde(default)]
@@ -676,6 +690,8 @@ mod tests {
             load_balance_strategy: "first".into(),
             upload_limit_mbps: 0,
             download_limit_mbps: 0,
+            per_ip_upload_limit_mbps: 0,
+            per_ip_download_limit_mbps: 0,
             max_connections: 0,
             auto_restart_minutes: 0,
             proxy_protocol_send: "off".into(),
@@ -700,13 +716,19 @@ mod tests {
 
     #[test]
     fn build_listeners_for_rule_normalizes_sni_for_tcp_only() {
-        let r = rule(1, "tcp_udp", Some("  Sub.Example.COM "));
+        let mut r = rule(1, "tcp_udp", Some("  Sub.Example.COM "));
+        r.per_ip_upload_limit_mbps = 80;
+        r.per_ip_download_limit_mbps = 80;
         let listeners = build_listeners_for_rule(&r, vec!["10.0.0.1:443".into()]);
         assert_eq!(listeners.len(), 2);
         assert_eq!(listeners[0].protocol, Protocol::Tcp);
         assert_eq!(listeners[0].sni.as_deref(), Some("sub.example.com"));
         assert_eq!(listeners[0].sni_fallback_addr, "127.0.0.1:10443");
+        assert_eq!(listeners[0].per_ip_upload_limit_bps, Some(10_000_000));
+        assert_eq!(listeners[0].per_ip_download_limit_bps, Some(10_000_000));
         assert_eq!(listeners[1].protocol, Protocol::Udp);
         assert_eq!(listeners[1].sni, None);
+        assert_eq!(listeners[1].per_ip_upload_limit_bps, Some(10_000_000));
+        assert_eq!(listeners[1].per_ip_download_limit_bps, Some(10_000_000));
     }
 }

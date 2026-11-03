@@ -174,6 +174,8 @@ export default function Rules() {
     load_balance_strategy?: string;
     upload_limit_mbps?: number;
     download_limit_mbps?: number;
+    per_ip_upload_limit_mbps?: number;
+    per_ip_download_limit_mbps?: number;
     max_connections?: number;
     auto_restart_minutes?: number;
   }) => {
@@ -187,6 +189,8 @@ export default function Rules() {
       sni: values.protocol === 'tcp' && values.sni?.trim() ? values.sni.trim() : null,
       forward_mode: 'direct',
       device_group_out: null,
+      per_ip_upload_limit_mbps: values.per_ip_upload_limit_mbps ?? 0,
+      per_ip_download_limit_mbps: values.per_ip_download_limit_mbps ?? 0,
       max_connections: values.max_connections ?? 0,
       auto_restart_minutes: values.auto_restart_minutes ?? 0,
     });
@@ -211,6 +215,8 @@ export default function Rules() {
       load_balance_strategy: r.load_balance_strategy ?? 'first',
       upload_limit_mbps: r.upload_limit_mbps ?? 0,
       download_limit_mbps: r.download_limit_mbps ?? 0,
+      per_ip_upload_limit_mbps: r.per_ip_upload_limit_mbps ?? 0,
+      per_ip_download_limit_mbps: r.per_ip_download_limit_mbps ?? 0,
       max_connections: r.max_connections ?? 0,
       auto_restart_minutes: r.auto_restart_minutes ?? 0,
       proxy_protocol_send: r.proxy_protocol_send ?? 'off',
@@ -241,6 +247,8 @@ export default function Rules() {
       load_balance_strategy: r.load_balance_strategy ?? 'first',
       upload_limit_mbps: r.upload_limit_mbps ?? 0,
       download_limit_mbps: r.download_limit_mbps ?? 0,
+      per_ip_upload_limit_mbps: r.per_ip_upload_limit_mbps ?? 0,
+      per_ip_download_limit_mbps: r.per_ip_download_limit_mbps ?? 0,
       max_connections: r.max_connections ?? 0,
       auto_restart_minutes: r.auto_restart_minutes ?? 0,
       proxy_protocol_send: r.proxy_protocol_send ?? 'off',
@@ -287,6 +295,8 @@ export default function Rules() {
     load_balance_strategy: 'first' as const,
     upload_limit_mbps: 0,
     download_limit_mbps: 0,
+    per_ip_upload_limit_mbps: 0,
+    per_ip_download_limit_mbps: 0,
   };
   const handleImport = async () => {
     if (!importGroupId) {
@@ -342,6 +352,8 @@ export default function Rules() {
     load_balance_strategy?: string;
     upload_limit_mbps?: number;
     download_limit_mbps?: number;
+    per_ip_upload_limit_mbps?: number;
+    per_ip_download_limit_mbps?: number;
     max_connections?: number;
     auto_restart_minutes?: number;
     proxy_protocol_send?: string;
@@ -382,6 +394,12 @@ export default function Rules() {
     if (newUp !== (editing.upload_limit_mbps ?? 0) || newDown !== (editing.download_limit_mbps ?? 0)) {
       payload.upload_limit_mbps = newUp;
       payload.download_limit_mbps = newDown;
+    }
+    const newPerIpUp = values.per_ip_upload_limit_mbps ?? 0;
+    const newPerIpDown = values.per_ip_download_limit_mbps ?? 0;
+    if (newPerIpUp !== (editing.per_ip_upload_limit_mbps ?? 0) || newPerIpDown !== (editing.per_ip_download_limit_mbps ?? 0)) {
+      payload.per_ip_upload_limit_mbps = newPerIpUp;
+      payload.per_ip_download_limit_mbps = newPerIpDown;
     }
     const newMaxConn = values.max_connections ?? 0;
     const newAutoRestart = values.auto_restart_minutes ?? 0;
@@ -1057,6 +1075,15 @@ export default function Rules() {
                     <Form.Item name="download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
                   </Space>
                 </Form.Item>
+                <Form.Item
+                  label={<span>{t('perIpRateLimits')} <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{t('perIpRateLimitsTooltip')}</span>} overlayStyle={{ maxWidth: 360 }}><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></span>}
+                  extra={t('perIpRateLimitsHint')}
+                >
+                  <Space orientation="vertical" style={{ width: '100%' }}>
+                    <Form.Item name="per_ip_upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
+                    <Form.Item name="per_ip_download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
+                  </Space>
+                </Form.Item>
                 <ProxyProtocolFields proto={createProto} t={t} />
                 {renderConnectionControls(createProto)}
               </>),
@@ -1107,6 +1134,15 @@ export default function Rules() {
                   <Space orientation="vertical" style={{ width: '100%' }}>
                     <Form.Item name="upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
                     <Form.Item name="download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
+                  </Space>
+                </Form.Item>
+                <Form.Item
+                  label={<span>{t('perIpRateLimits')} <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{t('perIpRateLimitsTooltip')}</span>} overlayStyle={{ maxWidth: 360 }}><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></span>}
+                  extra={t('perIpRateLimitsHint')}
+                >
+                  <Space orientation="vertical" style={{ width: '100%' }}>
+                    <Form.Item name="per_ip_upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
+                    <Form.Item name="per_ip_download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
                   </Space>
                 </Form.Item>
                 <ProxyProtocolFields proto={editProto} t={t} />

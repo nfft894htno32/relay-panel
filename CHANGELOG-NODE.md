@@ -13,6 +13,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-11-03
+
+Ships alongside panel `v1.3.1`. Adds native per-client-IP token-bucket rate limiting across raw TCP, Multi-SNI TCP, and UDP forwarding.
+
+### Added
+
+- **Per-client-IP token-bucket rate limiting**: Enforces `per_ip_upload_limit_bps` and `per_ip_download_limit_bps` per client IP alongside the rule-level cap. Canonicalizes IPv4-mapped IPv6 (`::ffff:x.x.x.x`) to IPv4 `/32`, groups IPv6 clients by `/64` prefix, honors real client IPs decoded from Proxy Protocol (`proxy_protocol_accept`), and automatically cleans up idle buckets with bounded memory (`MAX_TRACKED_IPS_PER_RULE = 16,384`).
+
 ## [1.3.0] - 2026-11-03
 
 Ships alongside panel 1.3.0. Adds native TLS ClientHello SNI multiplexing and automatic anti-loop fallback.

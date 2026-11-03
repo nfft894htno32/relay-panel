@@ -10,6 +10,15 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-11-03
+
+Ships alongside `node-v1.3.1`. Adds native per-client-IP rate limiting alongside rule-total bandwidth caps, plus companion SNI script refinements.
+
+### Added
+
+- **Per-client-IP bandwidth rate limiting (`单 IP 限速`)**: Rules now support `per_ip_upload_limit_mbps` and `per_ip_download_limit_mbps` (e.g. `80` Mbps = `10 MB/s`) in addition to the existing per-rule total bandwidth cap. All concurrent TCP connections and UDP sessions from the same client IPv4 (`/32`) or IPv6 (`/64` prefix) share one token bucket per rule, preventing a single user's multi-threaded downloads from saturating the relay node.
+- **Companion SNI disguise script refinements**: `scripts/setup-sni-sites.sh` now disables unrequested legacy domains on re-runs and prompts before updating Cloudflare DNS A records (so backend Reality landing nodes can generate SSL sites without overwriting relay DNS records); added `scripts/upgrade-sni-sites.sh` for 1-click rate-limiting upgrades on existing Nginx fallback hosts.
+
 ## [1.3.0] - 2026-11-03
 
 Ships alongside 

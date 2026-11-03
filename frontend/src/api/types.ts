@@ -54,6 +54,10 @@ export interface ForwardRule {
   upload_limit_mbps?: number;
   /** Per-rule download cap in Mbps (0 = unlimited). */
   download_limit_mbps?: number;
+  /** Per-client-IP upload cap in Mbps shared across all connections from the same client IP (0 = unlimited). */
+  per_ip_upload_limit_mbps?: number;
+  /** Per-client-IP download cap in Mbps shared across all connections from the same client IP (0 = unlimited). */
+  per_ip_download_limit_mbps?: number;
   /** Cap on concurrent TCP connections, counted PER NODE (0 = unlimited). */
   max_connections?: number;
   /** Restart the rule every N minutes to shed connections (0 = off).

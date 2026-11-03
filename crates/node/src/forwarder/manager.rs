@@ -27,6 +27,8 @@ struct ListenerFingerprint {
     load_balance_strategy: LoadBalanceStrategy,
     upload_limit_bps: Option<u64>,
     download_limit_bps: Option<u64>,
+    per_ip_upload_limit_bps: Option<u64>,
+    per_ip_download_limit_bps: Option<u64>,
     max_connections: Option<u32>,
     proxy_protocol: ProxyProtocolConfig,
 }
@@ -42,6 +44,8 @@ impl ListenerFingerprint {
             load_balance_strategy: l.load_balance_strategy,
             upload_limit_bps: l.upload_limit_bps,
             download_limit_bps: l.download_limit_bps,
+            per_ip_upload_limit_bps: l.per_ip_upload_limit_bps,
+            per_ip_download_limit_bps: l.per_ip_download_limit_bps,
             max_connections: l.max_connections,
             proxy_protocol: l.proxy_protocol.clone(),
         }
@@ -332,7 +336,12 @@ impl ForwarderManager {
             let rate_limit = rule_limiters
                 .entry(listener.rule_id)
                 .or_insert_with(|| {
-                    RateLimit::new(listener.upload_limit_bps, listener.download_limit_bps)
+                    RateLimit::with_per_ip(
+                        listener.upload_limit_bps,
+                        listener.download_limit_bps,
+                        listener.per_ip_upload_limit_bps,
+                        listener.per_ip_download_limit_bps,
+                    )
                 })
                 .clone();
             let counter = self.counter.clone();
@@ -625,7 +634,14 @@ impl ForwarderManager {
                 ));
                 let rate_limit = rule_limiters
                     .entry(lc.rule_id)
-                    .or_insert_with(|| RateLimit::new(lc.upload_limit_bps, lc.download_limit_bps))
+                    .or_insert_with(|| {
+                        RateLimit::with_per_ip(
+                            lc.upload_limit_bps,
+                            lc.download_limit_bps,
+                            lc.per_ip_upload_limit_bps,
+                            lc.per_ip_download_limit_bps,
+                        )
+                    })
                     .clone();
                 let gate = self
                     .rule_runtime
@@ -871,6 +887,8 @@ mod tests {
                 load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                 upload_limit_bps: None,
                 download_limit_bps: None,
+                per_ip_upload_limit_bps: None,
+                per_ip_download_limit_bps: None,
                 max_connections: None,
                 proxy_protocol: Default::default(),
             }],
@@ -890,6 +908,8 @@ mod tests {
                 load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                 upload_limit_bps: None,
                 download_limit_bps: None,
+                per_ip_upload_limit_bps: None,
+                per_ip_download_limit_bps: None,
                 max_connections: None,
                 proxy_protocol: Default::default(),
             }],
@@ -918,6 +938,12 @@ mod tests {
         let down_limited = ListenerFingerprint::from_listener(&l);
         assert_ne!(up_limited, down_limited);
         assert_ne!(unlimited, down_limited);
+
+        l.download_limit_bps = None;
+        l.per_ip_download_limit_bps = Some(10_000_000);
+        let per_ip_limited = ListenerFingerprint::from_listener(&l);
+        assert_ne!(unlimited, per_ip_limited);
+        assert_ne!(down_limited, per_ip_limited);
     }
 
     #[test]
@@ -1082,6 +1108,8 @@ mod tests {
                     load_balance_strategy: LoadBalanceStrategy::First,
                     upload_limit_bps: None,
                     download_limit_bps: None,
+                    per_ip_upload_limit_bps: None,
+                    per_ip_download_limit_bps: None,
                     max_connections: None,
                     proxy_protocol: Default::default(),
                 },
@@ -1096,6 +1124,8 @@ mod tests {
                     load_balance_strategy: LoadBalanceStrategy::First,
                     upload_limit_bps: None,
                     download_limit_bps: None,
+                    per_ip_upload_limit_bps: None,
+                    per_ip_download_limit_bps: None,
                     max_connections: None,
                     proxy_protocol: Default::default(),
                 },

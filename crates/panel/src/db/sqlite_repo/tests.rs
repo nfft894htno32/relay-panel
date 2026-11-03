@@ -148,6 +148,8 @@ async fn rule_create_full_supports_sni_multiplexing_and_conn_controls() {
             "first",
             100,
             100,
+            80,
+            80,
             200,
             15,
             &RuleProxyProtocol::default(),
@@ -178,6 +180,8 @@ async fn rule_create_full_supports_sni_multiplexing_and_conn_controls() {
             0,
             0,
             0,
+            0,
+            0,
             &RuleProxyProtocol::default(),
         )
         .await
@@ -199,6 +203,8 @@ async fn rule_create_full_supports_sni_multiplexing_and_conn_controls() {
             443,
             &[],
             "first",
+            0,
+            0,
             0,
             0,
             0,
@@ -227,6 +233,8 @@ async fn rule_create_full_supports_sni_multiplexing_and_conn_controls() {
             0,
             0,
             0,
+            0,
+            0,
             &RuleProxyProtocol::default(),
         )
         .await;
@@ -251,6 +259,8 @@ async fn rule_create_full_supports_sni_multiplexing_and_conn_controls() {
             0,
             0,
             0,
+            0,
+            0,
             &RuleProxyProtocol::default(),
         )
         .await
@@ -262,6 +272,8 @@ async fn rule_create_full_supports_sni_multiplexing_and_conn_controls() {
     assert_eq!(rules.len(), 3);
     let r1 = rules.iter().find(|r| r.id == id1).unwrap();
     assert_eq!(r1.sni.as_deref(), Some("region-de01.example.com"));
+    assert_eq!(r1.per_ip_upload_limit_mbps, 80);
+    assert_eq!(r1.per_ip_download_limit_mbps, 80);
     assert_eq!(r1.max_connections, 200);
     assert_eq!(r1.auto_restart_minutes, 15);
     assert_eq!(r1.targets.len(), 1);
@@ -306,6 +318,8 @@ async fn legacy_not_null_sni_column_compatible_with_none_sni() {
                 },
             ],
             "first",
+            0,
+            0,
             0,
             0,
             0,
@@ -380,6 +394,8 @@ async fn apply_traffic_batch_counts_real_bytes_and_updates_stats() {
             80,
             &[],
             "first",
+            0,
+            0,
             0,
             0,
             0,

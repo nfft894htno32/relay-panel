@@ -624,7 +624,7 @@ mod tests {
             sni: sni.to_ascii_lowercase(),
             targets,
             selector: Arc::new(TargetSelector::new(LoadBalanceStrategy::First, 1)),
-            rate_limit: RateLimit::Unlimited,
+            rate_limit: RateLimit::unlimited(),
             gate,
             proxy_protocol: Arc::new(ProxyProtocolConfig::default()),
         }

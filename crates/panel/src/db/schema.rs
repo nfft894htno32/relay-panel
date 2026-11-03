@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS forward_rules (
     load_balance_strategy TEXT NOT NULL DEFAULT 'first',
     upload_limit_mbps INTEGER NOT NULL DEFAULT 0,
     download_limit_mbps INTEGER NOT NULL DEFAULT 0,
+    per_ip_upload_limit_mbps INTEGER NOT NULL DEFAULT 0,
+    per_ip_download_limit_mbps INTEGER NOT NULL DEFAULT 0,
     max_connections INTEGER NOT NULL DEFAULT 0,
     auto_restart_minutes INTEGER NOT NULL DEFAULT 0,
     proxy_protocol_send TEXT NOT NULL DEFAULT 'off',
@@ -165,6 +167,8 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         "ALTER TABLE device_groups ADD COLUMN sni_loop_bypass_ips TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE device_groups ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE forward_rules ADD COLUMN sni TEXT",
+        "ALTER TABLE forward_rules ADD COLUMN per_ip_upload_limit_mbps INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE forward_rules ADD COLUMN per_ip_download_limit_mbps INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE forward_rules ADD COLUMN max_connections INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE forward_rules ADD COLUMN auto_restart_minutes INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE forward_rules ADD COLUMN proxy_protocol_send TEXT NOT NULL DEFAULT 'off'",
@@ -323,6 +327,8 @@ mod tests {
                 "first",
                 0,
                 0,
+                80,
+                80,
                 0,
                 0,
                 &pp,
@@ -351,11 +357,16 @@ mod tests {
                 0,
                 0,
                 0,
+                0,
+                0,
                 &pp,
             )
             .await
             .expect("insert SNI rule B on same port 443");
         assert_ne!(r1, r2);
+        let fetched_r1 = repo.find_rule_by_id(r1, &ResourceScope::All).await.unwrap().unwrap();
+        assert_eq!(fetched_r1.per_ip_upload_limit_mbps, 80);
+        assert_eq!(fetched_r1.per_ip_download_limit_mbps, 80);
 
         pool.close().await;
         let _ = std::fs::remove_file(&tmp);

@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS forward_rules (
     load_balance_strategy TEXT NOT NULL DEFAULT 'first',
     upload_limit_mbps INTEGER NOT NULL DEFAULT 0,
     download_limit_mbps INTEGER NOT NULL DEFAULT 0,
+    per_ip_upload_limit_mbps INTEGER NOT NULL DEFAULT 0,
+    per_ip_download_limit_mbps INTEGER NOT NULL DEFAULT 0,
     max_connections INTEGER NOT NULL DEFAULT 0,
     auto_restart_minutes INTEGER NOT NULL DEFAULT 0,
     proxy_protocol_send TEXT NOT NULL DEFAULT 'off',
@@ -163,7 +165,7 @@ SELECT setval(pg_get_serial_sequence('users', 'id'), (SELECT MAX(id) FROM users)
 INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING;
 "#;
 
-pub const PG_SCHEMA_VERSION: i32 = 100;
+pub const PG_SCHEMA_VERSION: i32 = 101;
 
 pub fn split_sql_statements(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
@@ -253,6 +255,8 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         "ALTER TABLE device_groups ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS sni TEXT",
         "ALTER TABLE forward_rules ALTER COLUMN sni DROP NOT NULL",
+        "ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS per_ip_upload_limit_mbps INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS per_ip_download_limit_mbps INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS max_connections INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS auto_restart_minutes INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS proxy_protocol_send TEXT NOT NULL DEFAULT 'off'",

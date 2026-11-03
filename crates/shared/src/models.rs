@@ -61,6 +61,12 @@ pub struct ForwardRule {
     #[serde(default)]
     pub download_limit_mbps: i32,
     #[serde(default)]
+    #[sqlx(default)]
+    pub per_ip_upload_limit_mbps: i32,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub per_ip_download_limit_mbps: i32,
+    #[serde(default)]
     pub max_connections: i32,
     #[serde(default)]
     pub auto_restart_minutes: i32,

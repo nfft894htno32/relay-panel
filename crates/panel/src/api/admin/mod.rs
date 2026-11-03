@@ -358,6 +358,8 @@ mod tests {
                 targets: None,
                 upload_limit_mbps: None,
                 download_limit_mbps: None,
+                per_ip_upload_limit_mbps: Some(80),
+                per_ip_download_limit_mbps: Some(80),
                 load_balance_strategy: LoadBalanceStrategy::First,
                 proxy_protocol_send: ProxyProtocolVersion::Off,
                 proxy_protocol_accept: false,
@@ -389,6 +391,8 @@ mod tests {
                 targets: None,
                 upload_limit_mbps: None,
                 download_limit_mbps: None,
+                per_ip_upload_limit_mbps: None,
+                per_ip_download_limit_mbps: None,
                 load_balance_strategy: LoadBalanceStrategy::First,
                 proxy_protocol_send: ProxyProtocolVersion::Off,
                 proxy_protocol_accept: false,
@@ -424,6 +428,8 @@ mod tests {
                 targets: None,
                 upload_limit_mbps: None,
                 download_limit_mbps: None,
+                per_ip_upload_limit_mbps: None,
+                per_ip_download_limit_mbps: None,
                 load_balance_strategy: LoadBalanceStrategy::First,
                 proxy_protocol_send: ProxyProtocolVersion::Off,
                 proxy_protocol_accept: false,
@@ -455,6 +461,8 @@ mod tests {
                 targets: None,
                 upload_limit_mbps: None,
                 download_limit_mbps: None,
+                per_ip_upload_limit_mbps: None,
+                per_ip_download_limit_mbps: None,
                 load_balance_strategy: LoadBalanceStrategy::First,
                 proxy_protocol_send: ProxyProtocolVersion::Off,
                 proxy_protocol_accept: false,
@@ -479,6 +487,8 @@ mod tests {
         assert_eq!(rules.len(), 2);
         let de01 = rules.iter().find(|r| r.name == "sni-de01").unwrap();
         assert_eq!(de01.sni.as_deref(), Some("region-de01.example.com"));
+        assert_eq!(de01.per_ip_upload_limit_mbps, 80);
+        assert_eq!(de01.per_ip_download_limit_mbps, 80);
         assert_eq!(de01.max_connections, 250);
         assert_eq!(de01.auto_restart_minutes, 15);
     }

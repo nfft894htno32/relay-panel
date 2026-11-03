@@ -62,6 +62,8 @@ pub struct RuleUpdate<'a> {
     pub load_balance_strategy: Option<&'a str>,
     pub upload_limit_mbps: Option<i32>,
     pub download_limit_mbps: Option<i32>,
+    pub per_ip_upload_limit_mbps: Option<i32>,
+    pub per_ip_download_limit_mbps: Option<i32>,
     pub max_connections: Option<i32>,
     pub auto_restart_minutes: Option<i32>,
     pub proxy_protocol_send: Option<&'a str>,
@@ -84,6 +86,8 @@ impl RuleUpdate<'_> {
             || self.load_balance_strategy.is_some()
             || self.upload_limit_mbps.is_some()
             || self.download_limit_mbps.is_some()
+            || self.per_ip_upload_limit_mbps.is_some()
+            || self.per_ip_download_limit_mbps.is_some()
             || self.max_connections.is_some()
             || self.auto_restart_minutes.is_some()
             || self.proxy_protocol_send.is_some()
@@ -195,6 +199,8 @@ pub trait RuleRepository: Send + Sync {
         load_balance_strategy: &str,
         upload_limit_mbps: i32,
         download_limit_mbps: i32,
+        per_ip_upload_limit_mbps: i32,
+        per_ip_download_limit_mbps: i32,
         max_connections: i32,
         auto_restart_minutes: i32,
         proxy_protocol: &RuleProxyProtocol,

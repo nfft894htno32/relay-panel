@@ -109,6 +109,8 @@ async fn pg_rule_create_full_supports_sni_multiplexing() {
             "first",
             0,
             0,
+            80,
+            80,
             200,
             15,
             &RuleProxyProtocol::default(),
@@ -134,6 +136,8 @@ async fn pg_rule_create_full_supports_sni_multiplexing() {
             0,
             0,
             0,
+            0,
+            0,
             &RuleProxyProtocol::default(),
         )
         .await
@@ -154,6 +158,8 @@ async fn pg_rule_create_full_supports_sni_multiplexing() {
             443,
             &[],
             "first",
+            0,
+            0,
             0,
             0,
             0,
