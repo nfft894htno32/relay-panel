@@ -603,6 +603,25 @@ where
     Option::<String>::deserialize(deserializer).map(Some)
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct BatchUpdateRateLimitsRequest {
+    pub rule_ids: Vec<i64>,
+    #[serde(default)]
+    pub upload_limit_mbps: Option<i32>,
+    #[serde(default)]
+    pub download_limit_mbps: Option<i32>,
+    #[serde(default)]
+    pub per_ip_upload_limit_mbps: Option<i32>,
+    #[serde(default)]
+    pub per_ip_download_limit_mbps: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchUpdateRateLimitsResponse {
+    pub updated: usize,
+    pub not_found: Vec<i64>,
+}
+
 // === Admin API — Groups ===
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateGroupRequest {

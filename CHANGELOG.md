@@ -10,6 +10,15 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-11-13
+
+Panel-only feature release (runs alongside `node-v1.3.1`). Adds batch editing of rule-total and per-client-IP rate limits for selected forwarding rules.
+
+### Added
+
+- **Batch rate-limit editor (`批量限速`)**: Select one or more rules on the Forward Rules page and click `批量限速` to update rule-total (`upload_limit_mbps` / `download_limit_mbps`) and/or per-client-IP (`per_ip_upload_limit_mbps` / `per_ip_download_limit_mbps`) caps via `POST /api/v1/rules/batch-rate-limits`. When selected rules differ on one section, that section's toggle defaults to off to prevent accidental overwrites, and `config_changed` WebSocket pushes are coalesced per affected inbound group.
+- **Rate-limit badges in rule table**: Rules with non-zero overall or per-IP rate limits now show compact `限速` / `单IP` tags in the rules list.
+
 ## [1.3.2] - 2026-11-03
 
 Ships alongside `node-v1.3.1`. Fixes one-click panel self-update version pin and compiled panel version string for the per-client-IP rate limiting release.

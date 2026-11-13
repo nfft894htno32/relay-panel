@@ -388,3 +388,16 @@ export interface NodeDisplayRow {
   region?: string | null;
   line_type?: string | null;
 }
+
+export interface BatchUpdateRateLimitsRequest {
+  rule_ids: number[];
+  upload_limit_mbps?: number;
+  download_limit_mbps?: number;
+  per_ip_upload_limit_mbps?: number;
+  per_ip_download_limit_mbps?: number;
+}
+
+export interface BatchUpdateRateLimitsResponse {
+  updated: number;
+  not_found: number[];
+}

@@ -4,7 +4,7 @@ import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, ForwardRule, DeviceGroup, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, RestartResponse } from '../api/types';
+import type { ApiEnvelope, BatchUpdateRateLimitsRequest, BatchUpdateRateLimitsResponse, ForwardRule, DeviceGroup, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, RestartResponse } from '../api/types';
 import { MIN_AUTO_RESTART_MINUTES } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { useTableScroll } from '../hooks/useIsMobile';
@@ -19,6 +19,14 @@ import type { TargetRow } from '../utils/rulesIO';
 
 const { Text } = Typography;
 const { TextArea } = Input;
+
+function formatRateTagValue(up?: number, down?: number): string | null {
+  const u = up ?? 0;
+  const d = down ?? 0;
+  if (u <= 0 && d <= 0) return null;
+  if (u === d) return `${u}M`;
+  return `↑${u > 0 ? `${u}M` : '∞'}/↓${d > 0 ? `${d}M` : '∞'}`;
+}
 
 function targetSummary(rule: ForwardRule): string {
   const targets = ruleTargets(rule).filter(t => t.enabled);
@@ -122,6 +130,13 @@ export default function Rules() {
   const [moveTarget, setMoveTarget] = useState<number | undefined>(undefined);
   const [moving, setMoving] = useState(false);
   const [moveResult, setMoveResult] = useState<MoveResult | null>(null);
+  const [batchRateForm] = Form.useForm();
+  const [batchRateOpen, setBatchRateOpen] = useState(false);
+  const [batchRateSaving, setBatchRateSaving] = useState(false);
+  const [batchApplyTotal, setBatchApplyTotal] = useState(true);
+  const [batchApplyPerIp, setBatchApplyPerIp] = useState(true);
+  const [batchTotalMixed, setBatchTotalMixed] = useState(false);
+  const [batchPerIpMixed, setBatchPerIpMixed] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -486,6 +501,77 @@ export default function Rules() {
 
   /** Move the selected rules to another inbound group. A rule whose listen port
    *  is already taken there is skipped and reported (see utils/moveRules). */
+  const openBatchRateLimits = () => {
+    const chosen = rules.filter(r => selectedRowKeys.includes(r.id));
+    if (chosen.length === 0) return;
+    const firstUp = chosen[0].upload_limit_mbps ?? 0;
+    const firstDown = chosen[0].download_limit_mbps ?? 0;
+    const totalUniform = chosen.every(
+      r => (r.upload_limit_mbps ?? 0) === firstUp && (r.download_limit_mbps ?? 0) === firstDown,
+    );
+    const firstPerIpUp = chosen[0].per_ip_upload_limit_mbps ?? 0;
+    const firstPerIpDown = chosen[0].per_ip_download_limit_mbps ?? 0;
+    const perIpUniform = chosen.every(
+      r => (r.per_ip_upload_limit_mbps ?? 0) === firstPerIpUp && (r.per_ip_download_limit_mbps ?? 0) === firstPerIpDown,
+    );
+
+    setBatchApplyTotal(totalUniform);
+    setBatchTotalMixed(!totalUniform);
+    setBatchApplyPerIp(perIpUniform);
+    setBatchPerIpMixed(!perIpUniform);
+
+    batchRateForm.setFieldsValue({
+      upload_limit_mbps: totalUniform ? firstUp : 0,
+      download_limit_mbps: totalUniform ? firstDown : 0,
+      per_ip_upload_limit_mbps: perIpUniform ? firstPerIpUp : 0,
+      per_ip_download_limit_mbps: perIpUniform ? firstPerIpDown : 0,
+    });
+    setBatchRateOpen(true);
+  };
+
+  const handleBatchRateLimits = async (values: {
+    upload_limit_mbps?: number;
+    download_limit_mbps?: number;
+    per_ip_upload_limit_mbps?: number;
+    per_ip_download_limit_mbps?: number;
+  }) => {
+    if (!batchApplyTotal && !batchApplyPerIp) return;
+    if (selectedRowKeys.length === 0) return;
+    const toMbps = (v?: number) => Math.max(0, Math.trunc(Number(v ?? 0)));
+    const payload: BatchUpdateRateLimitsRequest = { rule_ids: selectedRowKeys };
+    if (batchApplyTotal) {
+      payload.upload_limit_mbps = toMbps(values.upload_limit_mbps);
+      payload.download_limit_mbps = toMbps(values.download_limit_mbps);
+    }
+    if (batchApplyPerIp) {
+      payload.per_ip_upload_limit_mbps = toMbps(values.per_ip_upload_limit_mbps);
+      payload.per_ip_download_limit_mbps = toMbps(values.per_ip_download_limit_mbps);
+    }
+
+    setBatchRateSaving(true);
+    try {
+      const res = await api.post<unknown, ApiEnvelope<BatchUpdateRateLimitsResponse>>('/rules/batch-rate-limits', payload);
+      if (res.code !== 0) {
+        message.error(res.message || t('failedUpdateRule'));
+        return;
+      }
+      const updated = res.data?.updated ?? selectedRowKeys.length;
+      const skipped = res.data?.not_found?.length ?? 0;
+      if (skipped === 0) {
+        message.success(t('batchRateLimitsSuccess').replace('{count}', String(updated)));
+      } else {
+        message.warning(t('batchRateLimitsPartial').replace('{ok}', String(updated)).replace('{fail}', String(skipped)));
+      }
+      setBatchRateOpen(false);
+      setSelectedRowKeys([]);
+      load();
+    } catch {
+      message.error(t('failedUpdateRule'));
+    } finally {
+      setBatchRateSaving(false);
+    }
+  };
+
   const handleBatchMove = async () => {
     if (moveTarget == null) return;
     const chosen = rules.filter(r => selectedRowKeys.includes(r.id));
@@ -664,6 +750,14 @@ export default function Rules() {
         <Space size={4} wrap>
           {protoTags(p)}
           {r.sni && <Tag color="magenta">SNI: {r.sni}</Tag>}
+          {(() => {
+            const totalTag = formatRateTagValue(r.upload_limit_mbps, r.download_limit_mbps);
+            return totalTag ? <Tag color="gold">{t('rateLimitTagTotal').replace('{v}', totalTag)}</Tag> : null;
+          })()}
+          {(() => {
+            const perIpTag = formatRateTagValue(r.per_ip_upload_limit_mbps, r.per_ip_download_limit_mbps);
+            return perIpTag ? <Tag color="orange">{t('rateLimitTagPerIp').replace('{v}', perIpTag)}</Tag> : null;
+          })()}
           {r.proxy_protocol_send && r.proxy_protocol_send !== 'off' && (
             <Tooltip title={t('ppSendHint')}>
               <Tag color="geekblue">{t('ppTagSend').replace('{v}', r.proxy_protocol_send)}</Tag>
@@ -1002,6 +1096,11 @@ export default function Rules() {
               </Button>
             </Popconfirm>
           )}
+          {selectedRowKeys.length > 0 && (
+            <Button icon={<EditOutlined />} onClick={openBatchRateLimits}>
+              {t('batchRateLimits')} ({selectedRowKeys.length})
+            </Button>
+          )}
           <Button icon={<ReloadOutlined />} onClick={load}>{t('refresh')}</Button>
           <Dropdown menu={{ items: exportMenuItems }}>
             <Button icon={<DownloadOutlined />}>{t('exportImport')}</Button>
@@ -1231,6 +1330,114 @@ export default function Rules() {
             )}
           </div>
         )}
+      </Modal>
+
+      <Modal
+        open={batchRateOpen}
+        title={t('batchRateLimitsTitle').replace('{count}', String(selectedRowKeys.length))}
+        onCancel={() => setBatchRateOpen(false)}
+        onOk={() => batchRateForm.submit()}
+        okText={t('save')}
+        cancelText={t('cancel')}
+        okButtonProps={{ disabled: !batchApplyTotal && !batchApplyPerIp, loading: batchRateSaving }}
+        width={560}
+      >
+        <Alert type="info" showIcon style={{ marginBottom: 16 }} title={t('batchRateLimitsHint')} />
+        <Form form={batchRateForm} onFinish={handleBatchRateLimits} layout="vertical">
+          <Form.Item
+            label={
+              <Space>
+                <Switch
+                  size="small"
+                  checked={batchApplyTotal}
+                  onChange={setBatchApplyTotal}
+                  aria-label={t('batchApplyTotalLimits')}
+                />
+                <span>{t('batchApplyTotalLimits')}</span>
+                <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{t('rateLimitsTooltip')}</span>} overlayStyle={{ maxWidth: 340 }}>
+                  <QuestionCircleOutlined style={{ color: '#999' }} />
+                </Tooltip>
+              </Space>
+            }
+            extra={!batchApplyTotal
+              ? (batchTotalMixed ? t('batchRateLimitsMixedHint') : t('batchRateLimitsKeepUnchanged'))
+              : t('rateLimitsHint')}
+          >
+            <Space orientation="vertical" style={{ width: '100%' }}>
+              <Form.Item name="upload_limit_mbps" noStyle initialValue={0}>
+                <InputNumber
+                  min={0}
+                  precision={0}
+                  disabled={!batchApplyTotal}
+                  addonBefore={t('uploadLimit')}
+                  addonAfter="Mbps"
+                  aria-label={`${t('batchApplyTotalLimits')} ${t('uploadLimit')}`}
+                  style={{ width: '100%' }}
+                  placeholder="0"
+                />
+              </Form.Item>
+              <Form.Item name="download_limit_mbps" noStyle initialValue={0}>
+                <InputNumber
+                  min={0}
+                  precision={0}
+                  disabled={!batchApplyTotal}
+                  addonBefore={t('downloadLimit')}
+                  addonAfter="Mbps"
+                  aria-label={`${t('batchApplyTotalLimits')} ${t('downloadLimit')}`}
+                  style={{ width: '100%' }}
+                  placeholder="0"
+                />
+              </Form.Item>
+            </Space>
+          </Form.Item>
+
+          <Form.Item
+            label={
+              <Space>
+                <Switch
+                  size="small"
+                  checked={batchApplyPerIp}
+                  onChange={setBatchApplyPerIp}
+                  aria-label={t('batchApplyPerIpLimits')}
+                />
+                <span>{t('batchApplyPerIpLimits')}</span>
+                <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{t('perIpRateLimitsTooltip')}</span>} overlayStyle={{ maxWidth: 360 }}>
+                  <QuestionCircleOutlined style={{ color: '#999' }} />
+                </Tooltip>
+              </Space>
+            }
+            extra={!batchApplyPerIp
+              ? (batchPerIpMixed ? t('batchRateLimitsMixedHint') : t('batchRateLimitsKeepUnchanged'))
+              : t('perIpRateLimitsHint')}
+          >
+            <Space orientation="vertical" style={{ width: '100%' }}>
+              <Form.Item name="per_ip_upload_limit_mbps" noStyle initialValue={0}>
+                <InputNumber
+                  min={0}
+                  precision={0}
+                  disabled={!batchApplyPerIp}
+                  addonBefore={t('uploadLimit')}
+                  addonAfter="Mbps"
+                  aria-label={`${t('batchApplyPerIpLimits')} ${t('uploadLimit')}`}
+                  style={{ width: '100%' }}
+                  placeholder="0"
+                />
+              </Form.Item>
+              <Form.Item name="per_ip_download_limit_mbps" noStyle initialValue={0}>
+                <InputNumber
+                  min={0}
+                  precision={0}
+                  disabled={!batchApplyPerIp}
+                  addonBefore={t('downloadLimit')}
+                  addonAfter="Mbps"
+                  aria-label={`${t('batchApplyPerIpLimits')} ${t('downloadLimit')}`}
+                  style={{ width: '100%' }}
+                  placeholder="0"
+                />
+              </Form.Item>
+            </Space>
+          </Form.Item>
+        </Form>
       </Modal>
 
       {/* v0.4.8: rule diagnosis modal — three sections: ingress node, target

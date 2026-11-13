@@ -625,6 +625,17 @@ export const enUS: Dict = {
   batchMoveOccupied: '{count} rules skipped because their listen port is already used in the target group (they stay in their group):',
   batchMoveAlready: '{count} rules were already in the target group and were left alone',
   batchMoveFailed: '{count} rules failed to move:',
+  batchRateLimits: 'Batch Rate Limits',
+  batchRateLimitsTitle: 'Batch Edit Rate Limits ({count} rules selected)',
+  batchRateLimitsHint: 'Update both sections at once, or turn a switch off to leave each rule\'s existing setting unchanged (0 = unlimited; 80 Mbps = 10 MB/s).',
+  batchApplyTotalLimits: 'Update rule-total rate limits',
+  batchApplyPerIpLimits: 'Update per-IP rate limits',
+  batchRateLimitsMixedHint: 'Selected rules currently differ here; left off by default to preserve them. Turn on to overwrite all.',
+  batchRateLimitsKeepUnchanged: 'Off: each rule keeps its current setting',
+  batchRateLimitsSuccess: 'Updated rate limits for {count} rules',
+  batchRateLimitsPartial: 'Updated {ok} rules, {fail} not found or skipped',
+  rateLimitTagTotal: 'Cap: {v}',
+  rateLimitTagPerIp: 'Per-IP: {v}',
 
   // ── v1.2.0: traffic history ──
   trafficHistory: 'Traffic',

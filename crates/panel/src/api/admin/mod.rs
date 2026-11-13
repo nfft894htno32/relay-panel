@@ -34,9 +34,9 @@ fn err<T: Serialize, S: Into<String>>(code: i32, msg: S) -> ApiResponse<T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        change_password, create_group, create_rule, delete_group, delete_rule, get_me, list_groups,
-        list_rules, reset_rule_traffic, update_group, update_rule, ChangePasswordRequest,
-        ListRulesQuery,
+        batch_update_rule_rate_limits, change_password, create_group, create_rule, delete_group,
+        delete_rule, get_me, list_groups, list_rules, reset_rule_traffic, update_group,
+        update_rule, ChangePasswordRequest, ListRulesQuery,
     };
     use crate::api::middleware::{AdminOnly, AuthUser};
     use crate::api::system::ReleaseCache;
@@ -48,8 +48,8 @@ mod tests {
     use axum::extract::{Path, Query, State};
     use axum::Json;
     use relay_shared::protocol::{
-        CreateGroupRequest, CreateRuleRequest, GroupType, LoadBalanceStrategy, Protocol,
-        ProxyProtocolVersion, UpdateGroupRequest, UpdateRuleRequest,
+        BatchUpdateRateLimitsRequest, CreateGroupRequest, CreateRuleRequest, GroupType,
+        LoadBalanceStrategy, Protocol, ProxyProtocolVersion, UpdateGroupRequest, UpdateRuleRequest,
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::SqlitePool;
@@ -576,5 +576,119 @@ mod tests {
         )
         .await;
         assert_eq!(del.code, 0);
+    }
+
+    #[tokio::test]
+    async fn batch_update_rate_limits_updates_selected_rules_preserves_untouched_fields_and_coalesces_pushes(
+    ) {
+        let (state, pool) = test_state().await;
+        seed_rule_and_group(&pool).await;
+        add_group(&pool, 21, 1, "gin2").await;
+        sqlx::query("UPDATE forward_rules SET upload_limit_mbps = 500, download_limit_mbps = 600 WHERE id = 200")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules (id, name, uid, paused, listen_port, protocol, \
+             device_group_in, target_addr, target_port, upload_limit_mbps, download_limit_mbps) \
+             VALUES \
+             (201, 'r2', 1, 0, 12001, 'tcp', 20, '127.0.0.1', 81, 1000, 1200), \
+             (202, 'r3', 1, 0, 12002, 'tcp', 21, '127.0.0.1', 82, 300, 400)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (_id21, mut rx21) = state.node_connections.register(21, None).await;
+
+        expect_group_pushes(&state, 20, 1, async {
+            let Json(resp) = batch_update_rule_rate_limits(
+                AuthUser {
+                    user_id: 1,
+                    admin: true,
+                },
+                State(state.clone()),
+                Json(BatchUpdateRateLimitsRequest {
+                    rule_ids: vec![200, 201, 201, 202, 99999],
+                    upload_limit_mbps: None,
+                    download_limit_mbps: None,
+                    per_ip_upload_limit_mbps: Some(80),
+                    per_ip_download_limit_mbps: Some(80),
+                }),
+            )
+            .await;
+            assert_eq!(resp.code, 0, "{}", resp.message);
+            let data = resp.data.unwrap();
+            assert_eq!(data.updated, 3);
+            assert_eq!(data.not_found, vec![99999]);
+        })
+        .await;
+
+        let mut g21_pushes = 0;
+        while rx21.try_recv().is_ok() {
+            g21_pushes += 1;
+        }
+        assert_eq!(g21_pushes, 1, "group 21 should receive 1 push");
+
+        let rows: Vec<(i64, i32, i32, i32, i32)> = sqlx::query_as(
+            "SELECT id, upload_limit_mbps, download_limit_mbps, per_ip_upload_limit_mbps, per_ip_download_limit_mbps \
+             FROM forward_rules ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (200, 500, 600, 80, 80),
+                (201, 1000, 1200, 80, 80),
+                (202, 300, 400, 80, 80),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_update_rate_limits_rejects_empty_and_negative_requests() {
+        let (state, pool) = test_state().await;
+        seed_rule_and_group(&pool).await;
+        let admin = || AuthUser {
+            user_id: 1,
+            admin: true,
+        };
+
+        let Json(empty_ids) = batch_update_rule_rate_limits(
+            admin(),
+            State(state.clone()),
+            Json(BatchUpdateRateLimitsRequest {
+                rule_ids: vec![],
+                upload_limit_mbps: Some(100),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(empty_ids.code, 400);
+
+        let Json(no_fields) = batch_update_rule_rate_limits(
+            admin(),
+            State(state.clone()),
+            Json(BatchUpdateRateLimitsRequest {
+                rule_ids: vec![200],
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(no_fields.code, 400);
+
+        let Json(neg_val) = batch_update_rule_rate_limits(
+            admin(),
+            State(state),
+            Json(BatchUpdateRateLimitsRequest {
+                rule_ids: vec![200],
+                per_ip_download_limit_mbps: Some(-1),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(neg_val.code, 400);
     }
 }

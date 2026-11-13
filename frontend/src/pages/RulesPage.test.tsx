@@ -590,3 +590,102 @@ describe('PROXY protocol', () => {
     expect(screen.getByText('ppUdpUnsupported')).toBeInTheDocument();
   });
 });
+
+describe('batch rate limits', () => {
+  it('shows rate-limit tags on rules with non-zero limits and hides them when 0', async () => {
+    routes({
+      rules: ok([
+        rule({ upload_limit_mbps: 500, download_limit_mbps: 500, per_ip_download_limit_mbps: 80 }),
+        rule({ id: 2, name: 'unthrottled', listen_port: 10002 }),
+      ]),
+      groups: ok([group()]),
+    });
+    renderPage();
+    await waitFor(() => expect(screen.getByText('hk-web')).toBeInTheDocument());
+    expect(screen.getAllByText('rateLimitTagTotal')).toHaveLength(1);
+    expect(screen.getAllByText('rateLimitTagPerIp')).toHaveLength(1);
+  });
+
+  it('updates both rule-total and per-IP limits for uniform selected rules', async () => {
+    mockPost.mockReset();
+    mockPost.mockResolvedValue(ok({ updated: 2, not_found: [] }));
+    const user = userEvent.setup();
+    const { container } = renderPage();
+    await waitFor(() => expect(screen.getByText('hk-web')).toBeInTheDocument());
+    const getsBefore = mockGet.mock.calls.filter((c) => String(c[0]).startsWith('/rules')).length;
+
+    const boxes = container.querySelectorAll('tr.ant-table-row input[type="checkbox"]');
+    await user.click(boxes[0] as HTMLElement);
+    await user.click(boxes[1] as HTMLElement);
+    await user.click(screen.getByRole('button', { name: /batchRateLimits \(2\)/ }));
+
+    const totalUp = await screen.findByLabelText('batchApplyTotalLimits uploadLimit');
+    const totalDown = screen.getByLabelText('batchApplyTotalLimits downloadLimit');
+    const perIpUp = screen.getByLabelText('batchApplyPerIpLimits uploadLimit');
+    const perIpDown = screen.getByLabelText('batchApplyPerIpLimits downloadLimit');
+
+    await user.clear(totalUp);
+    await user.type(totalUp, '500');
+    await user.clear(totalDown);
+    await user.type(totalDown, '500');
+    await user.clear(perIpUp);
+    await user.type(perIpUp, '80');
+    await user.clear(perIpDown);
+    await user.type(perIpDown, '80');
+
+    await user.click(screen.getByRole('button', { name: /^save$/ }));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    expect(mockPost).toHaveBeenCalledWith('/rules/batch-rate-limits', {
+      rule_ids: [1, 2],
+      upload_limit_mbps: 500,
+      download_limit_mbps: 500,
+      per_ip_upload_limit_mbps: 80,
+      per_ip_download_limit_mbps: 80,
+    });
+    await waitFor(() =>
+      expect(mockGet.mock.calls.filter((c) => String(c[0]).startsWith('/rules')).length).toBeGreaterThan(getsBefore),
+    );
+  });
+
+  it('leaves heterogeneous rule-total limits off by default and omits them when only per-IP limits are edited', async () => {
+    mockPost.mockReset();
+    mockPost.mockResolvedValue(ok({ updated: 2, not_found: [] }));
+    routes({
+      rules: ok([
+        rule({ upload_limit_mbps: 500, download_limit_mbps: 500 }),
+        rule({ id: 2, name: 'jp-game', listen_port: 10002, upload_limit_mbps: 1000, download_limit_mbps: 1000 }),
+      ]),
+      groups: ok([group()]),
+    });
+    const user = userEvent.setup();
+    const { container } = renderPage();
+    await waitFor(() => expect(screen.getByText('hk-web')).toBeInTheDocument());
+
+    const boxes = container.querySelectorAll('tr.ant-table-row input[type="checkbox"]');
+    await user.click(boxes[0] as HTMLElement);
+    await user.click(boxes[1] as HTMLElement);
+    await user.click(screen.getByRole('button', { name: /batchRateLimits \(2\)/ }));
+
+    const totalSwitch = await screen.findByRole('switch', { name: 'batchApplyTotalLimits' });
+    const perIpSwitch = screen.getByRole('switch', { name: 'batchApplyPerIpLimits' });
+    expect(totalSwitch).toHaveAttribute('aria-checked', 'false');
+    expect(perIpSwitch).toHaveAttribute('aria-checked', 'true');
+
+    const perIpUp = screen.getByLabelText('batchApplyPerIpLimits uploadLimit');
+    const perIpDown = screen.getByLabelText('batchApplyPerIpLimits downloadLimit');
+    await user.clear(perIpUp);
+    await user.type(perIpUp, '80');
+    await user.clear(perIpDown);
+    await user.type(perIpDown, '80');
+
+    await user.click(screen.getByRole('button', { name: /^save$/ }));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    expect(mockPost).toHaveBeenCalledWith('/rules/batch-rate-limits', {
+      rule_ids: [1, 2],
+      per_ip_upload_limit_mbps: 80,
+      per_ip_download_limit_mbps: 80,
+    });
+  });
+});

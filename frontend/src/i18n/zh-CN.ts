@@ -622,6 +622,17 @@ export const zhCN = {
   batchMoveOccupied: '{count} 条规则因监听端口在目标分组已被占用而跳过（仍在原分组）：',
   batchMoveAlready: '{count} 条规则本来就在目标分组，未处理',
   batchMoveFailed: '{count} 条规则切换失败：',
+  batchRateLimits: '批量限速',
+  batchRateLimitsTitle: '批量修改限速（已选 {count} 条规则）',
+  batchRateLimitsHint: '可同时修改两项，也可关闭某一项开关以保留各规则原有设置不变（0 = 不限速；80 Mbps = 10 MB/s）。',
+  batchApplyTotalLimits: '修改整体限速（规则总带宽）',
+  batchApplyPerIpLimits: '修改单 IP 限速（单用户带宽）',
+  batchRateLimitsMixedHint: '所选规则当前该项限速不一致，已默认关闭开关以保留原值；开启后将统一覆盖。',
+  batchRateLimitsKeepUnchanged: '已关闭：保持每条规则原有设置不变',
+  batchRateLimitsSuccess: '已批量更新 {count} 条规则的限速配置',
+  batchRateLimitsPartial: '已更新 {ok} 条规则，{fail} 条不存在或已跳过',
+  rateLimitTagTotal: '限速: {v}',
+  rateLimitTagPerIp: '单IP: {v}',
 
   // ── v1.2.0: 流量历史 ──
   trafficHistory: '流量趋势',

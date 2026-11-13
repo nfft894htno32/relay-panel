@@ -102,6 +102,114 @@ pub async fn update_rule(
     }
 }
 
+pub async fn batch_update_rule_rate_limits(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Json(req): Json<BatchUpdateRateLimitsRequest>,
+) -> Json<ApiResponse<BatchUpdateRateLimitsResponse>> {
+    let mut seen = std::collections::HashSet::with_capacity(req.rule_ids.len());
+    let unique_ids: Vec<i64> = req
+        .rule_ids
+        .into_iter()
+        .filter(|id| seen.insert(*id))
+        .collect();
+
+    if unique_ids.is_empty() {
+        return Json(err(400, "请至少选择一条规则"));
+    }
+    if unique_ids.len() > 500 {
+        return Json(err(400, "单次批量修改最多支持 500 条规则"));
+    }
+
+    let limits = [
+        req.upload_limit_mbps,
+        req.download_limit_mbps,
+        req.per_ip_upload_limit_mbps,
+        req.per_ip_download_limit_mbps,
+    ];
+    if limits.iter().all(Option::is_none) {
+        return Json(err(400, "请至少选择一项要修改的限速配置"));
+    }
+    if limits.iter().flatten().any(|&v| v < 0) {
+        return Json(err(400, "限速值不能小于 0"));
+    }
+
+    let partial = UpdateRuleRequest {
+        upload_limit_mbps: req.upload_limit_mbps,
+        download_limit_mbps: req.download_limit_mbps,
+        per_ip_upload_limit_mbps: req.per_ip_upload_limit_mbps,
+        per_ip_download_limit_mbps: req.per_ip_download_limit_mbps,
+        ..Default::default()
+    };
+
+    let scope = user.resource_scope();
+    let mut updated = 0usize;
+    let mut not_found = Vec::new();
+    let mut affected_groups = std::collections::BTreeSet::new();
+
+    for id in unique_ids {
+        let group_in = match state.db.find_rule_by_id(id, &scope).await {
+            Ok(Some(rule)) => rule.device_group_in,
+            Ok(None) => {
+                not_found.push(id);
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(
+                    "batch_update_rule_rate_limits {}: find_rule_by_id failed: {}",
+                    id,
+                    e
+                );
+                return Json(err(500, "数据库错误"));
+            }
+        };
+
+        match crate::service::rules::update_rule(state.db.as_ref(), id, &scope, &partial).await {
+            Ok(()) => {
+                updated += 1;
+                affected_groups.insert(group_in);
+            }
+            Err(UpdateRuleError::NotFound) => not_found.push(id),
+            Err(UpdateRuleError::BadRequest(msg)) => return Json(err(400, msg)),
+            Err(UpdateRuleError::PortConflict) => {
+                return Json(err(409, "监听端口在此入口分组上已被占用"))
+            }
+            Err(UpdateRuleError::Database(e)) => {
+                tracing::error!(
+                    "batch_update_rule_rate_limits {}: service failed: {}",
+                    id,
+                    e
+                );
+                return Json(err(500, "数据库错误"));
+            }
+        }
+    }
+
+    for gid in affected_groups {
+        state
+            .node_connections
+            .send_group(gid, r#"{"type":"config_changed"}"#)
+            .await;
+    }
+
+    if updated > 0 {
+        crate::service::audit::record(
+            &state,
+            Some(user.user_id),
+            "batch_update_rule_rate_limits",
+            "rule",
+            0,
+            &format!("updated {updated} rules"),
+        )
+        .await;
+    }
+
+    Json(ApiResponse::success(BatchUpdateRateLimitsResponse {
+        updated,
+        not_found,
+    }))
+}
+
 pub async fn reset_rule_traffic(
     user: AuthUser,
     State(state): State<AppState>,

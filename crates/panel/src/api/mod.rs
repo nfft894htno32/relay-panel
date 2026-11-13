@@ -73,6 +73,10 @@ pub fn routes() -> Router<AppState> {
             axum::routing::get(admin::list_rules).post(admin::create_rule),
         )
         .route(
+            "/rules/batch-rate-limits",
+            axum::routing::post(admin::batch_update_rule_rate_limits),
+        )
+        .route(
             "/rules/{id}",
             axum::routing::put(admin::update_rule).delete(admin::delete_rule),
         )
