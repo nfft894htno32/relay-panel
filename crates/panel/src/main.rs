@@ -110,6 +110,7 @@ async fn main() {
         geoip_in_flight: std::sync::Arc::new(tokio::sync::Mutex::new(
             std::collections::HashSet::new(),
         )),
+        node_traffic_locks: service::node_traffic::NodeTrafficLocks::new(),
     };
 
     // v1.2.0: scheduled rule restarts. Shares the AppState (and therefore the

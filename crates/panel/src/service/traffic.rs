@@ -154,6 +154,8 @@ pub async fn remove_group_status(db: &dyn Repository, group_id: i64) -> Result<u
     for (key, _) in db.scan_prefix(&label_prefix).await? {
         removed += db.delete(&key).await?;
     }
+    // Per-node traffic quota records belong to this group's nodes as well.
+    removed += crate::service::node_traffic::remove_group_records(db, group_id).await?;
     Ok(removed)
 }
 

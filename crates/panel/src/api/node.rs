@@ -374,11 +374,26 @@ pub async fn report_status(
         });
         // Status persistence is best-effort: the original used .ok() to swallow
         // any DB error so a transient failure never broke the report cycle.
+        let status_json_str = status.to_string();
         let _ = state
             .db
-            .set(&status_key, &status.to_string())
+            .set(&status_key, &status_json_str)
             .await
             .map_err(|e| tracing::warn!("report_status: kvs set failed: {}", e));
+
+        // Accumulate per-node NIC traffic deltas and evaluate quota thresholds/exhaustion alerts.
+        if let Some(node_key) = status_key.strip_prefix("node_status:") {
+            crate::service::node_traffic::on_status_report(
+                &state,
+                &g.name,
+                node_key,
+                req.boot_upload_bytes,
+                req.boot_download_bytes,
+                req.network_interface.as_deref(),
+                &status_json_str,
+            )
+            .await;
+        }
 
         // v1.2.4: fold this report into the node's hourly metrics bucket. The
         // status written above is a snapshot each report overwrites; this is the
@@ -496,6 +511,7 @@ mod tests {
             geoip_in_flight: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            node_traffic_locks: crate::service::node_traffic::NodeTrafficLocks::new(),
         };
         (state, pool)
     }

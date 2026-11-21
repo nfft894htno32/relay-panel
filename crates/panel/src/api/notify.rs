@@ -76,6 +76,8 @@ pub struct DeliveryLogRow {
 #[derive(Debug, Deserialize)]
 pub struct UpdateNotifyRequest {
     pub enabled: bool,
+    #[serde(default = "notify::default_notify_traffic")]
+    pub notify_traffic: bool,
     pub notify_offline: bool,
     pub offline_alert_secs: i64,
     pub notify_recovery: bool,
@@ -140,6 +142,7 @@ pub async fn update_notify_settings(
 
     let cfg = NotifyConfig {
         enabled: req.enabled,
+        notify_traffic: req.notify_traffic,
         notify_offline: req.notify_offline,
         offline_alert_secs: req.offline_alert_secs,
         notify_recovery: req.notify_recovery,

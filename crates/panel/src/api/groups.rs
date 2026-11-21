@@ -60,6 +60,7 @@ mod tests {
             node_connections,
             diagnose: crate::api::diagnose::DiagnoseRegistry::new(),
             geoip_in_flight: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            node_traffic_locks: crate::service::node_traffic::NodeTrafficLocks::new(),
         };
         let resp = list_live_rates(
             AuthUser {

@@ -54,6 +54,11 @@ const _: () = assert!(MIN_OFFLINE_ALERT_SECS > crate::api::stats::NODE_ONLINE_WI
 pub struct NotifyConfig {
     /// Master switch. Off = the scheduler still tracks state but sends nothing.
     pub enabled: bool,
+    /// Notify when a node's NIC traffic reaches configured warning thresholds or
+    /// exhausts its quota (100%). Default true so configuring a node quota +
+    /// Telegram immediately delivers traffic alerts without extra toggles.
+    #[serde(default = "default_notify_traffic")]
+    pub notify_traffic: bool,
     /// The old notification page always sent the first offline alert. This is
     /// explicitly defaulted to true so adding selectable events does not stop
     /// alerts for installations with a pre-v1.2.6 JSON blob.
@@ -94,10 +99,15 @@ fn default_notify_offline() -> bool {
     true
 }
 
+pub fn default_notify_traffic() -> bool {
+    true
+}
+
 impl Default for NotifyConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            notify_traffic: true,
             notify_offline: true,
             offline_alert_secs: DEFAULT_OFFLINE_ALERT_SECS,
             notify_recovery: false,
@@ -148,6 +158,7 @@ impl NotifyConfig {
 #[derive(Debug, Clone, Serialize)]
 pub struct NotifyConfigPublic {
     pub enabled: bool,
+    pub notify_traffic: bool,
     pub notify_offline: bool,
     pub offline_alert_secs: i64,
     pub notify_recovery: bool,
@@ -172,6 +183,7 @@ impl From<&NotifyConfig> for NotifyConfigPublic {
     fn from(c: &NotifyConfig) -> Self {
         Self {
             enabled: c.enabled,
+            notify_traffic: c.notify_traffic,
             notify_offline: c.notify_offline,
             offline_alert_secs: c.alert_after(),
             notify_recovery: c.notify_recovery,
@@ -459,11 +471,12 @@ mod tests {
 
     #[test]
     fn old_config_keeps_offline_alerts_enabled() {
-        // Existing installations have no `notify_offline` key in their JSON.
-        // Adding event selection must not silently stop their current outage
-        // alerts after upgrade.
+        // Existing installations have no `notify_offline` or `notify_traffic` key
+        // in their JSON. Adding event selection must not silently stop their
+        // current outage or newly added traffic alerts after upgrade.
         let cfg = NotifyConfig::from_json(Some(r#"{"enabled":true}"#));
         assert!(cfg.notify_offline);
+        assert!(cfg.notify_traffic);
     }
 
     #[test]

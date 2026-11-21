@@ -23,6 +23,7 @@ import { useIsMobile } from '../hooks/useIsMobile';
 import { NodeGroupSection } from '../components/nodes/NodeGroupSection';
 import { SortableNodeGroupSection } from '../components/nodes/SortableNodeGroupSection';
 import { NodeDetailDrawer } from '../components/nodes/NodeDetailDrawer';
+import { NodeTrafficModal } from '../components/nodes/NodeTrafficModal';
 import {
   hasGroupOrder,
   mergeVisibleOrder,
@@ -60,6 +61,7 @@ export default function NodeStatus() {
   const [nodeVersionCheckFailed, setNodeVersionCheckFailed] = useState(false);
   const [panelProtocol, setPanelProtocol] = useState(0);
   const [detailRow, setDetailRow] = useState<AnyNodeRow | null>(null);
+  const [trafficEditRow, setTrafficEditRow] = useState<AnyNodeRow | null>(null);
   const inFlightRef = useRef(false);
   const [liveRates, setLiveRates] = useState<Map<string, NodeLiveRate>>(() => new Map());
   const liveInFlightRef = useRef(false);
@@ -160,6 +162,9 @@ export default function NodeStatus() {
   const detailCurrent = detailRow
     ? rows?.find((r) => r.group_id === detailRow.group_id && r.node_id === detailRow.node_id) ?? detailRow
     : null;
+  const trafficEditCurrent = trafficEditRow
+    ? rows?.find((r) => r.group_id === trafficEditRow.group_id && r.node_id === trafficEditRow.node_id) ?? trafficEditRow
+    : null;
 
   // Drag to reorder the groups: pointer, plus keyboard (Space to pick up,
   // arrows to move, Space to drop, Escape to cancel). Enter is left out on
@@ -243,6 +248,7 @@ export default function NodeStatus() {
       t,
       openDetail: setDetailRow,
       onDelete: isAdmin ? handleDelete : undefined,
+      onEditTraffic: isAdmin ? setTrafficEditRow : undefined,
       onBatchUpgraded: isAdmin ? refresh : undefined,
     };
     return canReorder && hasGroupOrder(groupRows)
@@ -316,6 +322,13 @@ export default function NodeStatus() {
         isAdmin={isAdmin}
         panelProtocol={panelProtocol}
         onDeleted={refresh}
+        onEditTraffic={isAdmin ? setTrafficEditRow : undefined}
+      />
+      <NodeTrafficModal
+        row={trafficEditCurrent}
+        open={trafficEditRow !== null}
+        onClose={() => setTrafficEditRow(null)}
+        onSaved={refresh}
       />
     </>
   );

@@ -11,6 +11,7 @@ import { resolveNodeUpgrade } from './upgrade';
 import { nodeDesktopColumnWidths } from './tableLayout';
 import { UPGRADE_COL_CLASS } from './upgradeAlign';
 import { NodeLabelCell } from './NodeLabelCell';
+import { NodeTrafficCell } from './NodeTrafficCell';
 
 interface Props {
   rows: NodeDisplayRow[];
@@ -32,12 +33,13 @@ interface Props {
    *  offline rows — deleting an online node's record achieves nothing, because
    *  the next report (within ~10s) recreates it. Absent for the user view. */
   onDelete?: (row: NodeDisplayRow) => void;
+  onEditTraffic?: (row: NodeDisplayRow) => void;
 }
 
 /** Desktop table for one group's nodes. Both admin and user share the same
  *  columns — the permission difference is in the data source (admin reads
  *  /nodes, user reads /nodes/shared) and the detail drawer. */
-export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, t, openDetail, showUpgrade, onDelete }: Props) {
+export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, t, openDetail, showUpgrade, onDelete, onEditTraffic }: Props) {
   const labels = { d: t('uptimeDay'), h: t('uptimeHour'), m: t('uptimeMinute'), s: t('uptimeSecond') };
 
   const columns = [
@@ -158,6 +160,10 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
       render: (_: unknown, r: NodeDisplayRow) => (
         <span className="rp-mono rp-node-throughput">{formatBytes(r.boot_upload_bytes)} / {formatBytes(r.boot_download_bytes)}</span>
       ),
+    },
+    {
+      title: t('nodeTrafficQuota'), key: 'traffic_quota', width: nodeDesktopColumnWidths.trafficQuota,
+      render: (_: unknown, r: NodeDisplayRow) => <NodeTrafficCell row={r} t={t} onEdit={onEditTraffic} />,
     },
     {
       title: t('systemUptime'), key: 'uptime', width: 90,

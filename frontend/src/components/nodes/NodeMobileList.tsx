@@ -9,6 +9,7 @@ import { formatBps, formatUptime } from '../../utils/format';
 import { versionRelation, versionTagColor } from '../../utils/version';
 import { resolveNodeUpgrade, type NodeUpgradeState } from './upgrade';
 import { NodeLabelCell } from './NodeLabelCell';
+import { NodeTrafficCell } from './NodeTrafficCell';
 
 const { Text } = Typography;
 
@@ -27,12 +28,13 @@ interface Props {
    *  ladder (PR4), compared against the latest NODE release (PR5). */
   /** Admin view: show each node's version and upgrade state. */
   showUpgrade?: boolean;
+  onEditTraffic?: (row: NodeDisplayRow) => void;
 }
 
 /** Mobile-friendly compact list — one card per node. No wide table, no
  *  horizontal scroll. Shows: status + version + upgrade + network + speed +
  *  resource bars + uptime + a details button. */
-export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', nodeVersionCheckFailed = false, t, openDetail, showUpgrade }: Props) {
+export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', nodeVersionCheckFailed = false, t, openDetail, showUpgrade, onEditTraffic }: Props) {
   const labels = { d: t('uptimeDay'), h: t('uptimeHour'), m: t('uptimeMinute'), s: t('uptimeSecond') };
 
   return (
@@ -99,6 +101,12 @@ export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', no
               ↑ {formatBps(r.upload_bps)} ↓ {formatBps(r.download_bps)}
               {' · '}{t('systemUptime')}: {formatUptime(r.uptime, labels)}
             </div>
+            {!isPlaceholder && (r.traffic_quota || onEditTraffic) && (
+              <div style={{ marginTop: 6 }}>
+                <Text type="secondary" style={{ fontSize: 11 }}>{t('nodeTrafficQuota')}</Text>
+                <NodeTrafficCell row={r} t={t} onEdit={onEditTraffic} compact />
+              </div>
+            )}
             <div style={{ display: 'flex', gap: 12, marginTop: 6 }}>
               <div style={{ flex: 1 }}>
                 <Text type="secondary" style={{ fontSize: 11 }}>CPU</Text>

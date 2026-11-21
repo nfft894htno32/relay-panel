@@ -31,6 +31,7 @@ pub struct AppState {
     pub node_connections: ws::NodeConnections,
     pub diagnose: diagnose::DiagnoseRegistry,
     pub geoip_in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    pub node_traffic_locks: crate::service::node_traffic::NodeTrafficLocks,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -147,6 +148,14 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/nodes/{group_id}/label/{node_id}",
             axum::routing::put(stats::set_node_label),
+        )
+        .route(
+            "/nodes/{group_id}/traffic/{node_id}",
+            axum::routing::put(stats::update_node_traffic),
+        )
+        .route(
+            "/nodes/{group_id}/traffic/{node_id}/reset",
+            axum::routing::post(stats::reset_node_traffic),
         )
         .route(
             "/nodes/{group_id}/upgrade/{node_id}",

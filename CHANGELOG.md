@@ -10,6 +10,15 @@ independent `v*` / `node-v*` tracks since this release).
 
 ## [Unreleased]
 
+## [1.3.4] - 2026-11-21
+
+Panel-only feature release (runs alongside `node-v1.3.1`, no node upgrade required and no destructive schema changes). Adds per-node NIC traffic quota accounting, calibration, monthly auto-reset, and Telegram/email threshold & exhaustion alerting.
+
+### Added
+
+- **Per-node traffic quota & reboot-safe NIC accounting (`流量配额`)**: Tracks cumulative per-node NIC traffic across OS reboots directly from existing `report_status` heartbeats (`boot_upload_bytes` / `boot_download_bytes`), with per-node total quota, manual used-traffic calibration, four billing directions (`both` bidirectional / `upload` outbound-only / `download` inbound-only / `max`), up to 5 warning percentage thresholds (1–99%), built-in 100% exhaustion alerting, optional monthly billing-day auto-reset (1–31 with month-end clamping), and one-click manual reset (`PUT /api/v1/nodes/{group_id}/traffic/{node_id}`, `POST /api/v1/nodes/{group_id}/traffic/{node_id}/reset`).
+- **Node traffic alerts & restored Notification Settings UI (`通知设置`)**: Added `/notify` admin page to configure Telegram Bot Token / Chat ID (and optional SMTP email), toggle node traffic alerts (`notify_traffic`) alongside offline/recovery/version alerts, send test messages, and inspect delivery history (`traffic_threshold` / `traffic_exhausted`). Traffic alerts notify only and never auto-pause forwarding rules.
+
 ## [1.3.3] - 2026-11-13
 
 Panel-only feature release (runs alongside `node-v1.3.1`). Adds batch editing of rule-total and per-client-IP rate limits for selected forwarding rules.

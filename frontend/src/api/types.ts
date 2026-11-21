@@ -116,6 +116,7 @@ export interface TrafficHistoryResponse {
 
 export interface NotifyConfigPublic {
   enabled: boolean;
+  notify_traffic: boolean;
   notify_offline: boolean;
   offline_alert_secs: number;
   notify_recovery: boolean;
@@ -137,7 +138,15 @@ export interface NotifyConfigPublic {
 export interface NotifyHistoryEntry {
   id: string;
   created_at: string;
-  event: 'offline' | 'offline_reminder' | 'recovery' | 'version_outdated' | 'test' | string;
+  event:
+    | 'traffic_threshold'
+    | 'traffic_exhausted'
+    | 'offline'
+    | 'offline_reminder'
+    | 'recovery'
+    | 'version_outdated'
+    | 'test'
+    | string;
   channel: 'telegram' | 'email' | string;
   status: 'sent' | 'failed' | string;
   node_key?: string | null;
@@ -247,6 +256,25 @@ export interface NodeDisk {
   used: number;
 }
 
+export type TrafficDirection = 'both' | 'upload' | 'download' | 'max';
+
+export interface NodeTrafficQuota {
+  total_bytes: number;
+  used_bytes: number;
+  base_bytes: number;
+  period_upload_bytes: number;
+  period_download_bytes: number;
+  direction: TrafficDirection;
+  warn_thresholds: number[];
+  reset_day?: number | null;
+  last_reset_at?: string | null;
+  next_reset_date?: string | null;
+  usage_percent?: number | null;
+  notified_thresholds: number[];
+  notified_exhausted: boolean;
+  status: 'unlimited' | 'normal' | 'warning' | 'exhausted';
+}
+
 export interface NodeStatus {
   group_id: number;
   node_id?: string | null;
@@ -286,6 +314,7 @@ export interface NodeStatus {
   boot_download_bytes?: number | null;
   network_interface?: string | null;
   listener_errors?: ListenerError[] | null;
+  traffic_quota?: NodeTrafficQuota | null;
 }
 
 export interface LoginResponse {
@@ -387,6 +416,7 @@ export interface NodeDisplayRow {
   listener_errors?: ListenerError[] | null;
   region?: string | null;
   line_type?: string | null;
+  traffic_quota?: NodeTrafficQuota | null;
 }
 
 export interface BatchUpdateRateLimitsRequest {

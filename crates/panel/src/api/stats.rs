@@ -284,6 +284,15 @@ pub async fn get_node_status(
     // Admin-given node names: all for an admin, and for anyone else only when
     // the site setting shows them to users.
     let labels = crate::service::node_labels::visible_labels(&state, user.admin).await;
+    // Per-node traffic quota & accounting records, read once in O(1) scan.
+    let traffic_records = match crate::service::node_traffic::all_records(state.db.as_ref()).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("get_node_status: loading node traffic records failed: {}", e);
+            Default::default()
+        }
+    };
+    let today_local = chrono::Local::now().date_naive();
 
     let rows: Vec<(String, String)> = match state.db.scan_prefix("node_status:").await {
         Ok(rows) => rows,
@@ -390,11 +399,13 @@ pub async fn get_node_status(
 
         status["online"] = serde_json::json!(status_is_online(value, now));
 
-        if let Some(label) = key
-            .strip_prefix("node_status:")
-            .and_then(|node_key| labels.get(node_key))
-        {
-            status["label"] = serde_json::json!(label);
+        if let Some(node_key) = key.strip_prefix("node_status:") {
+            if let Some(label) = labels.get(node_key) {
+                status["label"] = serde_json::json!(label);
+            }
+            if let Some(rec) = traffic_records.get(node_key) {
+                status["traffic_quota"] = serde_json::json!(rec.summary(today_local));
+            }
         }
 
         statuses.push(status);
@@ -499,8 +510,19 @@ pub async fn delete_node_status(
         }),
         Ok(_) => {
             tracing::info!("admin deleted node status record {}", key);
-            // The label names the machine, which is gone from the list now. A
-            // node that reports again later starts without one.
+            // The label and traffic quota belong to this machine, which is gone
+            // from the list now. A node that reports again later starts fresh.
+            if let Some(node_key) = key.strip_prefix("node_status:") {
+                if let Err(e) =
+                    crate::service::node_traffic::delete_record(state.db.as_ref(), node_key).await
+                {
+                    tracing::warn!(
+                        "delete_node_status: removing traffic record failed: {}",
+                        e
+                    );
+                }
+                state.node_traffic_locks.remove(node_key).await;
+            }
             if let Some(nid) = q
                 .node_id
                 .as_deref()
@@ -640,6 +662,299 @@ pub async fn set_node_label(
     )
     .await;
     Json(ApiResponse::success(label))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct UpdateNodeTrafficRequest {
+    /// Total traffic quota in bytes. `0` = unlimited (clears quota alerts while keeping tracking).
+    pub total_bytes: u64,
+    /// Optional manually calibrated used traffic in bytes.
+    /// Omit to keep live-tracked counters untouched; provide to calibrate used traffic.
+    #[serde(default)]
+    pub used_bytes: Option<u64>,
+    #[serde(default)]
+    pub direction: crate::service::node_traffic::TrafficDirection,
+    /// Warning threshold percentages in `1..=99` (e.g. `[80, 90]`). 100% exhaustion is built in.
+    #[serde(default)]
+    pub warn_thresholds: Vec<u8>,
+    /// Optional monthly auto-reset day (`1..=31`). `None` or `Some(0)` = manual reset only.
+    #[serde(default)]
+    pub reset_day: Option<u8>,
+}
+
+/// PUT /nodes/{group_id}/traffic/{node_id} — configure a node's traffic quota,
+/// optional calibrated used traffic, billing direction, warning thresholds, and monthly reset day.
+pub async fn update_node_traffic(
+    admin: AdminOnly,
+    State(state): State<AppState>,
+    axum::extract::Path((group_id, node_id)): axum::extract::Path<(i64, String)>,
+    Json(req): Json<UpdateNodeTrafficRequest>,
+) -> Json<ApiResponse<crate::service::node_traffic::NodeTrafficSummary>> {
+    use crate::service::node_traffic::{
+        format_bytes_human, load_record, next_reset_date, normalize_reset_day,
+        normalize_thresholds, save_record, spawn_alert_delivery, NodeTrafficRecord,
+        TrafficAlertContext,
+    };
+    use crate::service::notify::{self, NotifyConfig};
+
+    let node_id = node_id.trim().to_string();
+    let status_key = format!("node_status:{group_id}:{node_id}");
+    match parse_status_key(&status_key) {
+        Some((gid, Some(nid))) if gid == group_id && nid == node_id && !node_id.is_empty() => {}
+        _ => {
+            return Json(ApiResponse {
+                code: 400,
+                message: "invalid group_id / node_id combination".into(),
+                data: None,
+            })
+        }
+    }
+
+    let warn_thresholds = match normalize_thresholds(&req.warn_thresholds) {
+        Ok(v) => v,
+        Err(msg) => {
+            return Json(ApiResponse {
+                code: 400,
+                message: msg,
+                data: None,
+            })
+        }
+    };
+    let reset_day = match normalize_reset_day(req.reset_day) {
+        Ok(v) => v,
+        Err(msg) => {
+            return Json(ApiResponse {
+                code: 400,
+                message: msg,
+                data: None,
+            })
+        }
+    };
+
+    let status_json = match state.db.get(&status_key).await {
+        Ok(Some(raw)) => raw,
+        Ok(None) => {
+            return Json(ApiResponse {
+                code: 404,
+                message: "status record not found".into(),
+                data: None,
+            })
+        }
+        Err(e) => {
+            tracing::error!("update_node_traffic: status lookup failed: {}", e);
+            return Json(ApiResponse {
+                code: 500,
+                message: "database error".into(),
+                data: None,
+            });
+        }
+    };
+
+    let node_key = format!("{group_id}:{node_id}");
+    let now_local = chrono::Local::now();
+    let now_utc = now_local.with_timezone(&chrono::Utc);
+    let today_local = now_local.date_naive();
+
+    let (summary, pending_alert) = {
+        let _guard = state.node_traffic_locks.lock(&node_key).await;
+        let mut record = match load_record(state.db.as_ref(), &node_key).await {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                let mut r = NodeTrafficRecord::default();
+                r.seed_baseline_from_status_json(&status_json);
+                r
+            }
+            Err(e) => {
+                tracing::error!("update_node_traffic: load failed: {}", e);
+                return Json(ApiResponse {
+                    code: 500,
+                    message: "database error".into(),
+                    data: None,
+                });
+            }
+        };
+
+        let prev_reset_day = record.reset_day;
+        record.total_bytes = req.total_bytes;
+        record.direction = req.direction;
+        record.warn_thresholds = warn_thresholds;
+        record.reset_day = reset_day;
+        // Anchor last_reset_at when enabling monthly auto-reset so setting reset_day
+        // does not immediately wipe freshly configured usage on the same cycle.
+        if reset_day.is_some() && (prev_reset_day.is_none() || record.last_reset_at.is_none()) {
+            record.last_reset_at = Some(now_utc.to_rfc3339());
+        }
+        if let Some(used) = req.used_bytes {
+            record.base_bytes = used;
+            record.period_upload_bytes = 0;
+            record.period_download_bytes = 0;
+        }
+        record.reconcile_notified_state();
+
+        let mut pending = None;
+        if record.total_bytes > 0 {
+            let raw_cfg = state.db.get(notify::NOTIFY_CONFIG_KEY).await.ok().flatten();
+            let cfg = NotifyConfig::from_json(raw_cfg.as_deref());
+            if cfg.any_channel_enabled() && cfg.notify_traffic {
+                if let Some(alert) = record.evaluate_alert(true) {
+                    let next_reset = record
+                        .reset_day
+                        .map(|d| next_reset_date(today_local, d).format("%Y-%m-%d").to_string());
+                    pending = Some((cfg, record.direction, record.reset_day, next_reset, alert));
+                }
+            }
+        }
+
+        if let Err(e) = save_record(state.db.as_ref(), &node_key, &record).await {
+            tracing::error!("update_node_traffic: save failed: {}", e);
+            return Json(ApiResponse {
+                code: 500,
+                message: "database error".into(),
+                data: None,
+            });
+        }
+
+        (record.summary(today_local), pending)
+    };
+
+    let group_label = crate::service::audit::group_label(&state, group_id).await;
+    if let Some((cfg, direction, rday, next_reset, alert)) = pending_alert {
+        let group_name = state
+            .db
+            .find_name_by_id(group_id, &crate::db::repo::ResourceScope::All)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| format!("Group {group_id}"));
+        spawn_alert_delivery(
+            state.clone(),
+            cfg,
+            TrafficAlertContext {
+                group_name,
+                node_key: node_key.clone(),
+                status_json,
+                direction,
+                reset_day: rday,
+                next_reset,
+                alert,
+            },
+        );
+    }
+
+    crate::service::audit::record(
+        &state,
+        Some(admin.user_id),
+        "set_node_traffic",
+        "node",
+        &node_id,
+        &format!(
+            "{}分组 {} / 总额 {} / 已用 {} / 方向 {}",
+            crate::service::node_labels::audit_prefix(state.db.as_ref(), group_id, &node_id).await,
+            group_label,
+            if summary.total_bytes == 0 {
+                "不限".to_string()
+            } else {
+                format_bytes_human(summary.total_bytes)
+            },
+            format_bytes_human(summary.used_bytes),
+            summary.direction.label_zh(),
+        ),
+    )
+    .await;
+
+    Json(ApiResponse::success(summary))
+}
+
+/// POST /nodes/{group_id}/traffic/{node_id}/reset — reset a node's used traffic and alert state to 0.
+pub async fn reset_node_traffic(
+    admin: AdminOnly,
+    State(state): State<AppState>,
+    axum::extract::Path((group_id, node_id)): axum::extract::Path<(i64, String)>,
+) -> Json<ApiResponse<crate::service::node_traffic::NodeTrafficSummary>> {
+    use crate::service::node_traffic::{load_record, save_record, NodeTrafficRecord};
+
+    let node_id = node_id.trim().to_string();
+    let status_key = format!("node_status:{group_id}:{node_id}");
+    match parse_status_key(&status_key) {
+        Some((gid, Some(nid))) if gid == group_id && nid == node_id && !node_id.is_empty() => {}
+        _ => {
+            return Json(ApiResponse {
+                code: 400,
+                message: "invalid group_id / node_id combination".into(),
+                data: None,
+            })
+        }
+    }
+
+    let status_json = match state.db.get(&status_key).await {
+        Ok(Some(raw)) => raw,
+        Ok(None) => {
+            return Json(ApiResponse {
+                code: 404,
+                message: "status record not found".into(),
+                data: None,
+            })
+        }
+        Err(e) => {
+            tracing::error!("reset_node_traffic: status lookup failed: {}", e);
+            return Json(ApiResponse {
+                code: 500,
+                message: "database error".into(),
+                data: None,
+            });
+        }
+    };
+
+    let node_key = format!("{group_id}:{node_id}");
+    let now_local = chrono::Local::now();
+    let now_utc = now_local.with_timezone(&chrono::Utc);
+    let today_local = now_local.date_naive();
+
+    let summary = {
+        let _guard = state.node_traffic_locks.lock(&node_key).await;
+        let mut record = match load_record(state.db.as_ref(), &node_key).await {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                let mut r = NodeTrafficRecord::default();
+                r.seed_baseline_from_status_json(&status_json);
+                r
+            }
+            Err(e) => {
+                tracing::error!("reset_node_traffic: load failed: {}", e);
+                return Json(ApiResponse {
+                    code: 500,
+                    message: "database error".into(),
+                    data: None,
+                });
+            }
+        };
+        record.reset_usage(now_utc);
+        if let Err(e) = save_record(state.db.as_ref(), &node_key, &record).await {
+            tracing::error!("reset_node_traffic: save failed: {}", e);
+            return Json(ApiResponse {
+                code: 500,
+                message: "database error".into(),
+                data: None,
+            });
+        }
+        record.summary(today_local)
+    };
+
+    crate::service::audit::record(
+        &state,
+        Some(admin.user_id),
+        "reset_node_traffic",
+        "node",
+        &node_id,
+        &format!(
+            "{}分组 {} / 已手动清零已用流量与告警状态",
+            crate::service::node_labels::audit_prefix(state.db.as_ref(), group_id, &node_id).await,
+            crate::service::audit::group_label(&state, group_id).await,
+        ),
+    )
+    .await;
+
+    Json(ApiResponse::success(summary))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -904,6 +1219,7 @@ mod upgrade_result_tests {
             node_connections: NodeConnections::new(),
             diagnose: crate::api::diagnose::DiagnoseRegistry::new(),
             geoip_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            node_traffic_locks: crate::service::node_traffic::NodeTrafficLocks::new(),
         }
     }
 
@@ -1602,5 +1918,289 @@ mod tests {
 
         assert!(!exists(&pool, "node_status:5:A").await);
         assert!(exists(&pool, "geoip:1.1.1.1").await);
+    }
+}
+
+#[cfg(test)]
+mod node_traffic_api_tests {
+    use super::*;
+    use crate::api::middleware::{AdminOnly, AuthUser};
+    use crate::api::node::report_status;
+    use crate::api::system::ReleaseCache;
+    use crate::api::ws::NodeConnections;
+    use crate::config::Config;
+    use crate::db::schema::SCHEMA_SQL;
+    use crate::db::sqlite_repo::SqliteRepository;
+    use crate::service::node_traffic::{load_record, TrafficDirection};
+    use axum::http::HeaderMap;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::sync::Arc;
+
+    const TOKEN: &str = "traffic-test-token";
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    async fn test_state() -> AppState {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid) \
+             VALUES (7, 'JP-Relay', 'in', ?, 1)",
+        )
+        .bind(TOKEN)
+        .execute(&pool)
+        .await
+        .unwrap();
+        AppState {
+            db: Arc::new(SqliteRepository::new(pool)),
+            config: Config {
+                database_path: "sqlite::memory:".into(),
+                listen: "127.0.0.1:0".into(),
+                key: "test-key".into(),
+                jwt_secret: "test-secret".into(),
+                public_dir: "public".into(),
+                public_panel_url: String::new(),
+                cors_origins: vec![],
+                geoip_enabled: false,
+                geoip_cache_ttl: 604_800,
+            },
+            release_cache: ReleaseCache::new(),
+            node_connections: NodeConnections::new(),
+            diagnose: crate::api::diagnose::DiagnoseRegistry::new(),
+            geoip_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            node_traffic_locks: crate::service::node_traffic::NodeTrafficLocks::new(),
+        }
+    }
+
+    fn auth_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("Authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        h
+    }
+
+    fn status_report(node_id: &str, boot_up: u64, boot_down: u64) -> StatusReport {
+        StatusReport {
+            cpu_usage: 12.0,
+            mem_usage: 30.0,
+            active_connections: 5,
+            uptime_secs: 3600,
+            public_ip: Some("203.0.113.7".into()),
+            public_ipv4: Some("203.0.113.7".into()),
+            public_ipv6: None,
+            disk_total: None,
+            disk_used: None,
+            disk_usage_percent: None,
+            disk_mount: None,
+            upload_bps: Some(1000),
+            download_bps: Some(2000),
+            boot_upload_bytes: Some(boot_up),
+            boot_download_bytes: Some(boot_down),
+            network_interface: Some("eth0".into()),
+            node_id: Some(node_id.into()),
+            process_uptime_secs: Some(100),
+            node_version: Some("1.3.0".into()),
+            config_protocol_version: Some(CONFIG_PROTOCOL_VERSION),
+            listener_errors: None,
+            install_method: Some("systemd".into()),
+            cpu_model: None,
+            cpu_cores: None,
+            mem_total: None,
+            mem_used: None,
+            disks: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn full_lifecycle_heartbeat_quota_calibrate_reset_and_delete() {
+        let state = test_state().await;
+
+        // 1. Heartbeat 1 seeds baseline (50 GB up, 40 GB down) -> used remains 0
+        let Json(r1) = report_status(
+            State(state.clone()),
+            auth_headers(),
+            Json(status_report("node-1", 50 * GB, 40 * GB)),
+        )
+        .await;
+        assert_eq!(r1.code, 0);
+        let rec = load_record(state.db.as_ref(), "7:node-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.used_bytes(), 0);
+
+        // 2. Heartbeat 2 adds +3 GB up, +7 GB down -> used = 10 GB
+        let _ = report_status(
+            State(state.clone()),
+            auth_headers(),
+            Json(status_report("node-1", 53 * GB, 47 * GB)),
+        )
+        .await;
+        let rec = load_record(state.db.as_ref(), "7:node-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.used_bytes(), 10 * GB);
+
+        // 3. Admin configures quota (100 GB total, calibrated used = 75 GB, thresholds [80, 90], reset_day = 15)
+        let Json(upd) = update_node_traffic(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            axum::extract::Path((7, "node-1".to_string())),
+            Json(UpdateNodeTrafficRequest {
+                total_bytes: 100 * GB,
+                used_bytes: Some(75 * GB),
+                direction: TrafficDirection::Both,
+                warn_thresholds: vec![90, 80],
+                reset_day: Some(15),
+            }),
+        )
+        .await;
+        assert_eq!(upd.code, 0);
+        let summary = upd.data.unwrap();
+        assert_eq!(summary.total_bytes, 100 * GB);
+        assert_eq!(summary.used_bytes, 75 * GB);
+        assert_eq!(summary.warn_thresholds, vec![80, 90]);
+        assert_eq!(summary.reset_day, Some(15));
+        assert_eq!(summary.status, "normal");
+
+        // 4. Heartbeat 3 adds +4 GB up, +3 GB down -> used = 82 GB (warning!)
+        let _ = report_status(
+            State(state.clone()),
+            auth_headers(),
+            Json(status_report("node-1", 57 * GB, 50 * GB)),
+        )
+        .await;
+
+        // 5. Updating total_bytes WITHOUT used_bytes preserves live 82 GB
+        let Json(upd2) = update_node_traffic(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            axum::extract::Path((7, "node-1".to_string())),
+            Json(UpdateNodeTrafficRequest {
+                total_bytes: 100 * GB,
+                used_bytes: None,
+                direction: TrafficDirection::Both,
+                warn_thresholds: vec![80, 90],
+                reset_day: Some(15),
+            }),
+        )
+        .await;
+        assert_eq!(upd2.code, 0);
+        let s2 = upd2.data.unwrap();
+        assert_eq!(s2.used_bytes, 82 * GB);
+        assert_eq!(s2.status, "warning");
+
+        // 6. GET /nodes includes traffic_quota on the node row
+        let Json(nodes_resp) = get_node_status(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            State(state.clone()),
+        )
+        .await;
+        assert_eq!(nodes_resp.code, 0);
+        let rows = nodes_resp.data.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["traffic_quota"]["used_bytes"].as_u64(), Some(82 * GB));
+        assert_eq!(rows[0]["traffic_quota"]["status"].as_str(), Some("warning"));
+
+        // 7. Reset clears used traffic to 0 while keeping quota & NIC baseline
+        let Json(rst) = reset_node_traffic(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            axum::extract::Path((7, "node-1".to_string())),
+        )
+        .await;
+        assert_eq!(rst.code, 0);
+        let s3 = rst.data.unwrap();
+        assert_eq!(s3.used_bytes, 0);
+        assert_eq!(s3.total_bytes, 100 * GB);
+        assert_eq!(s3.status, "normal");
+
+        // Next heartbeat (+1 GB up, +1 GB down) adds only +2 GB on top of 0
+        let _ = report_status(
+            State(state.clone()),
+            auth_headers(),
+            Json(status_report("node-1", 58 * GB, 51 * GB)),
+        )
+        .await;
+        let rec = load_record(state.db.as_ref(), "7:node-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.used_bytes(), 2 * GB);
+
+        // 8. Deleting node status also removes its traffic record
+        let Json(del) = delete_node_status(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            axum::extract::Path((7,)),
+            axum::extract::Query(DeleteStatusQuery {
+                node_id: Some("node-1".into()),
+            }),
+        )
+        .await;
+        assert_eq!(del.code, 0);
+        assert!(load_record(state.db.as_ref(), "7:node-1")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn update_node_traffic_validates_inputs_and_missing_node() {
+        let state = test_state().await;
+
+        // Missing node -> 404
+        let Json(resp) = update_node_traffic(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            axum::extract::Path((7, "missing".to_string())),
+            Json(UpdateNodeTrafficRequest {
+                total_bytes: 100 * GB,
+                used_bytes: None,
+                direction: TrafficDirection::Both,
+                warn_thresholds: vec![80],
+                reset_day: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.code, 404);
+
+        // Invalid threshold -> 400
+        let Json(resp2) = update_node_traffic(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            axum::extract::Path((7, "n1".to_string())),
+            Json(UpdateNodeTrafficRequest {
+                total_bytes: 100 * GB,
+                used_bytes: None,
+                direction: TrafficDirection::Both,
+                warn_thresholds: vec![0],
+                reset_day: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp2.code, 400);
+
+        // Invalid reset_day -> 400
+        let Json(resp3) = update_node_traffic(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            axum::extract::Path((7, "n1".to_string())),
+            Json(UpdateNodeTrafficRequest {
+                total_bytes: 100 * GB,
+                used_bytes: None,
+                direction: TrafficDirection::Both,
+                warn_thresholds: vec![80],
+                reset_day: Some(32),
+            }),
+        )
+        .await;
+        assert_eq!(resp3.code, 400);
     }
 }

@@ -278,6 +278,10 @@ async fn tick(state: &AppState, watch: &mut Watch, now: chrono::DateTime<chrono:
     watch
         .version_alerted_target
         .retain(|k, _| seen.iter().any(|s| s == k));
+
+    // Apply monthly auto-resets for any node whose billing reset day has arrived,
+    // including nodes that are currently offline or quiet.
+    crate::service::node_traffic::run_scheduled_resets(state).await;
 }
 
 /// Every node label, or none when they cannot be read — an alert still goes out

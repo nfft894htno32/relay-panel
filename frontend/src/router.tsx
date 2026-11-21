@@ -12,6 +12,7 @@ const Dashboard = lazy(() => import('./pages/Dashboard'));
 const Rules = lazy(() => import('./pages/Rules'));
 const Groups = lazy(() => import('./pages/Groups'));
 const NodeStatus = lazy(() => import('./pages/NodeStatus'));
+const NotifySettings = lazy(() => import('./pages/NotifySettings'));
 const Account = lazy(() => import('./pages/Account'));
 const Forbidden = lazy(() => import('./pages/Forbidden'));
 
@@ -39,6 +40,7 @@ export const router = createBrowserRouter([
       { path: 'groups', element: <RequireAdmin><Groups /></RequireAdmin> },
       { path: 'nodes', element: <NodeStatus /> },
       { path: 'node-status', element: <NodeStatus /> },
+      { path: 'notify', element: <RequireAdmin><NotifySettings /></RequireAdmin> },
       { path: 'account', element: <Account /> },
       { path: '403', element: <Forbidden /> },
     ],

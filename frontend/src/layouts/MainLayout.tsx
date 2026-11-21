@@ -9,6 +9,7 @@ import {
   DashboardOutlined,
   ApiOutlined,
   CloudServerOutlined,
+  BellOutlined,
   UserOutlined,
   LogoutOutlined,
   LockOutlined,
@@ -41,6 +42,7 @@ export default function MainLayout() {
     { key: '/groups', icon: <CloudServerOutlined />, label: t('deviceGroups') },
     { key: '/rules', icon: <ApiOutlined />, label: t('forwardRules') },
     { key: '/nodes', icon: <CloudServerOutlined />, label: t('nodeStatus') },
+    { key: '/notify', icon: <BellOutlined />, label: t('notifySettings') },
     { key: '/account', icon: <UserOutlined />, label: t('personalCenter') },
   ];
 

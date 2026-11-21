@@ -1,6 +1,6 @@
  
-import { Drawer, Descriptions, Tag, Button, Popconfirm, message } from 'antd';
-import { DeleteOutlined } from '@ant-design/icons';
+import { Drawer, Descriptions, Tag, Button, Popconfirm, message, Space } from 'antd';
+import { DeleteOutlined, SettingOutlined } from '@ant-design/icons';
 import { formatPercent, formatBytes, formatBps, formatUptime } from '../../utils/format';
 import { useI18n } from '../../i18n/context';
 import { CountryFlag } from './CountryFlag';
@@ -8,6 +8,7 @@ import type { ApiEnvelope, NodeDisplayRow } from '../../api/types';
 import api from '../../api/client';
 import { cpuSummary, memSummary, wsDownTag } from './shared';
 import { DiskList, hasDiskList } from './NodeResourceBar';
+import { NodeTrafficCell, trafficDirectionLabel, trafficResetText } from './NodeTrafficCell';
 
 interface Props {
   row: NodeDisplayRow | null;
@@ -16,13 +17,14 @@ interface Props {
   isAdmin: boolean;
   panelProtocol: number;
   onDeleted?: () => void;
+  onEditTraffic?: (row: NodeDisplayRow) => void;
 }
 
 /** Full-metric detail drawer for one node. Admin sees extra fields (node_id,
  *  config protocol, interface, disk mount, process uptime, listener errors, a
  *  delete-status action). Regular users see only safe metrics — no node_id,
  *  no token, no config protocol, no listener errors, no management actions. */
-export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, onDeleted }: Props) {
+export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, onDeleted, onEditTraffic }: Props) {
   const { t } = useI18n();
   const labels = { d: t('uptimeDay'), h: t('uptimeHour'), m: t('uptimeMinute'), s: t('uptimeSecond') };
 
@@ -99,6 +101,22 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
           <Descriptions.Item label={`${t('totalUpload')}/${t('totalDownload')}`}>
             {formatBytes(row.boot_upload_bytes)} / {formatBytes(row.boot_download_bytes)}
           </Descriptions.Item>
+          {(row.traffic_quota || (isAdmin && onEditTraffic)) && (
+            <Descriptions.Item label={t('nodeTrafficQuota')}>
+              <div>
+                <NodeTrafficCell row={row} t={t} onEdit={isAdmin ? onEditTraffic : undefined} compact />
+                {row.traffic_quota && (
+                  <div style={{ fontSize: 12, color: 'var(--rp-text-secondary)', marginTop: 4, lineHeight: 1.6 }}>
+                    <div>{t('nodeTrafficDirection')}: {trafficDirectionLabel(row.traffic_quota.direction, t)}</div>
+                    <div>
+                      {t('nodeTrafficCycleTracked')}: ↑ {formatBytes(row.traffic_quota.period_upload_bytes)} / ↓ {formatBytes(row.traffic_quota.period_download_bytes)}
+                    </div>
+                    <div>{t('nodeTrafficNextReset')}: {trafficResetText(row.traffic_quota, t)}</div>
+                  </div>
+                )}
+              </div>
+            </Descriptions.Item>
+          )}
           <Descriptions.Item label={t('systemUptime')}>{formatUptime(row.uptime, labels)}</Descriptions.Item>
           <Descriptions.Item label={t('lastSeen')}>{row.last_seen || '-'}</Descriptions.Item>
 
@@ -133,9 +151,16 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
       )}
       {isAdmin && row && (
         <div style={{ marginTop: 16 }}>
-          <Popconfirm title={t('nodeStatusDeleteConfirm')} onConfirm={handleDelete}>
-            <Button danger icon={<DeleteOutlined />}>{t('nodeStatusDelete')}</Button>
-          </Popconfirm>
+          <Space wrap>
+            {onEditTraffic && row.node_id && (
+              <Button icon={<SettingOutlined />} onClick={() => onEditTraffic(row)}>
+                {t('nodeTrafficEditQuota')}
+              </Button>
+            )}
+            <Popconfirm title={t('nodeStatusDeleteConfirm')} onConfirm={handleDelete}>
+              <Button danger icon={<DeleteOutlined />}>{t('nodeStatusDelete')}</Button>
+            </Popconfirm>
+          </Space>
         </div>
       )}
     </Drawer>

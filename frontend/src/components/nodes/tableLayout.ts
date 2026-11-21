@@ -11,4 +11,5 @@ export const nodeDesktopColumnWidths = {
   disk: 96,
   rate: 192,
   traffic: 172,
+  trafficQuota: 196,
 } as const;

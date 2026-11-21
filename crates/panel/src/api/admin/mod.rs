@@ -84,6 +84,7 @@ mod tests {
             geoip_in_flight: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            node_traffic_locks: crate::service::node_traffic::NodeTrafficLocks::new(),
         };
         (state, pool)
     }
